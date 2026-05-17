@@ -1,0 +1,13 @@
+.env
+state/
+runs/
+active/
+inbox/*.md
+!inbox/.gitkeep
+archive/
+.venv/
+anvil.log
+__pycache__/
+*.pyc
+.DS_Store
+*.tmp
