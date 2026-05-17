@@ -59,6 +59,11 @@ class State(BaseModel):
     steps: list[StepState] = []
     pending_action: PendingAction | None = None
     coder_mode: Literal["manual", "auto"] = "auto"
+    # Full path to this run's append-only run log, set when the log is opened
+    # in handle_brief so git_ops.commit_step can reference its filename.
+    # Added Step 8 (orchestrator-directed); not in Component 5's schema —
+    # flagged for doc parity. Optional/back-compatible.
+    run_log: str | None = None
 
 
 def state_dir() -> Path:

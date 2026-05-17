@@ -1,0 +1,201 @@
+"""Step 8 tests — Orchestrator manual-mode full pass over the trivial brief.
+
+Hermetic: a /tmp git repo as target_repo_path, a /tmp inbox brief, and
+ANVIL_STATE_DIR pointed at a /tmp dir (runs/ + any marker land there).
+NEVER ~/Downloads/anvil. Telegram and git_ops are mocked; the Planner is
+the real Phase-0 stub (no LLM / no network — it IS the mock-equivalent).
+run_smoke is injected (manual mode makes no real file changes, so the
+trivial brief's real smokes can't pass — we inject pass).
+
+Note-2 / decision-enforcing assertions: a clean run must create NO lock
+file (~/.anvil-active) and NO state/*.marker (telegram-down marker is
+failure-only).
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from collections import deque
+from pathlib import Path
+
+from anvil.config import Config
+from anvil.orchestrator import Orchestrator
+from anvil.planner import Planner
+from anvil.state import read_state, state_dir
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+TRIVIAL = FIXTURES / "trivial-test-brief.md"
+STUB = FIXTURES / "stub-plans.json"
+ANVIL_REPO = Path(__file__).resolve().parent.parent
+
+
+class FakeTelegram:
+    def __init__(self, replies):
+        self.sent: list[str] = []
+        self._replies = deque(replies)
+        self._mid = 0
+
+    def send(self, text: str) -> int:
+        self.sent.append(text)
+        self._mid += 1
+        return self._mid
+
+    def wait_for_reply(self, timeout):
+        if not self._replies:
+            return None
+        text = self._replies.popleft()
+
+        class _R:
+            pass
+        r = _R()
+        r.text = text
+        r.message_id = 999
+        r.timestamp = 0
+        return r
+
+
+class FakeGit:
+    def __init__(self):
+        self.calls = []
+
+    def commit_step(self, repo_path, plan, step_idx, *, brief_name=None,
+                    commit_message_hint=None, run_log_filename=None) -> str:
+        self.calls.append({
+            "step_idx": step_idx,
+            "brief_name": brief_name,
+            "commit_message_hint": commit_message_hint,
+            "run_log_filename": run_log_filename,
+        })
+        return f"deadbeef{step_idx:02d}"
+
+
+class TestOrchestrator(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev_state = os.environ.get("ANVIL_STATE_DIR")
+        self._tmp = Path(tempfile.mkdtemp(prefix="anvil-test-orch-"))
+        self.assertTrue(str(self._tmp).startswith(tempfile.gettempdir()))
+        self.assertNotEqual(self._tmp.resolve(), ANVIL_REPO.resolve())
+
+        os.environ["ANVIL_STATE_DIR"] = str(self._tmp / "state")
+
+        # /tmp target repo (validate_or_reject rule 3 needs a real git repo)
+        self.repo = self._tmp / "target-repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+
+        # trivial brief copy with target_repo_path rewritten, placed in inbox/
+        inbox = self._tmp / "inbox"
+        inbox.mkdir()
+        text = TRIVIAL.read_text().replace(
+            "target_repo_path: /tmp/anvil-test-repo",
+            f"target_repo_path: {self.repo}",
+        )
+        self.brief_path = inbox / "trivial-test-brief.md"
+        self.brief_path.write_text(text)
+
+        # vault_path with no _voice.md → exercises voice snapshot fallback
+        self.cfg = Config(
+            anthropic_api_key="x",
+            telegram_bot_token="t",
+            telegram_chat_id="123",
+            vault_path=self._tmp / "no-vault",
+            anvil_root=ANVIL_REPO,
+            anvil_defer_window_seconds=300,
+            planner_model="claude-opus-4-7",
+            planner_timeout=120,
+            coder_timeout=600,
+        )
+
+    def tearDown(self) -> None:
+        if self._prev_state is None:
+            os.environ.pop("ANVIL_STATE_DIR", None)
+        else:
+            os.environ["ANVIL_STATE_DIR"] = self._prev_state
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _orch(self, replies):
+        self.tg = FakeTelegram(replies)
+        self.git = FakeGit()
+        return Orchestrator(
+            self.cfg,
+            coder_mode="manual",
+            planner=Planner(stub_plans_path=STUB),
+            telegram=self.tg,
+            git=self.git,
+            run_smoke=lambda cmd, cwd: (True, "pass"),
+        )
+
+    def test_full_manual_pass_over_trivial_brief(self) -> None:
+        # step1 manual 'done', step1 confirm 'go', step2 manual 'done'
+        # (auto: no confirm), step3 manual 'done', step3 confirm 'go'
+        orch = self._orch(["done", "go", "done", "done", "go"])
+        rc = orch.handle_brief(self.brief_path)
+        self.assertEqual(rc, 0)
+
+        st = read_state()
+        self.assertIsNotNone(st)
+        self.assertEqual(st.status, "done")
+        self.assertEqual([s.status for s in st.steps], ["done", "done", "done"])
+        self.assertTrue(all(s.commit for s in st.steps))  # none skipped
+        self.assertIsNotNone(st.run_log)
+
+        # run log written, slugged from build_name "Phase 0 — trivial round-trip"
+        runs = list((state_dir() / "runs").glob(
+            "*-phase-0-trivial-round-trip.md"))
+        self.assertEqual(len(runs), 1)
+        log_txt = runs[0].read_text()
+        self.assertIn("ANVIL run log", log_txt)
+        self.assertIn("complete", log_txt)
+        self.assertEqual(Path(st.run_log).name, runs[0].name)
+
+        # git.commit_step wired: 3 commits, run_log_filename = the log file
+        self.assertEqual(len(self.git.calls), 3)
+        for c in self.git.calls:
+            self.assertEqual(c["run_log_filename"], runs[0].name)
+            self.assertEqual(c["brief_name"], "Phase 0 — trivial round-trip")
+            self.assertIsNone(c["commit_message_hint"])  # trivial steps set none
+
+        # step-completion format on the EXPLICIT steps (1 and 3)
+        joined = "\n---\n".join(self.tg.sent)
+        self.assertIn("[ANVIL] Step 1 complete — Create a file", joined)
+        self.assertIn("- What:", joined)
+        self.assertIn("- Files: test.txt", joined)
+        self.assertIn("- Smoke: pass", joined)
+        self.assertIn("Reply 'go' to continue", joined)
+        self.assertIn("[ANVIL] Step 3 complete — Verify and finish", joined)
+        # AUTO step 2: no "Step 2 complete" confirmation message at all
+        self.assertNotIn("Step 2 complete", joined)
+        # completion message
+        self.assertIn(
+            "[ANVIL] Build complete — Phase 0 — trivial round-trip", joined
+        )
+
+        # --- the decision-enforcing assertions ---
+        self.assertFalse(
+            Path("~/.anvil-active").expanduser().exists(),
+            "orchestrator must NEVER create the dead lock file",
+        )
+        markers = list(state_dir().glob("*.marker"))
+        self.assertEqual(
+            markers, [], f"clean run must produce no marker; found {markers}",
+        )
+
+    def test_auto_coder_mode_raises_not_implemented(self) -> None:
+        orch = self._orch([])
+        orch.coder_mode = "auto"
+        with self.assertRaises(NotImplementedError):
+            orch.handle_brief(self.brief_path)
+
+    def test_manual_abort_returns_nonzero_and_state_aborted(self) -> None:
+        orch = self._orch(["abort"])  # step 1 manual reply = abort
+        rc = orch.handle_brief(self.brief_path)
+        self.assertEqual(rc, 1)
+        self.assertEqual(read_state().status, "aborted")
+        self.assertFalse(Path("~/.anvil-active").expanduser().exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
