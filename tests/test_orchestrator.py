@@ -47,6 +47,11 @@ class FakeTelegram:
         if not self._replies:
             return None
         text = self._replies.popleft()
+        if text == "<INT>":
+            # Simulate what the Phase B hotfix's flag-check does inside the
+            # real wait_for_reply: a deliberate KeyboardInterrupt out of the
+            # wait, which must reach Orchestrator.run()'s handler.
+            raise KeyboardInterrupt("simulated SIGINT during wait_for_reply")
 
         class _R:
             pass
@@ -211,6 +216,24 @@ class TestOrchestrator(unittest.TestCase):
         # resume() does parse_brief(state.brief_path) — must now succeed
         reparsed = parse_brief(read_state().brief_path)
         self.assertEqual(reparsed.build_name, "Phase 0 — trivial round-trip")
+
+    def test_run_interrupted_at_step1_persists_paused_mid_execution(
+        self,
+    ) -> None:
+        """Phase B hotfix end-to-end: a KeyboardInterrupt out of Step 1's
+        wait_for_reply must propagate through handle_brief (which catches
+        only Exception/AnvilError/NotImplementedError) to run()'s
+        except KeyboardInterrupt, persisting status=paused-mid-execution."""
+        orch = self._orch(["<INT>"])  # SIGINT at the Step 1 manual prompt
+        rc = orch.run(self.brief_path)
+        self.assertEqual(rc, 2)
+        st = read_state()
+        self.assertEqual(st.status, "paused-mid-execution")
+        self.assertEqual(st.current_step, 1)
+        self.assertEqual(st.steps[0].status, "running")
+        # hotfix interplay: brief_path still points at the active/ copy
+        self.assertTrue(st.brief_path.endswith("/active/" + self.brief_path.name))
+        self.assertFalse(Path("~/.anvil-active").expanduser().exists())
 
     def test_auto_coder_mode_raises_not_implemented(self) -> None:
         orch = self._orch([])

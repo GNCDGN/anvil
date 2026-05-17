@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,6 +52,63 @@ class _Upd:
     message_id: int | None
     text: str | None
     date: int | None
+
+
+# ---- interrupt facility (Phase B hotfix) ------------------------------------
+# A bare SIGINT is swallowed while the orchestrator is blocked in
+# `wait_for_reply` — PTB's `bot.get_updates` long-poll runs under
+# `asyncio.run()` and that layer absorbs the signal, so the default
+# KeyboardInterrupt never propagates to `Orchestrator.run()`'s handler
+# (caught by the Step 10 Phase B pre-flight). Fix: a SIGINT handler that only
+# sets a module flag; `wait_for_reply` checks the flag in pure Python between
+# poll cycles and raises KeyboardInterrupt there, where it is guaranteed to
+# propagate. Worst-case latency to honour a SIGINT is one `long_poll_seconds`
+# window (default 30s) — an in-flight long-poll must return first. This 30s
+# ceiling is accepted and documented (see vault decisions.md, Phase B).
+_INTERRUPTED = False
+_PREV_SIGINT = None
+_HANDLER_INSTALLED = False
+
+
+def _on_sigint(signum, frame) -> None:  # noqa: ARG001 — signal handler
+    global _INTERRUPTED
+    _INTERRUPTED = True
+
+
+def install_interrupt_handler() -> None:
+    """Install the flag-setting SIGINT handler and clear any stale flag.
+    Degrades to a no-op (behaviour == pre-hotfix) if called off the main
+    thread, where `signal.signal` is not allowed — no regression."""
+    global _INTERRUPTED, _PREV_SIGINT, _HANDLER_INSTALLED
+    _INTERRUPTED = False
+    try:
+        _PREV_SIGINT = signal.signal(signal.SIGINT, _on_sigint)
+        _HANDLER_INSTALLED = True
+    except ValueError as e:  # not main thread
+        log.warning(f"interrupt handler not installed ({e}); "
+                    "SIGINT behaviour unchanged from pre-hotfix")
+        _HANDLER_INSTALLED = False
+
+
+def restore_interrupt_handler() -> None:
+    """Restore the previous SIGINT handler. Safe to call unconditionally."""
+    global _PREV_SIGINT, _HANDLER_INSTALLED
+    if _HANDLER_INSTALLED and _PREV_SIGINT is not None:
+        try:
+            signal.signal(signal.SIGINT, _PREV_SIGINT)
+        except ValueError:
+            pass
+    _PREV_SIGINT = None
+    _HANDLER_INSTALLED = False
+
+
+def interrupt_requested() -> bool:
+    return _INTERRUPTED
+
+
+def clear_interrupt() -> None:
+    global _INTERRUPTED
+    _INTERRUPTED = False
 
 
 class TelegramClient:
@@ -153,8 +211,15 @@ class TelegramClient:
         """Long-poll until a text reply arrives in `chat_id`. Returns the
         Reply, or None if `timeout` (seconds) elapses first. `timeout=None`
         waits indefinitely. Tracks last_update_id so backlog and already-seen
-        updates are never reprocessed. Never raises."""
+        updates are never reprocessed. Never raises, EXCEPT a deliberate
+        KeyboardInterrupt when an interrupt has been requested (Phase B
+        hotfix) — checked between poll cycles so it propagates to
+        Orchestrator.run()'s handler instead of being swallowed by the
+        asyncio long-poll. Honoured within one long_poll_seconds window."""
         start = time.time()
+
+        if interrupt_requested():
+            raise KeyboardInterrupt("interrupt requested before wait_for_reply")
 
         # Baseline: a non-blocking getUpdates so we ignore any backlog and
         # only react to replies that arrive after this call begins.
@@ -169,6 +234,13 @@ class TelegramClient:
                 self._last_update_id = 0
 
         while True:
+            # Per-cycle check — before issuing the next get_updates. A SIGINT
+            # that arrived during the previous long-poll is honoured here, in
+            # pure Python, where the raise is guaranteed to propagate.
+            if interrupt_requested():
+                raise KeyboardInterrupt(
+                    "interrupt requested during wait_for_reply"
+                )
             try:
                 updates = self._poll_updates(
                     self._last_update_id + 1, self.long_poll_seconds

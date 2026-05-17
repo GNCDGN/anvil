@@ -120,6 +120,11 @@ class Orchestrator:
 
     # ---- public API ----
     def run(self, brief_path: Path) -> int:
+        from anvil.telegram import (
+            install_interrupt_handler,
+            restore_interrupt_handler,
+        )
+        install_interrupt_handler()
         try:
             return self.handle_brief(Path(brief_path))
         except KeyboardInterrupt:
@@ -133,22 +138,42 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001 — never-raise contract
             log.error(f"fatal in run(): {e}", exc_info=True)
             return 2
+        finally:
+            restore_interrupt_handler()
 
     def resume(self) -> int:
         from anvil.state import read_state
+        from anvil.telegram import (
+            install_interrupt_handler,
+            restore_interrupt_handler,
+        )
         st = read_state()
         if st is None or st.status in ("done", "failed", "aborted"):
             log.info("nothing to resume")
             return 0
-        self.telegram.send(
-            f"[ANVIL] Resuming {Path(st.brief_path).name}, step "
-            f"{st.current_step} ({st.status}). Reply 'resume' or 'abort'."
-        )
-        reply = self.telegram.wait_for_reply(timeout=None)
-        if reply is None or reply.text.strip().lower() != "resume":
-            transition(st, "aborted")
-            return 1
-        return self.handle_brief(Path(st.brief_path))
+        install_interrupt_handler()
+        try:
+            self.telegram.send(
+                f"[ANVIL] Resuming {Path(st.brief_path).name}, step "
+                f"{st.current_step} ({st.status}). Reply 'resume' or 'abort'."
+            )
+            reply = self.telegram.wait_for_reply(timeout=None)
+            if reply is None or reply.text.strip().lower() != "resume":
+                transition(st, "aborted")
+                return 1
+            return self.handle_brief(Path(st.brief_path))
+        except KeyboardInterrupt:
+            log.warning("KeyboardInterrupt in resume() — persisting state")
+            try:
+                transition(self._state or st, "paused-mid-execution")
+            except Exception:  # noqa: BLE001
+                pass
+            return 2
+        except Exception as e:  # noqa: BLE001 — never-raise contract
+            log.error(f"fatal in resume(): {e}", exc_info=True)
+            return 2
+        finally:
+            restore_interrupt_handler()
 
     def handle_brief(self, brief_path: Path) -> int:
         try:

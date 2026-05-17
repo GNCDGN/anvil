@@ -14,7 +14,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from anvil.telegram import Reply, TelegramClient, _Upd
+from anvil.telegram import (
+    Reply,
+    TelegramClient,
+    _Upd,
+    _on_sigint,
+    clear_interrupt,
+)
 
 CHAT = "999"
 
@@ -128,6 +134,47 @@ class TestTelegramPoll(unittest.TestCase):
         with patch.object(self.c, "_poll_updates", side_effect=flaky):
             r = self.c.wait_for_reply(timeout=5)
         self.assertEqual(r.text, "ack")  # recovered after the swallowed error
+
+
+class TestTelegramInterrupt(unittest.TestCase):
+    """Phase B hotfix: a SIGINT (simulated by invoking the real _on_sigint
+    handler, which only sets the module flag) must make wait_for_reply raise
+    KeyboardInterrupt between poll cycles — never swallowed, never deferred
+    past the next get_updates."""
+
+    def setUp(self) -> None:
+        clear_interrupt()
+        self.c = TelegramClient("tok", CHAT, long_poll_seconds=30)
+        self._sleep = patch("anvil.telegram.time.sleep", lambda *_: None)
+        self._sleep.start()
+
+    def tearDown(self) -> None:
+        self._sleep.stop()
+        clear_interrupt()  # never leak the flag into other tests
+
+    def test_interrupt_before_wait_raises_before_any_poll(self) -> None:
+        _on_sigint(2, None)  # SIGINT arrived before we even start waiting
+        with patch.object(self.c, "_poll_updates") as m:
+            with self.assertRaises(KeyboardInterrupt):
+                self.c.wait_for_reply(timeout=None)
+        m.assert_not_called()  # raised before issuing any get_updates
+
+    def test_interrupt_mid_loop_raises_on_next_iteration(self) -> None:
+        calls = {"n": 0}
+
+        def poll(offset, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return []          # baseline (offset=None, timeout=0)
+            if calls["n"] == 2:
+                _on_sigint(2, None)  # SIGINT lands during this long-poll
+                return []          # poll returns normally, no reply
+            raise AssertionError("a 3rd poll must NOT be issued after interrupt")
+
+        with patch.object(self.c, "_poll_updates", side_effect=poll):
+            with self.assertRaises(KeyboardInterrupt):
+                self.c.wait_for_reply(timeout=None)
+        self.assertEqual(calls["n"], 2)  # baseline + 1 loop poll, then raise
 
 
 if __name__ == "__main__":
