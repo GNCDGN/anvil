@@ -183,6 +183,35 @@ class TestOrchestrator(unittest.TestCase):
             markers, [], f"clean run must produce no marker; found {markers}",
         )
 
+    def test_move_brief_updates_state_brief_path_for_resume(self) -> None:
+        """Step 10 hotfix: after inbox→active move, state.brief_path must
+        point at the active/ file (persisted), so resume() re-parses a path
+        that still exists rather than the vacated inbox path."""
+        from anvil.brief import parse_brief
+        from anvil.state import init_state, read_state, write_state
+
+        orch = self._orch([])
+        brief = parse_brief(self.brief_path)
+        st = init_state(
+            brief, "2026-05-18T00:00:00+01:00",
+            brief_path=str(self.brief_path), coder_mode="manual",
+        )
+        orch._state = st
+        orch._run_log = None
+        write_state(st)  # persisted with the inbox path
+        self.assertTrue(self.brief_path.exists())
+
+        orch._move_brief(self.brief_path)
+
+        active = self._tmp / "active" / self.brief_path.name
+        self.assertTrue(active.exists(), "brief must move into active/")
+        self.assertFalse(self.brief_path.exists(), "inbox copy must be gone")
+        self.assertEqual(orch._state.brief_path, str(active))
+        self.assertEqual(read_state().brief_path, str(active))
+        # resume() does parse_brief(state.brief_path) — must now succeed
+        reparsed = parse_brief(read_state().brief_path)
+        self.assertEqual(reparsed.build_name, "Phase 0 — trivial round-trip")
+
     def test_auto_coder_mode_raises_not_implemented(self) -> None:
         orch = self._orch([])
         orch.coder_mode = "auto"

@@ -75,6 +75,7 @@ class Orchestrator:
         self._run_smoke = run_smoke or self._default_run_smoke
         self.voice_spec = voice.load_voice_spec(config.vault_path)
         self._run_log: Path | None = None
+        self._state = None
 
     # ---- telegram (lazy so unit tests can inject a mock) ----
     @property
@@ -316,12 +317,21 @@ class Orchestrator:
 
     # ---- brief movement ----
     def _move_brief(self, brief_path: Path) -> None:
+        """Move inbox/<brief> → active/<brief> and, crucially, update
+        state.brief_path to the new location and persist it. Without this,
+        resume() would re-parse the now-vacated inbox path and fail
+        (caught by Step 10 pre-flight: resume-broken-by-move)."""
         try:
             if brief_path.parent.name == "inbox":
                 active = brief_path.parent.parent / "active"
                 active.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(brief_path), str(active / brief_path.name))
-                self._log_event("brief", f"moved to active/{brief_path.name}")
+                new_path = active / brief_path.name
+                shutil.move(str(brief_path), str(new_path))
+                if self._state is not None:
+                    self._state.brief_path = str(new_path)
+                    write_state(self._state)
+                self._log_event("brief", f"moved to active/{brief_path.name}; "
+                                f"state.brief_path → {new_path}")
         except Exception as e:  # noqa: BLE001 — non-fatal
             log.warning(f"move_brief skipped ({e})")
 
