@@ -1,0 +1,369 @@
+"""Brief parsing and schema validation (implementation-notes Component 2).
+
+Models are Pydantic v2 per the brief's Step 3 note ("implement Step, Brief,
+EndToEndTest Pydantic models per implementation-notes Component 2"). Component
+2's code sketch shows `@dataclass`; the Step 3 note is the authority and says
+Pydantic, and requirements.txt pins pydantic>=2.0 — reconciled to Pydantic.
+
+`validate_or_reject` collects ALL violations and raises a single
+`BriefValidationError` carrying the full list (never just the first).
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+from typing import Literal
+
+import yaml
+from pydantic import BaseModel
+
+from anvil.errors import BriefValidationError
+
+_VALID_OPERATIONS = {"read", "write", "smoke-test", "commit", "shell"}
+_REQUIRED_FRONTMATTER = (
+    "brief_version",
+    "project",
+    "build_name",
+    "target_repo",
+    "target_repo_path",
+    "vps_deploy",
+)
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]")
+
+
+class Step(BaseModel):
+    number: int
+    name: str
+    scope_files: list[str]
+    scope_operations: list[str]
+    smoke: str
+    confirm: Literal["explicit", "auto"]
+    commit_message_hint: str | None = None
+    notes: str | None = None
+
+
+class EndToEndTest(BaseModel):
+    script: str
+    expected_exit: int = 0
+    on_fail: str = "escalate"
+
+
+class Brief(BaseModel):
+    brief_version: int
+    project: str
+    build_name: str
+    target_repo: str
+    target_repo_path: Path
+    vps_deploy: Literal["yes", "no"]
+    service_name: str | None = None
+    goal: str = ""
+    context_links: list[str] = []
+    context_paths: list[Path] = []
+    steps: list[Step] = []
+    end_to_end_test: EndToEndTest | None = None
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def _split_frontmatter(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.S)
+    if not m:
+        return {}, text
+    fm = yaml.safe_load(m.group(1)) or {}
+    return (fm if isinstance(fm, dict) else {}), m.group(2)
+
+
+def _sections(body: str) -> dict[str, str]:
+    """Split markdown body into top-level ## sections (keyed by lowercased
+    heading text)."""
+    out: dict[str, str] = {}
+    cur: str | None = None
+    buf: list[str] = []
+    for line in body.splitlines():
+        h = re.match(r"^##\s+(.+?)\s*$", line)
+        if h and not line.startswith("###"):
+            if cur is not None:
+                out[cur] = "\n".join(buf).strip()
+            cur = h.group(1).strip().lower()
+            buf = []
+        else:
+            if cur is not None:
+                buf.append(line)
+    if cur is not None:
+        out[cur] = "\n".join(buf).strip()
+    return out
+
+
+def _clean(v: str) -> str:
+    return v.strip().strip("`").strip()
+
+
+def _norm_yes_no(raw: object) -> str:
+    """Normalise a vps_deploy value to 'yes'/'no'. YAML 1.1 parses unquoted
+    yes/no as booleans, so handle bool as well as string forms; anything
+    unrecognised defaults to 'no' (rule-4-safe)."""
+    if isinstance(raw, bool):
+        return "yes" if raw else "no"
+    s = str(raw).strip().lower()
+    return s if s in ("yes", "no") else "no"
+
+
+def _field(block: str, key: str) -> str | None:
+    m = re.search(
+        rf"^\s*-\s*\*\*{re.escape(key)}:\*\*\s*(.*)$", block, re.M
+    )
+    return _clean(m.group(1)) if m else None
+
+
+def _csv(val: str | None) -> list[str]:
+    if not val:
+        return []
+    if val.lower().startswith("(none"):
+        return []
+    return [p.strip().strip("`") for p in val.split(",") if p.strip()]
+
+
+def _parse_steps(steps_section: str) -> list[Step]:
+    steps: list[Step] = []
+    # Split on "### Step N — Name" headers, keeping each block.
+    parts = re.split(r"^###\s+Step\s+(\d+)\s*[—-]\s*(.+?)\s*$",
+                     steps_section, flags=re.M)
+    # parts[0] is preamble; then repeating (number, name, block)
+    for i in range(1, len(parts), 3):
+        number = int(parts[i])
+        name = parts[i + 1].strip()
+        block = parts[i + 2]
+        confirm = (_field(block, "confirm") or "").lower()
+        steps.append(
+            Step(
+                number=number,
+                name=name,
+                scope_files=_csv(_field(block, "scope.files")),
+                scope_operations=_csv(_field(block, "scope.operations")),
+                smoke=_field(block, "smoke") or "",
+                confirm=confirm if confirm in ("explicit", "auto") else "explicit",
+                commit_message_hint=_field(block, "commit_message_hint"),
+                notes=_field(block, "notes"),
+            )
+        )
+    return steps
+
+
+def _parse_context(ctx_section: str) -> list[str]:
+    if not ctx_section or ctx_section.strip().lower().startswith("(none"):
+        return []
+    return _WIKILINK_RE.findall(ctx_section)
+
+
+def _parse_e2e(section: str | None) -> EndToEndTest | None:
+    if not section or not section.strip():
+        return None
+    script = _field(section, "script")
+    if not script:
+        return None
+    exp = _field(section, "expected_exit")
+    on_fail = _field(section, "on_fail")
+    return EndToEndTest(
+        script=script,
+        expected_exit=int(exp) if exp and exp.isdigit() else 0,
+        on_fail=on_fail or "escalate",
+    )
+
+
+def parse_brief_raw(path: Path) -> tuple[Brief, dict]:
+    """Parse a brief markdown file. Returns (Brief, raw_frontmatter). The raw
+    frontmatter dict lets validate_or_reject's rule 1 distinguish a literally
+    absent key from a parse-time default. Does not validate."""
+    text = Path(path).read_text(encoding="utf-8")
+    fm, body = _split_frontmatter(text)
+    sections = _sections(body)
+    brief = Brief(
+        brief_version=fm.get("brief_version", 0),
+        project=str(fm.get("project", "")),
+        build_name=str(fm.get("build_name", "")),
+        target_repo=str(fm.get("target_repo", "")),
+        target_repo_path=Path(
+            str(fm.get("target_repo_path", "")) or "."
+        ).expanduser(),
+        vps_deploy=_norm_yes_no(fm.get("vps_deploy", "no")),
+        service_name=(
+            str(fm["service_name"]) if fm.get("service_name") else None
+        ),
+        goal=sections.get("goal", ""),
+        context_links=_parse_context(sections.get("context", "")),
+        steps=_parse_steps(sections.get("steps", "")),
+        end_to_end_test=_parse_e2e(sections.get("end-to-end test")),
+    )
+    return brief, (fm if isinstance(fm, dict) else {})
+
+
+def parse_brief(path: Path) -> Brief:
+    """Parse a brief markdown file into a Brief (Component 2 API). Does not
+    validate — call validate_or_reject for that."""
+    brief, _ = parse_brief_raw(path)
+    return brief
+
+
+# ---------------------------------------------------------------------------
+# Validation — all 12 rules from implementation-notes Component 2
+# ---------------------------------------------------------------------------
+
+def _is_git_repo(path: Path) -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def _escapes(repo: Path, rel: str) -> bool:
+    """True if `rel` is absolute-outside-repo or `..`-escapes the repo."""
+    p = Path(rel)
+    if p.is_absolute():
+        try:
+            p.resolve().relative_to(repo.resolve())
+            return False
+        except ValueError:
+            return True
+    try:
+        (repo / p).resolve().relative_to(repo.resolve())
+        return False
+    except ValueError:
+        return True
+
+
+def validate_or_reject(
+    brief: Brief, raw_frontmatter: dict | None = None,
+    vault_root: Path | None = None,
+) -> None:
+    """Raise BriefValidationError listing ALL violations, or return None.
+
+    `raw_frontmatter` lets rule 1 see which required keys were literally
+    absent (parse_brief defaults them). `vault_root` enables rule 11
+    (context wiki-link resolution); Component 2's signature is
+    validate_or_reject(brief) — vault_root is an optional extension since
+    rule 11 inherently needs vault context (resolve_context_paths owns the
+    hard resolution).
+    """
+    e: list[str] = []
+    fm = raw_frontmatter if raw_frontmatter is not None else {}
+
+    # 1. Frontmatter completeness
+    for k in _REQUIRED_FRONTMATTER:
+        if raw_frontmatter is not None:
+            if k not in fm or fm.get(k) in (None, ""):
+                e.append(f"frontmatter: required key '{k}' missing or empty")
+        else:
+            if getattr(brief, k, None) in (None, "", 0) and k != "brief_version":
+                e.append(f"frontmatter: required key '{k}' missing or empty")
+
+    # 2. brief_version == 1
+    if brief.brief_version != 1:
+        e.append(f"brief_version must be 1 (got {brief.brief_version})")
+
+    # 3. target_repo_path exists and is a git repo
+    if not brief.target_repo_path.exists():
+        e.append(f"target_repo_path does not exist: {brief.target_repo_path}")
+    elif not _is_git_repo(brief.target_repo_path):
+        e.append(f"target_repo_path is not a git repo: {brief.target_repo_path}")
+
+    # 4. vps_deploy: yes requires service_name
+    if brief.vps_deploy == "yes" and not brief.service_name:
+        e.append("vps_deploy is 'yes' but service_name is not set")
+
+    # 5. At least one step
+    if not brief.steps:
+        e.append("brief has no steps")
+
+    # 6. Step numbers unique, starting at 1, sequential
+    nums = [s.number for s in brief.steps]
+    if nums and nums != list(range(1, len(nums) + 1)):
+        e.append(f"step numbers must be 1..N sequential, got {nums}")
+
+    for s in brief.steps:
+        tag = f"step {s.number} ({s.name})"
+        # 7. scope.files within target_repo_path
+        for f in s.scope_files:
+            if _escapes(brief.target_repo_path, f):
+                e.append(f"{tag}: scope.files path escapes target_repo_path: {f}")
+        # 8. scope.operations non-empty subset of the allowed set
+        if not s.scope_operations:
+            e.append(f"{tag}: scope.operations is empty")
+        bad_ops = set(s.scope_operations) - _VALID_OPERATIONS
+        if bad_ops:
+            e.append(f"{tag}: unknown operations {sorted(bad_ops)}")
+        # 9. smoke is an existing script path or an inline command
+        sm = s.smoke.strip()
+        if not sm:
+            e.append(f"{tag}: smoke is empty")
+        elif (
+            " " not in sm and sm.endswith(".sh")
+            and not (brief.target_repo_path / sm).is_file()
+            and not Path(sm).expanduser().is_file()
+        ):
+            e.append(f"{tag}: smoke looks like a script path but does not exist: {sm}")
+        # 10. confirm is explicit|auto (Step model already constrains; double-check)
+        if s.confirm not in ("explicit", "auto"):
+            e.append(f"{tag}: confirm must be explicit|auto, got {s.confirm!r}")
+
+    # 11. Context wiki-links resolve (needs vault context)
+    if vault_root is not None:
+        for link in brief.context_links:
+            if _resolve_one(link, vault_root) is None:
+                e.append(f"context wiki-link does not resolve: [[{link}]]")
+
+    # 12. end_to_end_test.script exists if declared
+    if brief.end_to_end_test is not None:
+        sp = brief.end_to_end_test.script
+        if not (
+            (brief.target_repo_path / sp).is_file()
+            or Path(sp).expanduser().is_file()
+        ):
+            e.append(f"end_to_end_test.script does not exist: {sp}")
+
+    if e:
+        raise BriefValidationError(e)
+
+
+def _resolve_one(link: str, vault_root: Path) -> Path | None:
+    link = link.strip().lstrip("/")
+    candidates = [
+        vault_root / link,
+        vault_root / f"{link}.md",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    # basename match anywhere in the vault (Obsidian-style short links)
+    base = Path(link).name
+    for ext in ("", ".md"):
+        hits = list(vault_root.rglob(f"{base}{ext}"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def resolve_context_paths(brief: Brief, vault_root: Path) -> Brief:
+    """Resolve every context wiki-link to a filesystem path. Raises
+    BriefValidationError listing ALL unresolved links."""
+    resolved: list[Path] = []
+    unresolved: list[str] = []
+    for link in brief.context_links:
+        p = _resolve_one(link, vault_root)
+        if p is None:
+            unresolved.append(link)
+        else:
+            resolved.append(p)
+    if unresolved:
+        raise BriefValidationError(
+            [f"unresolved context wiki-link: [[{u}]]" for u in unresolved]
+        )
+    return brief.model_copy(update={"context_paths": resolved})

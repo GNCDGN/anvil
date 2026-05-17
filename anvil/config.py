@@ -5,6 +5,10 @@ be present and non-empty; everything else has a sensible default sourced from
 implementation-notes "Environment". `anvil_lock_file` is deliberately absent —
 the lock-file mechanism was removed in the Component 1 patch (time-bounded
 `[ANVIL]`-prefix deferral, `anvil_defer_window_seconds`, replaces it).
+
+`ConfigError` is imported from `anvil.errors` (folded into the AnvilError
+hierarchy in Step 3 per orchestrator instruction; it was defined locally in
+Step 2 as a flagged follow-up).
 """
 from __future__ import annotations
 
@@ -14,15 +18,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from anvil.errors import ConfigError
 
-class ConfigError(Exception):
-    """Raised when required configuration is missing or malformed.
-
-    Defined locally for Step 2. errors.py (Step 3, implementation-notes
-    Component 12) introduces the AnvilError hierarchy; Component 12 does not
-    currently list ConfigError — aligning it into that hierarchy is a flagged
-    Step 3 follow-up.
-    """
+__all__ = ["Config", "ConfigError"]
 
 
 def _expand(p: str) -> Path:
