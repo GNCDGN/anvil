@@ -26,9 +26,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Literal
 
+import anthropic
 import yaml
 from pydantic import BaseModel
 
@@ -90,6 +92,12 @@ class Planner:
         self.model = model
         self.timeout = timeout
         self._stub_plans_path = Path(stub_plans_path or _DEFAULT_STUB_PLANS)
+        # Phase 1 Step 5 scaffold: real Anthropic client for _call_anthropic.
+        # Guarded on api_key so Phase 0 stub callers (Planner(),
+        # Planner(stub_plans_path=...)) get _client=None and the stub path
+        # is unaffected. Step 6 rewrites __init__ to load the system prompt
+        # and make the client mandatory.
+        self._client = anthropic.Anthropic(api_key=api_key) if api_key else None
 
     def _load_stub_plans(self) -> list[dict]:
         try:
@@ -129,6 +137,148 @@ class Planner:
             f"no stub plan for step_number {target_number} "
             f"(step_idx {step_idx})"
         )
+
+    # -----------------------------------------------------------------------
+    # Phase 1 Step 5 — Anthropic call wrapper + Stage B retry loop
+    #
+    # Added to the existing Phase 0 class without touching plan_step (the
+    # stub stays callable until Step 6 replaces it). Step 6 wires
+    # self._system_prompt and self.vault_root in __init__; here they are
+    # read defensively so this step's tests (which mock _call_anthropic at
+    # the method level) do not depend on Step 6 wiring.
+    # -----------------------------------------------------------------------
+
+    def _call_anthropic(
+        self, system: str, user: str, timeout: int, *, step: int, stage: str
+    ) -> str:
+        """Subprocess-free streaming call. Returns the model text, or ""
+        on timeout / rate-limit / any error (never raises).
+
+        SDK note (anthropic 0.102.0): messages.stream(...) is a context
+        manager; the brief's stream.get_final_message().usage is reached
+        via `with ... as stream`. RateLimitError / APITimeoutError are
+        retried once after sleeping min(60, retry-after); a second
+        failure returns "". A broad Exception is logged and returns "".
+        """
+
+        def _attempt() -> str:
+            client = self._client.with_options(timeout=timeout)
+            t0 = time.monotonic()
+            with client.messages.stream(
+                model=self.model,
+                max_tokens=8192,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            ) as stream:
+                final = stream.get_final_message()
+            duration = time.monotonic() - t0
+            text = "".join(
+                b.text for b in final.content
+                if getattr(b, "type", None) == "text"
+            )
+            u = final.usage
+            log.info(
+                f"[planner] step={step} stage={stage} model={self.model} "
+                f"input_tokens={u.input_tokens} "
+                f"output_tokens={u.output_tokens} "
+                f"cache_creation_input_tokens="
+                f"{u.cache_creation_input_tokens or 0} "
+                f"cache_read_input_tokens="
+                f"{u.cache_read_input_tokens or 0} "
+                f"duration_s={duration:.1f}"
+            )
+            return text
+
+        def _retry_after(exc: Exception) -> int:
+            resp = getattr(exc, "response", None)
+            hdr = getattr(resp, "headers", None)
+            try:
+                return int(hdr.get("retry-after")) if hdr else 1
+            except (TypeError, ValueError):
+                return 1
+
+        try:
+            try:
+                return _attempt()
+            except (anthropic.APITimeoutError, anthropic.RateLimitError) as e:
+                time.sleep(min(60, _retry_after(e)))
+                try:
+                    return _attempt()
+                except (
+                    anthropic.APITimeoutError,
+                    anthropic.RateLimitError,
+                ) as e2:
+                    log.error(
+                        f"[planner] step={step} stage={stage} "
+                        f"rate-limit/timeout twice ({e2}); returning empty"
+                    )
+                    return ""
+        except Exception as e:  # noqa: BLE001 — never-raise contract
+            log.error(
+                f"[planner] step={step} stage={stage} call failed "
+                f"({e}); returning empty"
+            )
+            return ""
+
+    def _run_stage_b_with_retry(
+        self, brief, state, step_idx: int, selected_paths: list[str]
+    ) -> dict:
+        """Stage B call -> parse -> validate, with one retry-with-error.
+        Returns a validated plan dict, or a planner-validation-failure
+        escalation block (design Part 3 retry block). Stage A is not
+        re-run; an empty response is a tooling failure -> immediate
+        escalation, no retry."""
+        system = getattr(self, "_system_prompt", "")
+        vault_root = getattr(self, "vault_root", Path("."))
+        files = _load_files(selected_paths, vault_root)
+        user_prompt = _assemble_stage_b_prompt(brief, state, step_idx, files)
+        step_no = step_idx + 1
+
+        response = self._call_anthropic(
+            system=system, user=user_prompt, timeout=self.timeout,
+            step=step_no, stage="B",
+        )
+        if not response:
+            return _escalation_block(
+                "planner-validation-failure",
+                "Stage B returned empty after first attempt",
+                step_idx,
+            )
+        try:
+            plan = _parse_plan_json(response)
+            _validate_plan_structure(plan, brief.steps[step_idx])
+            return plan
+        except (PlanParseError, PlanValidationError) as e:
+            retry_prompt = (
+                user_prompt
+                + "\n\n## Previous attempt failed validation\n\n"
+                + "The previous response failed validation with this "
+                + "error:\n\n<validation_error>\n"
+                + f"{e}\n</validation_error>\n\n"
+                + "Produce a corrected JSON object that addresses the "
+                + "error. Output only the JSON, no preamble."
+            )
+            response2 = self._call_anthropic(
+                system=system, user=retry_prompt, timeout=self.timeout,
+                step=step_no, stage="B",
+            )
+            if not response2:
+                return _escalation_block(
+                    "planner-validation-failure",
+                    f"Stage B retry returned empty. First error: {e}",
+                    step_idx,
+                )
+            try:
+                plan = _parse_plan_json(response2)
+                _validate_plan_structure(plan, brief.steps[step_idx])
+                return plan
+            except (PlanParseError, PlanValidationError) as e2:
+                return _escalation_block(
+                    "planner-validation-failure",
+                    f"Plan validation failed twice. First: {e}. "
+                    f"Second: {e2}",
+                    step_idx,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -502,3 +652,16 @@ def _validate_plan_structure(plan: dict, brief_step: Step) -> None:
             "scope_boundaries must be a dict with str in_scope and out_of_scope"
         )
     return None
+
+
+def _escalation_block(reason: str, detail: str, step_idx: int) -> dict:
+    """design Part 3 escalation shape. No `options` field:
+    planner-validation-failure escalations carry no choice for Genco,
+    only an abort decision. step_number is 1-indexed (brief) from the
+    0-indexed step_idx."""
+    return {
+        "escalate": True,
+        "reason": reason,
+        "detail": detail,
+        "step_number": step_idx + 1,
+    }
