@@ -37,7 +37,10 @@ class StepState(BaseModel):
     smoke: Literal["pass", "fail"] | None = None
     smoke_output: str | None = None
     plan: dict | None = None
-    coder_result: dict | None = None
+    # design Part 4 / brief Step 7: coder_output (was the unused Phase 0
+    # placeholder coder_result; renamed + retyped str|None, decision #6
+    # closed). Phase 2 Coder writes it; Phase 1 manual mode leaves it None.
+    coder_output: str | None = None
 
 
 class PendingAction(BaseModel):
@@ -50,7 +53,7 @@ class PendingAction(BaseModel):
 
 
 class State(BaseModel):
-    schema_version: int = 1
+    schema_version: int = 2
     brief_path: str
     started_at: str
     finished_at: str | None = None
@@ -125,7 +128,13 @@ def write_state(state: State) -> None:
 
 def read_state() -> State | None:
     """Return the current State, or None if no current-run.json exists.
-    Raises StateCorruptError if the file exists but is unreadable/invalid."""
+    Raises StateCorruptError if the file exists but is unreadable/invalid.
+
+    schema_version 1 (legacy) and 2 (current) both load: pydantic places
+    the file's value on the field and defaults the v2-added StepState
+    fields (plan, coder_output) when absent. A loaded v1 state is NOT
+    force-migrated — a read does not rewrite; it stays v1 until a fresh
+    init_state (which defaults to 2)."""
     json_path = _json_path()
     if not json_path.is_file():
         return None
@@ -171,6 +180,14 @@ def _render_state_md(state: State) -> str:
     if cur is not None:
         lines.append(f"**Step {cur.n} — {cur.name}**")
         lines.append(f"Status: {cur.status} · coder_mode: {state.coder_mode}")
+        # brief Step 7: compact plan indicator only — never the verbose
+        # plan content (keeps current-run.md one-screen-glanceable).
+        # Omitted entirely when no plan is persisted for this step.
+        if cur.plan is not None:
+            lines.append(
+                "Plan: (escalated)" if cur.plan.get("escalate")
+                else "Plan: stored"
+            )
     else:
         lines.append("(no current step)")
     lines += ["", "## Pending action", ""]

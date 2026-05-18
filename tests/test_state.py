@@ -130,6 +130,67 @@ class TestState(unittest.TestCase):
         # canonical file and state/ is gitignored. The invariant that matters
         # (reader never sees a partial canonical file) holds.
 
+    # ---- Phase 1 Step 7: plan / coder_output / schema_version=2 ----
+
+    def test_stepstate_new_fields_defaults(self) -> None:
+        s = self._mk_state()
+        for st in s.steps:
+            self.assertIsNone(st.plan)
+            self.assertIsNone(st.coder_output)
+
+    def test_schema_version_defaults_to_2(self) -> None:
+        s = self._mk_state()
+        self.assertEqual(s.schema_version, 2)
+        write_state(s)
+        self.assertEqual(read_state().schema_version, 2)
+
+    def test_v1_state_file_loads_legacy(self) -> None:
+        s = self._mk_state()
+        raw = s.model_dump()
+        raw["schema_version"] = 1
+        for st in raw["steps"]:
+            st.pop("plan", None)
+            st.pop("coder_output", None)
+        (self._dir / "current-run.json").write_text(
+            json.dumps(raw), encoding="utf-8"
+        )
+        back = read_state()
+        self.assertIsNotNone(back)
+        self.assertEqual(back.schema_version, 1)  # legacy preserved
+        self.assertTrue(all(st.plan is None for st in back.steps))
+        self.assertTrue(all(st.coder_output is None for st in back.steps))
+
+    def test_round_trip_preserves_plan(self) -> None:
+        s = self._mk_state()
+        s.steps[0].plan = {"step_number": 1, "approach": "x"}
+        write_state(s)
+        self.assertEqual(
+            read_state().steps[0].plan, {"step_number": 1, "approach": "x"}
+        )
+
+    def test_md_plan_stored(self) -> None:
+        s = self._mk_state()
+        s.steps[0].plan = {"step_number": 1, "approach": "x"}
+        write_state(s)
+        md = (self._dir / "current-run.md").read_text()
+        self.assertIn("Plan: stored", md)
+        self.assertNotIn("Plan: (escalated)", md)
+
+    def test_md_plan_escalated(self) -> None:
+        s = self._mk_state()
+        s.steps[0].plan = {"escalate": True, "reason": "missing-decision"}
+        write_state(s)
+        md = (self._dir / "current-run.md").read_text()
+        self.assertIn("Plan: (escalated)", md)
+        self.assertNotIn("Plan: stored", md)
+
+    def test_md_plan_none_no_line(self) -> None:
+        s = self._mk_state()  # no plan set
+        write_state(s)
+        md = (self._dir / "current-run.md").read_text()
+        self.assertNotIn("Plan: stored", md)
+        self.assertNotIn("Plan: (escalated)", md)
+
     def test_transition_persists(self) -> None:
         s = self._mk_state()
         write_state(s)

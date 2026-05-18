@@ -338,9 +338,10 @@ class Orchestrator:
     def _plan_step(self, brief, state, idx: int):
         """Returns Plan | escalation-dict. Resume-reuse: if
         state.steps[idx].plan is already set, reconstruct from it without
-        calling the Planner (escalation dict passes through). In
-        Phase 0-shaped state .plan is always None so this falls through;
-        Step 7's schema work makes the reuse path live on resume.
+        calling the Planner (escalation dict passes through). Step 7
+        landed the schema (StepState.plan, schema_version=2), so the
+        reuse path is live on resume; a legacy v1 state loads with
+        .plan=None on every step and falls through to the Planner.
 
         On a fresh plan, persist immediately via the atomic write_state
         contract (the brief's `_write_state()` shorthand) so a crash
