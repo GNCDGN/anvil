@@ -39,6 +39,7 @@ from anvil.errors import AnvilError
 from anvil.planner import Plan, Planner
 from anvil.state import (
     PendingAction,
+    State,
     init_state,
     state_dir,
     transition,
@@ -168,7 +169,7 @@ class Orchestrator:
             if reply is None or reply.text.strip().lower() != "resume":
                 transition(st, "aborted")
                 return 1
-            return self.handle_brief(Path(st.brief_path))
+            return self.handle_brief(Path(st.brief_path), resumed_state=st)
         except KeyboardInterrupt:
             log.warning("KeyboardInterrupt in resume() — persisting state")
             try:
@@ -182,7 +183,9 @@ class Orchestrator:
         finally:
             restore_interrupt_handler()
 
-    def handle_brief(self, brief_path: Path) -> int:
+    def handle_brief(
+        self, brief_path: Path, *, resumed_state: State | None = None,
+    ) -> int:
         try:
             if self.coder_mode == "auto":
                 # Phase 2+ path — not built in Phase 0. Nothing more.
@@ -199,20 +202,51 @@ class Orchestrator:
             # caught below — a brief defect surfaces, not a silent blind run.
             brief = resolve_context_paths(brief, self.config.vault_path)
 
-            started_at = datetime.now(_UK).isoformat(timespec="seconds")
-            state = init_state(
-                brief, started_at, brief_path=str(brief_path),
-                coder_mode="manual",
-            )
-            self._state = state
-            self._open_run_log(brief, started_at)
-            state = transition(state, "running", run_log=str(self._run_log))
-            self._state = state
-            self._log_event("start", f"{len(brief.steps)} steps; manual mode")
+            if resumed_state is not None:
+                # Decision #15 fix (Phase 2 Step 2): on resume, reuse the
+                # loaded state instead of clobbering it with init_state.
+                # _plan_step's reuse-guard depends on state.steps[i].plan
+                # being populated; init_state always sets plan=None and so
+                # silently invalidated the guard on the resume path before.
+                state = resumed_state
+                self._state = state
+                # Reopen the existing run log for append, if known.
+                if state.run_log:
+                    self._run_log = Path(state.run_log)
+                self._log_event(
+                    "resume", f"resumed at step {state.current_step}"
+                )
+                # The brief is already in active/ from the original run; do
+                # not re-move it. transition() back to "running" so the
+                # loop's status checks see a runnable state.
+                state = transition(state, "running", pending_action=None)
+                self._state = state
+            else:
+                started_at = datetime.now(_UK).isoformat(timespec="seconds")
+                state = init_state(
+                    brief, started_at, brief_path=str(brief_path),
+                    coder_mode="manual",
+                )
+                self._state = state
 
-            self._move_brief(brief_path)
+                self._open_run_log(brief, started_at)
+                state = transition(state, "running",
+                                   run_log=str(self._run_log))
+                self._state = state
+                self._log_event(
+                    "start", f"{len(brief.steps)} steps; manual mode"
+                )
+
+                self._move_brief(brief_path)
 
             for idx, bstep in enumerate(brief.steps):
+                # Decision #15 fix (Phase 2 Step 2): skip steps already
+                # marked done from a prior session. Without this, resume
+                # re-executes completed steps with their persisted plans —
+                # which is worse than re-planning. The reuse-guard alone
+                # is not enough; we must not enter the step body at all.
+                if state.steps[idx].status == "done":
+                    continue
                 state.steps[idx].status = "running"
                 state.current_step = bstep.number
                 state = transition(state, "running")

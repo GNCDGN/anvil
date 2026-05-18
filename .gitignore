@@ -11,3 +11,4 @@ __pycache__/
 *.pyc
 .DS_Store
 *.tmp
+*.pre-phase-2-step-2.bak
