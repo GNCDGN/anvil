@@ -39,6 +39,7 @@ class Config:
     planner_timeout: int
     coder_timeout: int
     claude_binary: str | None = None
+    coder_mode: str = "manual"
 
     @classmethod
     def load(cls, env_path: Path | None = None) -> "Config":
@@ -81,6 +82,12 @@ class Config:
         )
         coder_timeout = int_env("CODER_TIMEOUT_SECONDS", 600)
         claude_binary = os.environ.get("CLAUDE_BINARY", "").strip() or None
+        coder_mode = os.environ.get("CODER_MODE", "manual").strip() or "manual"
+        if coder_mode not in ("manual", "auto"):
+            problems.append(
+                f"CODER_MODE (must be 'manual' or 'auto', got {coder_mode!r})"
+            )
+            coder_mode = "manual"
         planner_timeout = int_env("PLANNER_TIMEOUT_SECONDS", 120)
         anvil_defer_window_seconds = int_env("ANVIL_DEFER_WINDOW_SECONDS", 300)
 
@@ -101,4 +108,5 @@ class Config:
             planner_timeout=planner_timeout,
             coder_timeout=coder_timeout,
             claude_binary=claude_binary,
+            coder_mode=coder_mode,
         )

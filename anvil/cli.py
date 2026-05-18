@@ -106,14 +106,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     from anvil.orchestrator import Orchestrator
-    return Orchestrator(config).run(briefs[0])
+    return Orchestrator(config, coder_mode=config.coder_mode).run(briefs[0])
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
     _setup_logging()
     config = _load_config_or_exit()
     from anvil.orchestrator import Orchestrator
-    return Orchestrator(config).resume()
+    return Orchestrator(config, coder_mode=config.coder_mode).resume()
 
 
 def build_parser() -> argparse.ArgumentParser:
