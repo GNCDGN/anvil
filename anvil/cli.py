@@ -15,6 +15,7 @@ Phase 0 Step 9: `run` / `resume` are wired to the Orchestrator.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -22,6 +23,36 @@ from pathlib import Path
 from anvil import __version__
 
 _TERMINAL = {"done", "failed", "aborted"}
+
+
+def _setup_logging() -> Path:
+    """Wire a file handler so the [planner] token-usage lines (and every
+    anvil.* log) are persisted to anvil.log. Nothing else configures a
+    handler anywhere; without this every log.info() no-ops at the
+    handler-less root logger (decision #13). Attaches to the `anvil`
+    parent logger (children propagate up), not root, so the test
+    suite's assertLogs and any third-party logging are untouched.
+    Idempotent: a second call does not stack a duplicate handler on the
+    same file (keeps the manual probe and repeat invocations safe).
+    Format is `%(asctime)s %(message)s` — the message already carries
+    its own `[planner]` prefix, so no redundant logger-name bracket;
+    the Step 10 `grep "\\[planner\\]"` still matches.
+    """
+    log_path = _anvil_root() / "anvil.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    anvil_log = logging.getLogger("anvil")
+    anvil_log.setLevel(logging.INFO)
+    for h in anvil_log.handlers:
+        if isinstance(h, logging.FileHandler) and (
+            Path(getattr(h, "baseFilename", "")).resolve()
+            == log_path.resolve()
+        ):
+            return log_path
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    anvil_log.addHandler(handler)
+    return log_path
 
 
 def _anvil_root() -> Path:
@@ -55,6 +86,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    _setup_logging()
     config = _load_config_or_exit()
 
     # One build at a time: refuse if a non-terminal run is live.
@@ -78,6 +110,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    _setup_logging()
     config = _load_config_or_exit()
     from anvil.orchestrator import Orchestrator
     return Orchestrator(config).resume()
