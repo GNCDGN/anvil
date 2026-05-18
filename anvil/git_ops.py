@@ -61,6 +61,30 @@ def is_clean(repo_path: Path) -> bool:
     return _git(repo_path, "status", "--porcelain").stdout.strip() == ""
 
 
+def head_hash(repo_path: Path) -> str | None:
+    """Return the current HEAD commit SHA, or None on git failure.
+
+    Phase 2 Step 7 addition (decisions #14/17 close at Step 9): in
+    manual-Coder mode Genco commits in his own Claude Code session,
+    so ANVIL's git_ops.commit_step() finds nothing to commit and
+    returns "". The orchestrator falls back to head_hash() to record
+    the attribution that already exists in the target repo's git log
+    — design Part 3 explicitly: "The state still records the head
+    commit hash via `git rev-parse HEAD` so attribution holds either
+    way." Returns None (not raise) on any git failure so the
+    orchestrator can keep going; state.commit stays None in that
+    case, same shape as before.
+    """
+    try:
+        r = _git(repo_path, "rev-parse", "HEAD", check=False)
+        if r.returncode != 0:
+            return None
+        sha = r.stdout.strip()
+        return sha or None
+    except GitError:
+        return None
+
+
 def files_changed_since(repo_path: Path, commit_hash: str) -> list[str]:
     """Names of files changed between `commit_hash` and HEAD."""
     out = _git(
