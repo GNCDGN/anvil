@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -62,6 +63,12 @@ class Brief(BaseModel):
     context_paths: list[Path] = []
     steps: list[Step] = []
     end_to_end_test: EndToEndTest | None = None
+    # Phase 2 Step 6 (decision #18 layer 1): scope.files paths that
+    # don't exist at target_repo_path AND aren't write-targets of any
+    # step land here as warnings (not validation errors). Each entry:
+    # {'kind': 'path-not-found', 'step_number': int, 'path': str,
+    #  'closest_match': str | None}.
+    parse_warnings: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +182,90 @@ def _parse_e2e(section: str | None) -> EndToEndTest | None:
     )
 
 
+def _basename_match(repo: Path, target: str) -> str | None:
+    """Walk repo (excluding .git/__pycache__/.venv/node_modules) for a
+    file with the same basename as `target`. Return the relative path
+    of the single match, or None if zero or multiple matches exist.
+    Deterministic: walks in sorted order so the same input always
+    produces the same answer."""
+    base = Path(target).name
+    excluded = {".git", "__pycache__", ".venv", "node_modules"}
+    hits: list[str] = []
+    try:
+        for p in sorted(repo.rglob(base)):
+            if any(seg in excluded for seg in p.parts):
+                continue
+            if not p.is_file():
+                continue
+            try:
+                hits.append(str(p.relative_to(repo)))
+            except ValueError:
+                continue
+    except OSError:
+        return None
+    return hits[0] if len(hits) == 1 else None
+
+
+def _compute_parse_warnings(brief: Brief) -> list[dict]:
+    """Phase 2 Step 6 (decision #18): for each step's scope.files,
+    warn if the path doesn't exist at target_repo_path AND isn't a
+    write-target of any step. Files the build creates would otherwise
+    be falsely warned about.
+
+    Returns a list of warning dicts; the caller assigns them to
+    brief.parse_warnings AND emits the human-readable line via
+    _emit_parse_warnings.
+
+    target_repo_path is checked for existence; if it doesn't exist
+    yet (validation will catch that separately), the warning pass is
+    skipped entirely — no false-positive flood of "everything missing".
+    """
+    repo = brief.target_repo_path
+    if not repo.is_dir():
+        return []
+    write_targets: set[str] = set()
+    for step in brief.steps:
+        if "write" in step.scope_operations:
+            write_targets.update(step.scope_files)
+    warnings: list[dict] = []
+    for step in brief.steps:
+        for sf in step.scope_files:
+            if (repo / sf).exists():
+                continue
+            if sf in write_targets:
+                continue
+            warnings.append({
+                "kind": "path-not-found",
+                "step_number": step.number,
+                "path": sf,
+                "closest_match": _basename_match(repo, sf),
+            })
+    return warnings
+
+
+def _emit_parse_warnings(warnings: list[dict]) -> None:
+    """Emit each warning to stderr and to the anvil logger. Stderr
+    line shape matches the brief's spec:
+      [brief-warning] step N: scope.files entry 'X' does not exist
+      at target_repo_path; closest match: 'Y'. Continuing; the Coder
+      will reconcile at execute time."""
+    if not warnings:
+        return
+    import logging
+    log = logging.getLogger("anvil.brief")
+    for w in warnings:
+        cm = w.get("closest_match")
+        cm_text = f"'{cm}'" if cm else "(none)"
+        line = (
+            f"[brief-warning] step {w['step_number']}: scope.files "
+            f"entry '{w['path']}' does not exist at target_repo_path; "
+            f"closest match: {cm_text}. Continuing; the Coder will "
+            "reconcile at execute time."
+        )
+        print(line, file=sys.stderr)
+        log.warning(line)
+
+
 def parse_brief_raw(path: Path) -> tuple[Brief, dict]:
     """Parse a brief markdown file. Returns (Brief, raw_frontmatter). The raw
     frontmatter dict lets validate_or_reject's rule 1 distinguish a literally
@@ -199,6 +290,13 @@ def parse_brief_raw(path: Path) -> tuple[Brief, dict]:
         steps=_parse_steps(sections.get("steps", "")),
         end_to_end_test=_parse_e2e(sections.get("end-to-end test")),
     )
+    # Phase 2 Step 6 (decision #18 layer 1): compute parse-time path
+    # warnings and attach them to the Brief. Emit each to stderr +
+    # logger so the build session sees them before Stage A runs.
+    warnings = _compute_parse_warnings(brief)
+    if warnings:
+        brief = brief.model_copy(update={"parse_warnings": warnings})
+        _emit_parse_warnings(warnings)
     return brief, (fm if isinstance(fm, dict) else {})
 
 

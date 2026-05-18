@@ -380,6 +380,33 @@ def _assemble_stage_a_prompt(
     out = template
     for token, value in subs:
         out = out.replace(token, value)
+
+    # Phase 2 Step 6 (decision #18 layer 2): append a
+    # [disk-reconciliation-note] block when the brief carries
+    # parse_warnings for THIS step. Stage B sees this through the
+    # Stage A->B handoff and may surface the reconciliation in
+    # escalation_triggers. The Stage A template itself is not
+    # modified; the block is appended at assembly time, same posture
+    # as Phase 1's {PRIOR_STEP_BLOCK} rendering. The block is omitted
+    # entirely when no warning applies to the current step.
+    relevant = [
+        w for w in getattr(brief, "parse_warnings", []) or []
+        if w.get("step_number") == step.number
+    ]
+    if relevant:
+        lines = []
+        for w in relevant:
+            cm = w.get("closest_match")
+            cm_text = f"'{cm}'" if cm else "(no single close match found)"
+            lines.append(
+                f"[disk-reconciliation-note] Brief step {w['step_number']} "
+                f"references '{w['path']}'; this path does not exist at "
+                f"target_repo_path. Closest match on disk: {cm_text}. "
+                "The Coder will reconcile at execute time; you may want "
+                "to flag this in escalation_triggers."
+            )
+        out = out.rstrip() + "\n\n" + "\n".join(lines) + "\n"
+
     return out
 
 
