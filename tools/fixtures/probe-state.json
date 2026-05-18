@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "brief_path": "/tmp/self-check-brief.md",
+  "started_at": "2026-05-18T00:00:00",
+  "status": "done",
+  "current_step": 1,
+  "coder_mode": "auto",
+  "run_log": null,
+  "steps": [
+    {
+      "n": 1,
+      "name": "fixture step",
+      "status": "done",
+      "commit": "deadbeef",
+      "smoke": "pass",
+      "smoke_output": "ok",
+      "plan": {
+        "step_number": 1,
+        "step_name": "fixture",
+        "approach": "do it",
+        "confidence": "high",
+        "escalation_triggers": []
+      },
+      "coder_output": {
+        "exit_code": 0,
+        "stdout": "done",
+        "stderr": "",
+        "files_touched": [
+          "a.py"
+        ],
+        "out_of_scope": [],
+        "reconciliations": [],
+        "duration_s": 12.3,
+        "allowed_tools": [
+          "Edit"
+        ]
+      }
+    }
+  ]
+}

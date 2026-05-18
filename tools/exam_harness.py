@@ -72,6 +72,65 @@ _VOICE = (
     "below is a hook for the human grader."
 )
 
+# Phase 2 grading dimensions, from
+# builds/2026-05-18-anvil-phase-2/design.md Part 10. Additive to
+# DIMENSIONS — the harness emits both sections; the grader uses
+# whichever set matches the phase being graded.
+PHASE2_DIMENSIONS = [
+    ("Coder scope discipline",
+     "coder_outputs per step — out_of_scope always empty"),
+    ("Allow-list behaviour",
+     "coder_outputs.allowed_tools per step; Layer 2 caught everything if Layer 1 leaked"),
+    ("Path-prefix reconciliation correctness",
+     "coder_outputs.reconciliations — triggered when expected, resolved cleanly"),
+    ("Git introspection",
+     "state.commit matches git log across all steps; never None for run steps"),
+    ("Smoke test correctness",
+     "orchestrator-run smokes correctly distinguish Coder success from smoke success"),
+    ("Escalation grammar",
+     "every escalation parsed; no paused-by-user from natural-language replies"),
+    ("Resume re-plan fix",
+     "across resume events in the build, zero avoidable Planner calls fire"),
+    ("Cost",
+     "Planner spend under $20; Coder cost tracked as duration"),
+    ("Total Genco reply count",
+     "under 20% of Phase 1 baseline (counted from run log reply events)"),
+    ("Phase-1-retroactive",
+     "Planner escalation calibration on Step 3 (judgment call); Step 4 conditional-skip discipline"),
+]
+
+# Escalation-source bins for Phase 2 scoring. Matched against the
+# `reason` field of escalation-shaped plans + run-log "escalation"
+# events. Order matters: more specific patterns first.
+_ESCALATION_BINS = {
+    "planner-self": (
+        "judgment-call", "scope-question", "missing-decision",
+        "stage-a-missed-context", "planner escalation",
+    ),
+    "framework": (
+        "planner-validation-failure", "smoke test failed",
+        "coder-out-of-scope", "coder-path-reconciliation-failed",
+        "coder-failed",
+    ),
+    "genco-initiated": (
+        # paused-by-user via non-grammar reply; the run-log "pause"
+        # event with a recorded reply text is the signal.
+        "pause",
+    ),
+}
+
+
+def _bin_escalation(reason: str) -> str:
+    """Return the bin name for an escalation reason, or "other"."""
+    if not reason:
+        return "other"
+    rlow = reason.lower()
+    for bin_name, patterns in _ESCALATION_BINS.items():
+        for p in patterns:
+            if p in rlow:
+                return bin_name
+    return "other"
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -161,6 +220,15 @@ class Capture:
         self.smokes: dict[int, dict] = {}
         self.actual_commits: dict[int, str] = {}
         self.last_state = None
+        # Phase 2 Step 4 additions: Coder output per step, path
+        # reconciliations, reply-event count, escalation source bins.
+        self.coder_outputs: dict[int, dict] = {}
+        self.reconciliations: list[dict] = []
+        self.reply_events: list[dict] = []
+        self.escalation_bin_counts: dict[str, int] = {
+            "planner-self": 0, "framework": 0,
+            "genco-initiated": 0, "other": 0,
+        }
 
     def poll(self, state: dict):
         self.last_state = state
@@ -190,6 +258,19 @@ class Capture:
                         "options": plan.get("options"),
                         "step_number": plan.get("step_number"),
                     })
+            # Phase 2 Step 4: capture coder_output as it appears.
+            co = st.get("coder_output")
+            old_co = old.get("coder_output")
+            if co is not None and old_co is None:
+                # The Phase 2 Coder returns a dict; Phase 1 manual
+                # mode leaves coder_output as None — both correct.
+                if isinstance(co, dict):
+                    self.coder_outputs[n] = co
+                    for rec in co.get("reconciliations", []) or []:
+                        self.reconciliations.append({"step": n, **rec})
+                else:
+                    # Legacy string shape — store as-is for the grader.
+                    self.coder_outputs[n] = {"_raw": co}
             if st.get("smoke") is not None and old.get("smoke") is None:
                 self.smokes[n] = {
                     "smoke": st.get("smoke"),
@@ -349,6 +430,106 @@ def render(cap: Capture, planner_calls: list[dict],
             "",
         ]
 
+
+    # --- Phase 2 Step 4 additions below ---
+    # Coder outputs section.
+    L += ["", "## Coder outputs", ""]
+    if cap.coder_outputs:
+        L += [
+            "| Step | exit | files | out_of_scope | duration_s | "
+            "allow-list / deny-list |",
+            "|---|---|---|---|---|---|",
+        ]
+        for n in sorted(cap.coder_outputs):
+            co = cap.coder_outputs[n]
+            if "_raw" in co:
+                L.append(
+                    f"| {n} | (manual) | — | — | — | — |"
+                )
+                continue
+            files = co.get("files_touched", []) or []
+            oos = co.get("out_of_scope", []) or []
+            dur = co.get("duration_s")
+            dur_s = f"{dur:.1f}" if isinstance(dur, (int, float)) else "—"
+            tools = co.get("allowed_tools") or co.get("disallowed_tools") or "—"
+            L.append(
+                f"| {n} | {co.get('exit_code', '—')} | "
+                f"{len(files)} ({', '.join(files) or '—'}) | "
+                f"{len(oos)} ({', '.join(oos) or '—'}) | "
+                f"{dur_s} | {tools} |"
+            )
+    else:
+        L.append("(no coder_output captured — Phase 1 manual-mode runs leave this empty)")
+
+    # Path reconciliations.
+    L += ["", "### Path reconciliations", ""]
+    if cap.reconciliations:
+        L += [
+            "| Step | original | resolved | status | reason |",
+            "|---|---|---|---|---|",
+        ]
+        for rec in cap.reconciliations:
+            L.append(
+                f"| {rec.get('step')} | {rec.get('original', '—')} | "
+                f"{rec.get('resolved') or '—'} | "
+                f"{rec.get('status', '—')} | {rec.get('reason', '—')} |"
+            )
+    else:
+        L.append("(no path reconciliations recorded)")
+
+    # Escalation rate — bin every captured escalation by source.
+    L += ["", "## Escalation rate (Phase 2 metric)", ""]
+    bin_counts = {"planner-self": 0, "framework": 0,
+                  "genco-initiated": 0, "other": 0}
+    for e in cap.escalations:
+        bin_counts[_bin_escalation(e.get("reason", ""))] += 1
+    total_escalations = sum(bin_counts.values())
+    L += [
+        f"- planner-self-emitted: {bin_counts['planner-self']}",
+        f"- framework-emitted: {bin_counts['framework']}",
+        f"- Genco-initiated (non-grammar reply): {bin_counts['genco-initiated']}",
+        f"- other: {bin_counts['other']}",
+        f"- **total**: {total_escalations}",
+    ]
+
+    # Total reply count — counted from run log "coder(manual) reply=",
+    # "pause reply=", and escalation→user-decision events. The harness
+    # does not see Telegram directly; the run log is the proxy.
+    L += ["", "## Total Genco reply count (proxy via run log)", ""]
+    reply_count = 0
+    if run_log and Path(run_log).is_file():
+        try:
+            run_log_text = Path(run_log).read_text(
+                encoding="utf-8", errors="replace"
+            )
+            for line in run_log_text.splitlines():
+                if "coder(manual)" in line and "reply=" in line:
+                    reply_count += 1
+                elif "**pause**" in line and "reply=" in line:
+                    reply_count += 1
+                elif "step-done" in line:
+                    # An explicit-confirm step-done is the "go" reply.
+                    reply_count += 1
+        except Exception as e:
+            L.append(f"(run-log read error: {e})")
+    L += [
+        f"- replies counted from run log: {reply_count}",
+        "- Phase 1 manual-Coder baseline is documented in the Phase 1 setup-log entry; "
+        "Phase 2 target is < 20% of that baseline.",
+    ]
+
+    # Phase 2 grading dimensions.
+    L += ["", "## Phase 2 grading dimensions (ungraded — grader plugs in here)", ""]
+    for i, (name, feeds) in enumerate(PHASE2_DIMENSIONS, 1):
+        L += [
+            f"### Phase 2 dimension {i} — {name}",
+            "",
+            f"Grader: assess against Phase 2 rubric dimension {i} ({name}). "
+            f"Evidence: {feeds}.",
+            "",
+        ]
+    # --- end Phase 2 Step 4 additions ---
+
     L += ["## Decisions register", ""]
     if decisions:
         L += [f"- {d}" for d in decisions]
@@ -389,7 +570,14 @@ def main(argv=None) -> int:
                         "(no watch loop) — deterministic snapshot")
     p.add_argument("--interval", type=float, default=2.0,
                    help="poll seconds (default 2)")
+    p.add_argument("--self-check", action="store_true",
+                   help="run against tools/fixtures/probe-state.json "
+                        "and assert the report contains all dimension "
+                        "sections; exit 0 on pass, non-zero on fail")
     args = p.parse_args(argv)
+
+    if args.self_check:
+        return _self_check()
 
     state_file = args.state_file.expanduser()
     log_file = args.log_file.expanduser()
@@ -450,6 +638,86 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         write("sigint")
         return 0
+
+
+
+def _self_check() -> int:
+    """Self-check: run the harness against a known fixture state and
+    assert the report contains every dimension section. Creates the
+    fixture at tools/fixtures/probe-state.json if missing. Stdlib-only.
+    Returns 0 on pass, 1 on fail."""
+    import tempfile
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    fixtures_dir.mkdir(parents=True, exist_ok=True)
+    fixture = fixtures_dir / "probe-state.json"
+    if not fixture.is_file():
+        fixture.write_text(json.dumps({
+            "schema_version": 2,
+            "brief_path": "/tmp/self-check-brief.md",
+            "started_at": "2026-05-18T00:00:00",
+            "status": "done",
+            "current_step": 1,
+            "coder_mode": "auto",
+            "run_log": None,
+            "steps": [
+                {
+                    "n": 1, "name": "fixture step",
+                    "status": "done",
+                    "commit": "deadbeef",
+                    "smoke": "pass",
+                    "smoke_output": "ok",
+                    "plan": {"step_number": 1, "step_name": "fixture",
+                             "approach": "do it", "confidence": "high",
+                             "escalation_triggers": []},
+                    "coder_output": {
+                        "exit_code": 0, "stdout": "done", "stderr": "",
+                        "files_touched": ["a.py"], "out_of_scope": [],
+                        "reconciliations": [], "duration_s": 12.3,
+                        "allowed_tools": ["Edit"],
+                    },
+                },
+            ],
+        }, indent=2), encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "self-check-exam.md"
+        rc = main([
+            "--state-file", str(fixture),
+            "--log-file", "/tmp/nonexistent-log",
+            "--target-repo", str(Path(__file__).resolve().parent.parent),
+            "--out", str(out),
+            "--once",
+        ])
+        if rc != 0 or not out.is_file():
+            print(f"self-check: harness exited {rc} or no output", file=sys.stderr)
+            return 1
+        report = out.read_text(encoding="utf-8")
+
+    expected_sections = [
+        "## Per-step evidence",
+        "## Status transitions",
+        "## Token cost",
+        "## Raw plans",
+        "## Escalations",
+        "## Coder outputs",
+        "### Path reconciliations",
+        "## Escalation rate (Phase 2 metric)",
+        "## Total Genco reply count",
+        "## Phase 2 grading dimensions",
+        "## Decisions register",
+    ]
+    missing = [s for s in expected_sections if s not in report]
+    if missing:
+        print(f"self-check: missing sections {missing}", file=sys.stderr)
+        return 1
+
+    # Verify the Coder fixture rendered into the table.
+    if "deadbeef" not in report or "12.3" not in report:
+        print("self-check: Coder fixture did not render", file=sys.stderr)
+        return 1
+
+    print("self-check: ok — all dimension sections present")
+    return 0
 
 
 if __name__ == "__main__":
