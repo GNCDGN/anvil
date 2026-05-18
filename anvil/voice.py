@@ -1,26 +1,37 @@
-"""Voice loading + outgoing-message formatting (implementation-notes
+"""Voice loading + outgoing-message formatting (design Part 8 / impl-notes
 Component 11).
 
-Voice consistency is binding (design Part 2). `load_voice_spec` has a real
-three-tier fallback so an outgoing message never silently loses its
-formatting constraints:
+Voice consistency is binding. `load_voice_spec` resolves the spec with two
+tiers and no third invented tier:
 
-  1. Veronica's live spec:
-     <vault_root>/01-Projects/second-brain/veronica/capabilities/reporting/prompts/_voice.md
-  2. The frozen snapshot: <anvil_root>/prompts/_voice-snapshot.md
-  3. A minimal hardcoded fallback (terse, direct, no preamble, no emoji)
+  1. Canonical: $VAULT_PATH/01-Projects/second-brain/veronica/capabilities/
+     reporting/prompts/_voice.md, read at runtime
+  2. Snapshot: anvil/prompts/_voice-snapshot.md, committed in this repo
 
-Order is vault → snapshot → minimal, never inverted.
+If the canonical is reachable it wins. If not, the snapshot is used. If
+neither is available the function returns an empty string and logs an
+error. It does not raise, and it does not substitute a hardcoded spec —
+an empty voice spec is the design's accepted failure mode (the Planner
+runs with no voice constraints rather than with a fabricated one).
 
-The Phase 0 step/escalation/completion messages are fixed-shape templates
-that already satisfy the spec by construction (`[ANVIL]` prefix, terse, no
-emoji, no preamble). The spec text is loaded at orchestrator startup and
-kept available for the Phase 1 Planner, which generates free text that the
-spec actually governs.
+VAULT_PATH from the environment is the source of truth. The `vault_root`
+parameter is a backward-compat shim for the Phase 0 call site in
+orchestrator.py; it is ignored. Step 6 migrates that call site to the
+zero-arg form and removes the shim.
+
+Drift: when both canonical and snapshot are readable, a warning is logged
+if the canonical's mtime is more than 30 days newer than the snapshot's.
+No auto-update; the warning is the signal.
+
+The Phase 0 step/escalation/completion formatters below are fixed-shape
+templates that satisfy the spec by construction. The spec text is loaded
+at orchestrator startup and consumed by the Phase 1 Planner, which
+generates free text the spec actually governs.
 """
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 log = logging.getLogger("anvil.voice")
@@ -28,33 +39,66 @@ log = logging.getLogger("anvil.voice")
 _VAULT_REL = (
     "01-Projects/second-brain/veronica/capabilities/reporting/prompts/_voice.md"
 )
-_SNAPSHOT = Path(__file__).resolve().parent.parent / "prompts" / "_voice-snapshot.md"
-_MINIMAL = (
-    "Voice (minimal fallback): terse, direct, no preamble, no emoji, no "
-    "exclamation marks, no service phrasing, no sign-offs. Plain English; "
-    "say what changed and what's needed, nothing else."
-)
+_SNAPSHOT = Path(__file__).resolve().parent / "prompts" / "_voice-snapshot.md"
+_DRIFT_SECONDS = 30 * 24 * 60 * 60
 
 
-def load_voice_spec(vault_root: Path) -> str:
-    """Vault → snapshot → minimal. Never raises; never returns empty."""
-    vault_path = Path(vault_root) / _VAULT_REL
-    try:
-        text = vault_path.read_text(encoding="utf-8").strip()
-        if text:
-            return text
-        log.warning(f"voice spec at {vault_path} is empty; trying snapshot")
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"voice spec vault read failed ({e}); trying snapshot")
-    try:
-        text = _SNAPSHOT.read_text(encoding="utf-8").strip()
-        if text:
-            return text
-        log.warning(f"voice snapshot {_SNAPSHOT} is empty; using minimal")
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"voice snapshot read failed ({e}); using minimal")
-    log.error("voice spec unavailable from vault and snapshot; minimal fallback")
-    return _MINIMAL
+def load_voice_spec(vault_root=None) -> str:
+    """Canonical (VAULT_PATH) → snapshot → empty string. Never raises.
+
+    `vault_root` is the Phase 0 backward-compat shim and is ignored;
+    VAULT_PATH from the environment is the source of truth. Step 6
+    removes the shim when orchestrator.py migrates to the zero-arg call.
+    """
+    if vault_root is not None:
+        log.debug("[voice] Phase 0 shim; VAULT_PATH env is source of truth")
+
+    vault_path = os.environ.get("VAULT_PATH", "").strip()
+    canonical = None
+    canonical_text = None
+    if vault_path:
+        canonical = Path(vault_path) / _VAULT_REL
+        if canonical.is_file():
+            try:
+                canonical_text = canonical.read_text(encoding="utf-8")
+            except OSError as e:
+                log.warning(
+                    f"[voice] canonical _voice.md unreadable: {e}; "
+                    f"falling back to snapshot"
+                )
+                canonical_text = None
+
+    if canonical_text is not None:
+        if _SNAPSHOT.is_file():
+            try:
+                if (
+                    canonical.stat().st_mtime - _SNAPSHOT.stat().st_mtime
+                    > _DRIFT_SECONDS
+                ):
+                    log.warning(
+                        f"[voice] canonical _voice.md is more than 30 days "
+                        f"newer than snapshot ({_SNAPSHOT}); snapshot is "
+                        f"likely stale"
+                    )
+            except OSError:
+                pass
+        return canonical_text
+
+    if _SNAPSHOT.is_file():
+        log.info("[voice] using snapshot _voice.md")
+        try:
+            return _SNAPSHOT.read_text(encoding="utf-8")
+        except OSError as e:
+            log.error(
+                f"[voice] snapshot _voice.md unreadable: {e}; voice spec empty"
+            )
+            return ""
+
+    log.error(
+        "[voice] neither canonical nor snapshot _voice.md found; "
+        "voice spec empty"
+    )
+    return ""
 
 
 def _short(text: str, n: int = 120) -> str:
