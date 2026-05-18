@@ -38,6 +38,7 @@ class Config:
     planner_model: str
     planner_timeout: int
     coder_timeout: int
+    claude_binary: str | None = None
 
     @classmethod
     def load(cls, env_path: Path | None = None) -> "Config":
@@ -79,6 +80,7 @@ class Config:
             os.environ.get("PLANNER_MODEL", "").strip() or "claude-opus-4-7"
         )
         coder_timeout = int_env("CODER_TIMEOUT_SECONDS", 600)
+        claude_binary = os.environ.get("CLAUDE_BINARY", "").strip() or None
         planner_timeout = int_env("PLANNER_TIMEOUT_SECONDS", 120)
         anvil_defer_window_seconds = int_env("ANVIL_DEFER_WINDOW_SECONDS", 300)
 
@@ -98,4 +100,5 @@ class Config:
             planner_model=planner_model,
             planner_timeout=planner_timeout,
             coder_timeout=coder_timeout,
+            claude_binary=claude_binary,
         )

@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 
 from anvil import git_ops as _git_ops
 from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
+from anvil.coder import Coder
 from anvil.errors import AnvilError
 from anvil.planner import Plan, Planner
 from anvil.state import (
@@ -67,6 +68,7 @@ class Orchestrator:
         telegram=None,
         git=None,
         run_smoke=None,
+        coder=None,
     ) -> None:
         self.config = config
         self.coder_mode = coder_mode
@@ -82,8 +84,38 @@ class Orchestrator:
         # decision #1 closed: zero-arg load_voice_spec() (VAULT_PATH env is
         # the source of truth); the Phase 0 vault_root shim is removed.
         self.voice_spec = voice.load_voice_spec()
+        # Phase 2 Step 9: lazy Coder construction. Only built when
+        # auto-mode is requested AND no coder was injected. Manual mode
+        # leaves self.coder = None and never reads it.
+        if coder is not None:
+            self.coder = coder
+        elif coder_mode == "auto":
+            self.coder = self._build_coder()
+        else:
+            self.coder = None
         self._run_log: Path | None = None
         self._state = None
+
+    def _build_coder(self) -> Coder:
+        """Construct a real Coder from config. The system prompt is
+        coder-system.md with {VOICE_SPEC} substituted. claude_binary
+        defaults to whatever `claude` resolves to on PATH at startup,
+        overridable via CLAUDE_BINARY in .env. Coder timeout reuses
+        config.coder_timeout (already present since Phase 0).
+        """
+        prompt_path = Path(__file__).resolve().parent / "prompts" / "coder-system.md"
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        prompt_text = prompt_text.replace("{VOICE_SPEC}", self.voice_spec)
+        binary = Path(
+            getattr(self.config, "claude_binary", None)
+            or shutil.which("claude")
+            or "claude"
+        )
+        return Coder(
+            claude_binary=binary,
+            timeout=self.config.coder_timeout,
+            system_prompt=prompt_text,
+        )
 
     # ---- telegram (lazy so unit tests can inject a mock) ----
     @property
@@ -188,10 +220,9 @@ class Orchestrator:
     ) -> int:
         try:
             if self.coder_mode == "auto":
-                # Phase 2+ path — not built in Phase 0. Nothing more.
-                raise NotImplementedError(
-                    "auto coder_mode is Phase 2 work; Phase 0 is manual only"
-                )
+                # Phase 2 Step 9 wires this path through the step loop;
+                # no-op here. The auto branch in step 5c does the work.
+                pass
 
             brief = parse_brief(brief_path)
             validate_or_reject(brief)  # raises BriefValidationError on bad brief
@@ -279,17 +310,69 @@ class Orchestrator:
                     "planner", f"step {bstep.number}: {plan.step_name}"
                 )
 
-                # 5c manual-Coder execution
-                outcome = self._manual_step(plan)
-                self._log_event("coder(manual)", f"reply={outcome}")
-                if outcome == "abort":
-                    state = transition(state, "aborted")
-                    return 1
-                if outcome == "skip":
-                    state.steps[idx].status = "done"
-                    state.steps[idx].commit = None
-                    state = transition(state, "running")
-                    continue
+                # 5c Coder execution — branch on coder_mode.
+                # Phase 2 Step 9: auto-mode invokes anvil.coder.Coder;
+                # manual-mode is the Phase 0/1 flow, unchanged.
+                if self.coder_mode == "auto":
+                    coder_output = self.coder.execute_step(plan, brief)
+                    state.steps[idx].coder_output = coder_output
+                    self._state = state
+                    write_state(state)
+                    self._log_event(
+                        "coder(auto)",
+                        f"exit={coder_output.get('exit_code')} "
+                        f"files={len(coder_output.get('files_touched') or [])} "
+                        f"oos={len(coder_output.get('out_of_scope') or [])} "
+                        f"dur={coder_output.get('duration_s', 0):.1f}s",
+                    )
+                    # Route post-Coder escalations.
+                    if coder_output.get("escalate") is True:
+                        self._escalate(
+                            state,
+                            coder_output.get("reason", "coder escalation"),
+                            coder_output.get("detail", ""),
+                            ("go", "abort"),
+                        )
+                        if not self._await_user_decision(state):
+                            return 1
+                        # User said go past the reconciliation failure.
+                        # Skip the step (cannot execute without resolved
+                        # paths); same posture as Planner escalation.
+                        state.steps[idx].status = "done"
+                        state.steps[idx].commit = None
+                        state = transition(state, "running")
+                        self._state = state
+                        continue
+                    if coder_output.get("out_of_scope"):
+                        self._escalate(
+                            state, "coder-out-of-scope",
+                            "Files touched outside plan scope: "
+                            + ", ".join(coder_output["out_of_scope"]),
+                            ("go", "abort"),
+                        )
+                        if not self._await_user_decision(state):
+                            return 1
+                    if coder_output.get("exit_code", 0) != 0:
+                        self._escalate(
+                            state, "coder-failed",
+                            (coder_output.get("stderr") or "")[:1500]
+                            or "Coder exited non-zero with no stderr.",
+                            ("go", "abort"),
+                        )
+                        if not self._await_user_decision(state):
+                            return 1
+                else:
+                    # 5c manual-Coder execution (Phase 0/1 flow).
+                    outcome = self._manual_step(plan)
+                    self._log_event("coder(manual)", f"reply={outcome}")
+                    if outcome == "abort":
+                        state = transition(state, "aborted")
+                        return 1
+                    if outcome == "skip":
+                        state.steps[idx].status = "done"
+                        state.steps[idx].commit = None
+                        state = transition(state, "running")
+                        continue
 
                 # 5d smoke
                 ok, smoke_out = self._run_smoke(bstep.smoke, brief.target_repo_path)
@@ -312,7 +395,18 @@ class Orchestrator:
                     commit_message_hint=bstep.commit_message_hint,
                     run_log_filename=Path(self._run_log).name,
                 )
-                state.steps[idx].commit = commit_hash or None
+                # Phase 2 Step 9 (decisions #14/17): if commit_step
+                # was a no-op (manual mode: Genco committed in his own
+                # Claude Code session, ANVIL's `git add -A` found
+                # nothing), fall back to head_hash so the state
+                # records the attribution that exists in the git log.
+                # Design Part 3 §"Manual mode preserved": "The state
+                # still records the head commit hash via
+                # `git rev-parse HEAD` so attribution holds either way."
+                state.steps[idx].commit = (
+                    commit_hash
+                    or self.git.head_hash(brief.target_repo_path)
+                )
                 state.steps[idx].status = "done"
                 state = transition(state, "running")
                 self._state = state

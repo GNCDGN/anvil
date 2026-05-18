@@ -261,11 +261,29 @@ class TestOrchestrator(unittest.TestCase):
         self.assertTrue(st.brief_path.endswith("/active/" + self.brief_path.name))
         self.assertFalse(Path("~/.anvil-active").expanduser().exists())
 
-    def test_auto_coder_mode_raises_not_implemented(self) -> None:
-        orch = self._orch([])
-        orch.coder_mode = "auto"
-        with self.assertRaises(NotImplementedError):
-            orch.handle_brief(self.brief_path)
+    def test_auto_coder_mode_constructs_without_raising(self) -> None:
+        # Phase 2 Step 9 replaces Phase 0's NotImplementedError
+        # assertion: auto-mode is now wired (decisions P2-8 + P2-9),
+        # so constructing an Orchestrator with coder_mode='auto'
+        # should succeed and populate self.coder. Full integration
+        # coverage lives at
+        # tests/test_orchestrator_coder_integration.py — this test
+        # guards the construction step alone, matching the original
+        # test's narrow scope (Phase 0 asserted Phase 0 behaviour;
+        # Phase 2 asserts Phase 2 behaviour).
+        from unittest import mock
+        from anvil.coder import Coder
+        from anvil.orchestrator import Orchestrator
+        orch = Orchestrator(
+            self.cfg,
+            coder_mode="auto",
+            planner=mock.Mock(),
+            telegram=mock.Mock(),
+            git=mock.Mock(),
+            run_smoke=mock.Mock(),
+        )
+        self.assertIsInstance(orch.coder, Coder)
+        self.assertEqual(orch.coder_mode, "auto")
 
     def test_manual_abort_returns_nonzero_and_state_aborted(self) -> None:
         orch = self._orch(["abort"])  # step 1 manual reply = abort
