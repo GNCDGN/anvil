@@ -300,7 +300,7 @@ class Orchestrator:
                 if not ok:
                     self._escalate(
                         state, "smoke test failed",
-                        smoke_out, "fix and re-run / abort",
+                        smoke_out, ("go", "abort"),
                     )
                     if not self._await_user_decision(state):
                         return 1
@@ -420,15 +420,82 @@ class Orchestrator:
         return "abort"
 
     # ---- escalation ----
-    def _escalate(self, state, reason, detail, options) -> None:
-        self.telegram.send(voice.format_escalation(state, reason, detail, options))
+    # Decision #19 (Phase 2 Step 3): the `options` argument is now a
+    # tuple of literal command tokens — ('go', 'abort') in the common
+    # case, ('abort',) when proceeding past the escalation makes no
+    # sense (e.g. planner-validation-failure). Planner-self-emitted
+    # `options` (a list of descriptive prose like 'amend brief to widen
+    # scope') are rendered as numbered context; the *grammar* the user
+    # replies with stays ('go', 'abort'). Source-compatible: a legacy
+    # string-shaped options arg still works (rendered as-is, grammar
+    # falls back to ('go', 'abort')) but emits a one-time warning.
+    def _escalate(self, state, reason, detail, options=("go", "abort")) -> None:
+        prose_lines: list[str] = []
+        if isinstance(options, (list, tuple)) and options and all(
+            isinstance(o, str) for o in options
+        ):
+            # If every element looks like a single short token, treat as
+            # the grammar tuple. Otherwise treat as descriptive prose.
+            grammar = tuple(o.strip().lower() for o in options)
+            looks_like_tokens = all(
+                len(o) <= 16 and " " not in o for o in grammar
+            )
+            if looks_like_tokens:
+                display = " / ".join(grammar)
+            else:
+                # Descriptive prose options from the Planner. Render as
+                # numbered list; grammar is the standard go/abort pair.
+                prose_lines = [
+                    f"  {i + 1}. {opt}" for i, opt in enumerate(options)
+                ]
+                grammar = ("go", "abort")
+                display = "go / abort"
+        elif isinstance(options, str):
+            # Legacy: a single string. Honour the contract but warn so
+            # remaining call sites get migrated.
+            log.warning(
+                "_escalate received legacy string options=%r; "
+                "call sites should pass a tuple of literal tokens.",
+                options,
+            )
+            grammar = ("go", "abort")
+            display = options
+        else:
+            grammar = ("go", "abort")
+            display = "go / abort"
+
+        if prose_lines:
+            detail_with_options = (
+                f"{detail}\n\nPlanner suggests:\n"
+                + "\n".join(prose_lines)
+                + "\n\nReply: " + display
+            )
+        else:
+            detail_with_options = detail
+
+        self.telegram.send(
+            voice.format_escalation(state, reason, detail_with_options, display)
+        )
         self._log_event("escalation", reason)
+        # Remembered for the immediately-following _await_user_decision.
+        self._pending_options = grammar
 
     def _await_user_decision(self, state) -> bool:
-        """Return True to proceed, False if the user aborts/pauses."""
+        """Return True to proceed, False if the user aborts/pauses.
+
+        Decision #19 (Phase 2 Step 3): the accepted-token set is now
+        whatever the most recent _escalate stored on self._pending_options.
+        The previous hardcoded ('go', 'continue', 'proceed') set is retired;
+        the user-facing options line now lists literal command tokens
+        that match the grammar exactly. The grammar always includes
+        'abort' as the abort path.
+        """
+        options = getattr(self, "_pending_options", ("go", "abort"))
         reply = self.telegram.wait_for_reply(timeout=None)
         text = (reply.text.strip().lower() if reply else "")
-        if text in ("go", "continue", "proceed"):
+        # An empty/missing reply is treated as paused-by-user, same as
+        # any other non-matching reply.
+        if text and text != "abort" and text in options:
             return True
         transition(state, "aborted" if text == "abort" else "paused-by-user")
         return False
