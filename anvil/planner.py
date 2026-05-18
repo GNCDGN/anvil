@@ -24,9 +24,11 @@ Component-3-faithfulness notes (Phase-0 stub adaptations, not deviations):
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Literal
 
+import yaml
 from pydantic import BaseModel
 
 from anvil.errors import PlannerError
@@ -123,3 +125,155 @@ class Planner:
             f"no stub plan for step_number {target_number} "
             f"(step_idx {step_idx})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Stage A — vault index, prompt assembly, response parsing
+#
+# Added alongside the Phase 0 stub (above), which stays callable until Step 6
+# replaces it. These are pure module-level functions: no Anthropic call, no
+# client state. Step 6's real Planner class calls them; _call_anthropic
+# lands in Step 5.
+# ---------------------------------------------------------------------------
+
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+_STAGE_A_TEMPLATE = _PROMPTS_DIR / "planner-stage-a.md"
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.S)
+
+
+def _parse_frontmatter(path: Path) -> dict:
+    """First 4096 bytes -> leading `---` YAML block -> dict, or {} if the
+    block is absent, unparseable, or not a mapping.
+
+    Adapted from the Veronica vault-index reference (conversational
+    implementation-notes Component 1) and anvil.brief._split_frontmatter;
+    kept local so planner has no sibling-private coupling. The 4096-byte
+    cap matches the reference; a frontmatter block larger than that
+    truncates and yields {} (acceptable per "no parseable frontmatter
+    -> {}").
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return {}
+    text = head.decode("utf-8", errors="replace")
+    if not text.startswith("---"):
+        return {}
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return {}
+    try:
+        fm = yaml.safe_load(m.group(1))
+    except yaml.YAMLError:
+        return {}
+    return fm if isinstance(fm, dict) else {}
+
+
+def _build_vault_index(
+    context_paths: list[str], vault_root: Path
+) -> dict[str, dict]:
+    """{path_str: frontmatter_dict} for every file under context_paths.
+
+    A path that is a file is indexed directly. A folder is walked with a
+    depth-2 cap: a file directly inside the folder is level 1, a file one
+    subfolder deep is level 2, anything deeper is excluded. Dotfiles and
+    .DS_Store are skipped (the Veronica reference's noise filter). Files
+    with no parseable frontmatter map to {} -- present, not skipped.
+    """
+    vault_root = Path(vault_root)
+    index: dict[str, dict] = {}
+    for raw in context_paths:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = vault_root / p
+        if p.is_file():
+            index[str(p)] = _parse_frontmatter(p)
+            continue
+        if p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if not f.is_file():
+                    continue
+                if f.name.startswith(".") or f.name == ".DS_Store":
+                    continue
+                if len(f.relative_to(p).parts) > 2:
+                    continue
+                index[str(f)] = _parse_frontmatter(f)
+    return index
+
+
+def _assemble_stage_a_prompt(
+    brief, state, step_idx: int, vault_index: dict[str, dict]
+) -> str:
+    """Load planner-stage-a.md and substitute its placeholders.
+
+    Substitution is str.replace per placeholder in a fixed order, NOT
+    str.format: the template plus the YAML vault-index block contain
+    literal { } braces that would break str.format. Do not "simplify"
+    this to .format.
+
+    {VOICE_SPEC} is not handled here. It is a system-prompt concern
+    (Step 2 / Step 6 Planner.__init__); Stage A's user-prompt template
+    has no {VOICE_SPEC} token. system prompt = system= arg; this
+    template = user= arg.
+
+    {BRIEF_MARKDOWN} source is state.brief_path (the Brief object carries
+    no raw text; the orchestrator persists the brief path into state).
+    Unreadable -> "" (never-raise); the structured step fields are still
+    substituted.
+
+    {STATE_JSON} uses state.model_dump_json(indent=2). design Part 2's
+    sample said json.dumps(state.dict(), indent=2); pinned pydantic v2
+    -> model_dump_json, same precedent as brief.py's dataclass->pydantic
+    reconciliation (tracked decision #5).
+    """
+    template = _STAGE_A_TEMPLATE.read_text(encoding="utf-8")
+    step = brief.steps[step_idx]
+
+    try:
+        brief_md = Path(state.brief_path).read_text(encoding="utf-8")
+    except OSError:
+        brief_md = ""
+
+    state_json = state.model_dump_json(indent=2)
+    vault_index_yaml = yaml.safe_dump(
+        vault_index, default_flow_style=False, sort_keys=True
+    )
+
+    subs = [
+        ("{BRIEF_MARKDOWN}", brief_md),
+        ("{STATE_JSON}", state_json),
+        ("{STEP_NUMBER}", str(step.number)),
+        ("{STEP_NAME}", step.name),
+        ("{STEP_SCOPE_FILES}", ", ".join(step.scope_files)),
+        ("{STEP_SCOPE_OPERATIONS}", ", ".join(step.scope_operations)),
+        ("{STEP_NOTES}", step.notes or ""),
+        ("{CONTEXT_PATHS}", ", ".join(str(c) for c in brief.context_paths)),
+        ("{VAULT_INDEX_YAML}", vault_index_yaml),
+    ]
+    out = template
+    for token, value in subs:
+        out = out.replace(token, value)
+    return out
+
+
+def _parse_stage_a_response(
+    text: str, vault_index: dict[str, dict]
+) -> list[str]:
+    """Newline-split, strip, drop empties, filter to paths in vault_index
+    (hallucination guard), then dedupe preserving first occurrence.
+
+    The filter runs before the dedupe so the dedupe target is the
+    surviving in-index set, not the raw response.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.split("\n"):
+        p = line.strip()
+        if not p or p not in vault_index:
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
