@@ -24,6 +24,7 @@ Component-3-faithfulness notes (Phase-0 stub adaptations, not deviations):
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Literal
@@ -31,7 +32,10 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel
 
+from anvil.brief import Step
 from anvil.errors import PlannerError
+
+log = logging.getLogger("anvil.planner")
 
 _DEFAULT_STUB_PLANS = (
     Path(__file__).resolve().parent.parent
@@ -277,3 +281,224 @@ def _parse_stage_a_response(
         seen.add(p)
         out.append(p)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Stage B — file loader, prompt assembly, JSON parse, validation
+#
+# Added alongside the Phase 0 stub and Stage A (above). The Phase 0
+# validate_plan_scope (Plan-object -> bool) stays callable; it is the
+# orchestrator's Phase 0 path, retired in Step 6 with the stub. The new
+# _validate_plan_structure (raw dict -> raise) is the Phase 1 entry point
+# and is independent of pydantic so its errors thread cleanly into the
+# Step 5 retry prompt. No Anthropic call here; _call_anthropic is Step 5.
+# ---------------------------------------------------------------------------
+
+_STAGE_B_TEMPLATE = _PROMPTS_DIR / "planner-stage-b.md"
+_TRUNCATION_MARKER = "\n\n[... truncated at 50000 chars]"
+
+_REQUIRED_PLAN_FIELDS = (
+    "step_number",
+    "step_name",
+    "files_to_touch",
+    "operations",
+    "approach",
+    "smoke_test",
+    "expected_outcome",
+    "commit_message",
+    "scope_boundaries",
+    "confidence",
+    "escalation_triggers",
+)
+_VALID_CONFIDENCE = {"high", "medium", "low"}
+
+
+class PlanParseError(Exception):
+    """Stage B output was not parseable as a single JSON object. Carries
+    the raw text. Subclasses Exception (not PlannerError) so a broad
+    `except PlannerError` cannot swallow it; Step 5's retry catches
+    (PlanParseError, PlanValidationError)."""
+
+
+class PlanValidationError(Exception):
+    """Stage B output parsed as JSON but failed structural validation (or
+    was a malformed escalation block). Same catch contract as
+    PlanParseError."""
+
+
+def _load_files(
+    paths: list[str], vault_root: Path, max_chars_per_file: int = 50_000
+) -> dict[str, str]:
+    """{path: content} for each readable path. Over the cap, content is
+    truncated to the cap and the literal design marker is appended.
+    Missing or unreadable files are logged and omitted (never raised) --
+    Stage A's index can be stale relative to disk by the time Stage B
+    runs, so a vanished file degrades the context, it does not abort.
+    """
+    vault_root = Path(vault_root)
+    out: dict[str, str] = {}
+    for raw in paths:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = vault_root / p
+        try:
+            content = p.read_text(encoding="utf-8")
+        except OSError as e:
+            log.warning(f"[planner] selected file unreadable, omitting: {raw} ({e})")
+            continue
+        if len(content) > max_chars_per_file:
+            content = content[:max_chars_per_file] + _TRUNCATION_MARKER
+        out[raw] = content
+    return out
+
+
+def _prior_step_block(state, step_idx: int) -> str:
+    """design Part 3 {PRIOR_STEP_BLOCK}. step_idx == 0 -> the literal
+    first-step string; otherwise a structured block from
+    state.steps[step_idx - 1]. coder output is read defensively
+    (coder_output then the on-disk coder_result -- decision #6, the
+    Step 7 rename is deferred)."""
+    if step_idx == 0:
+        return "(none — this is the first step)"
+    prior = state.steps[step_idx - 1]
+    plan_json = json.dumps(prior.plan) if prior.plan else "(no plan persisted)"
+    coder_out = (
+        getattr(prior, "coder_output", None)
+        or getattr(prior, "coder_result", None)
+        or "(manual mode — no output captured)"
+    )
+    return (
+        f"Step {prior.n}: {prior.name}\n"
+        f"Plan: {plan_json}\n"
+        f"Coder output: {coder_out}\n"
+        f"Smoke test result: {prior.smoke or '(none)'}\n"
+        f"Commit hash: {prior.commit or '(none)'}"
+    )
+
+
+def _assemble_stage_b_prompt(brief, state, step_idx: int, files: dict[str, str]) -> str:
+    """Load planner-stage-b.md and substitute placeholders.
+
+    str.replace per placeholder in a fixed order, NOT str.format: the
+    template plus the embedded JSON state and vault-file blocks contain
+    literal { } braces that would break str.format. Do not "simplify"
+    this to .format.
+
+    {VOICE_SPEC} is not handled here (system-prompt concern, Step 6).
+    {STATE_JSON} uses model_dump_json (decision #5). {BRIEF_MARKDOWN}
+    source is state.brief_path; unreadable -> "" (never-raise).
+    """
+    template = _STAGE_B_TEMPLATE.read_text(encoding="utf-8")
+    step = brief.steps[step_idx]
+
+    try:
+        brief_md = Path(state.brief_path).read_text(encoding="utf-8")
+    except OSError:
+        brief_md = ""
+
+    if files:
+        vault_files_blocks = "".join(
+            f'<vault_file path="{p}">\n{c}\n</vault_file>\n\n'
+            for p, c in files.items()
+        )
+    else:
+        vault_files_blocks = "(none selected)"
+
+    subs = [
+        ("{BRIEF_MARKDOWN}", brief_md),
+        ("{STATE_JSON}", state.model_dump_json(indent=2)),
+        ("{PRIOR_STEP_BLOCK}", _prior_step_block(state, step_idx)),
+        ("{VAULT_FILES_BLOCKS}", vault_files_blocks),
+        ("{STEP_NUMBER}", str(step.number)),
+        ("{STEP_NAME}", step.name),
+        ("{STEP_SCOPE_FILES}", ", ".join(step.scope_files)),
+        ("{STEP_SCOPE_OPERATIONS}", ", ".join(step.scope_operations)),
+        ("{STEP_NOTES}", step.notes or ""),
+        ("{CONTEXT_PATHS}", ", ".join(str(c) for c in brief.context_paths)),
+    ]
+    out = template
+    for token, value in subs:
+        out = out.replace(token, value)
+    return out
+
+
+def _parse_plan_json(text: str) -> dict:
+    """Strip surrounding whitespace, json.loads. Raise PlanParseError on
+    JSONDecodeError with the raw text in the message. Markdown fences are
+    NOT stripped -- fenced output fails parsing deliberately so the model
+    does not drift toward emitting fences."""
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError as e:
+        raise PlanParseError(
+            f"Stage B output is not valid JSON ({e}). Raw text:\n{text}"
+        ) from e
+
+
+def _validate_plan_structure(plan: dict, brief_step: Step) -> None:
+    """The eight design Part 3 checks, in order, raising
+    PlanValidationError on the first failure. Returns None on success.
+
+    Operates on the raw dict, not a Plan model -- the caller constructs
+    Plan(**plan) only after this passes. brief_step is anvil.brief.Step
+    (design's "BriefStep"); its scope is the flat scope_files /
+    scope_operations attrs (design's brief_step.scope.files shorthand),
+    same as Stage A.
+    """
+    # 1. Escalation short-circuit.
+    if plan.get("escalate") is True:
+        if not isinstance(plan.get("reason"), str):
+            raise PlanValidationError("escalation missing or non-str reason")
+        if not isinstance(plan.get("detail"), str):
+            raise PlanValidationError("escalation missing or non-str detail")
+        if not isinstance(plan.get("step_number"), int):
+            raise PlanValidationError("escalation missing or non-int step_number")
+        if "options" in plan and not (
+            isinstance(plan["options"], list)
+            and all(isinstance(o, str) for o in plan["options"])
+        ):
+            raise PlanValidationError("escalation options must be list[str]")
+        return None
+
+    # 2. Required fields present.
+    for name in _REQUIRED_PLAN_FIELDS:
+        if name not in plan:
+            raise PlanValidationError(f"missing field: {name}")
+
+    # 3. step_number matches the brief step.
+    if plan["step_number"] != brief_step.number:
+        raise PlanValidationError(
+            f"step_number mismatch: plan {plan['step_number']} "
+            f"vs brief {brief_step.number}"
+        )
+
+    # 4. files_to_touch within declared scope (literal-equal, no globs).
+    for path in plan["files_to_touch"]:
+        if path not in brief_step.scope_files:
+            raise PlanValidationError(f"out-of-scope file: {path}")
+
+    # 5. operations within declared scope.
+    for op in plan["operations"]:
+        if op not in brief_step.scope_operations:
+            raise PlanValidationError(f"out-of-scope operation: {op}")
+
+    # 6. confidence in the allowed set.
+    if plan["confidence"] not in _VALID_CONFIDENCE:
+        raise PlanValidationError(f"invalid confidence: {plan['confidence']}")
+
+    # 7. escalation_triggers is list[str] (may be empty).
+    et = plan["escalation_triggers"]
+    if not (isinstance(et, list) and all(isinstance(x, str) for x in et)):
+        raise PlanValidationError("escalation_triggers must be list[str]")
+
+    # 8. scope_boundaries is a dict with str in_scope / out_of_scope.
+    sb = plan["scope_boundaries"]
+    if not (
+        isinstance(sb, dict)
+        and isinstance(sb.get("in_scope"), str)
+        and isinstance(sb.get("out_of_scope"), str)
+    ):
+        raise PlanValidationError(
+            "scope_boundaries must be a dict with str in_scope and out_of_scope"
+        )
+    return None

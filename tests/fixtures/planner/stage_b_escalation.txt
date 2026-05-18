@@ -1,0 +1,6 @@
+{
+  "escalate": true,
+  "reason": "missing-decision",
+  "detail": "The brief does not say which threshold to use. That is a decision Genco has not made; planning past it would be a guess.",
+  "step_number": 1
+}

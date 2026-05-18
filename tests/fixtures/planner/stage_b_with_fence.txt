@@ -1,0 +1,15 @@
+```json
+{
+  "step_number": 1,
+  "step_name": "Example step",
+  "files_to_touch": ["a.py"],
+  "operations": ["write", "commit"],
+  "approach": "Add the helper. Follow the existing pattern in a.py.",
+  "smoke_test": "python -m unittest tests.test_a",
+  "expected_outcome": "Tests pass.",
+  "commit_message": "Step 1: add helper",
+  "scope_boundaries": {"in_scope": "a.py only", "out_of_scope": "b.py, tests"},
+  "confidence": "high",
+  "escalation_triggers": []
+}
+```
