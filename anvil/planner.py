@@ -1,25 +1,21 @@
-"""Planner (implementation-notes Component 3 / design "Plan output schema").
+"""Planner — the real two-stage Opus-driven planner (design Parts 1-4 /
+implementation-notes Component 3).
 
-Phase 0: a STUB Planner. There is no LLM call — `plan_step` reads
-`tests/fixtures/stub-plans.json` and returns the hardcoded plan whose
-`step_number` matches the brief step at the requested index. Phase 1 replaces
-this body with the real two-stage Opus-driven Planner; the `Plan` model and
-`validate_plan_scope` below are kept as-is for Phase 1.
+Stage A selects vault context files from a frontmatter index; Stage B
+generates the JSON plan, with retry-once-with-error and escalation on a
+second failure. `plan_step(brief, state, step_idx)` returns either a
+validated `Plan` pydantic model or an escalation dict (`escalate: True`).
+The caller checks `isinstance(result, dict) and result.get("escalate")`
+first; otherwise it is a `Plan`.
 
-`validate_plan_scope` is REAL validation (not a stub): it enforces that a
-plan's `files_to_touch` ⊆ the brief step's declared `scope.files` and its
-`operations` ⊆ declared `scope.operations`. The stub plans happen to pass it;
-it must still catch genuine out-of-scope plans when the real Planner runs.
+The Phase 0 stub (hardcoded plans from a fixture) and the Phase 0
+`validate_plan_scope` are removed here — scope is now enforced inside
+`_validate_plan_structure` (checks 4 and 5) before any `Plan` is
+constructed, so an out-of-scope plan becomes a planner-validation-failure
+escalation rather than a separate orchestrator-side check.
 
-Component-3-faithfulness notes (Phase-0 stub adaptations, not deviations):
-- Component 3's `Planner.__init__(api_key, model, timeout)` targets the real
-  Phase 1 Planner. The Phase 0 stub needs none of those; they are accepted
-  but optional, and `stub_plans_path` is added (defaults to the fixture).
-  Phase 1 removes the stub path and uses api_key/model/timeout.
-- `step_idx` is 0-based (the orchestrator loops `range(len(brief.steps))`);
-  `Plan.step_number` is 1-based. `plan_step` maps via
-  `brief.steps[step_idx].number` and raises `PlannerError` if no stub plan
-  matches that number.
+`step_idx` is 0-based (the orchestrator loops `range(len(brief.steps))`);
+`Plan.step_number` is 1-based.
 """
 from __future__ import annotations
 
@@ -35,14 +31,13 @@ import yaml
 from pydantic import BaseModel
 
 from anvil.brief import Step
-from anvil.errors import PlannerError
+from anvil.voice import load_voice_spec
 
 log = logging.getLogger("anvil.planner")
 
-_DEFAULT_STUB_PLANS = (
-    Path(__file__).resolve().parent.parent
-    / "tests" / "fixtures" / "stub-plans.json"
-)
+# design Part 2: Stage A timeout is fixed at 30s (impl-notes Component 3).
+# Stage B uses self.timeout (the configured planner_timeout).
+_STAGE_A_TIMEOUT = 30
 
 
 class ScopeBoundaries(BaseModel):
@@ -64,79 +59,56 @@ class Plan(BaseModel):
     escalation_triggers: list[str] = []
 
 
-def validate_plan_scope(plan: Plan, step) -> bool:
-    """REAL validation. True iff the plan stays within the brief step's
-    declared scope:
-      - every path in plan.files_to_touch is in step.scope_files
-      - every op in plan.operations is in step.scope_operations
-    Returns False on any out-of-scope file or operation. Used by the
-    orchestrator: `if not validate_plan_scope(...): escalate(...)`.
-    """
-    files_ok = set(plan.files_to_touch).issubset(set(step.scope_files))
-    ops_ok = set(plan.operations).issubset(set(step.scope_operations))
-    return files_ok and ops_ok
-
-
 class Planner:
+    """Two-stage planner. __init__ params are optional with defaults so
+    Planner() still constructs (Phase 0 precedent, kept for the
+    orchestrator default and the Step 5 retry tests). With no api_key the
+    client is None; the system prompt is still loaded so tests that mock
+    _call_anthropic at the method level work unchanged."""
+
     def __init__(
         self,
         api_key: str | None = None,
         model: str | None = None,
         timeout: int | None = None,
-        *,
-        stub_plans_path: Path | None = None,
+        vault_root=None,
     ) -> None:
-        # Phase 0 stub ignores api_key/model/timeout (no LLM). Retained in
-        # the signature so Phase 1 can drop in the real Planner unchanged.
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
-        self._stub_plans_path = Path(stub_plans_path or _DEFAULT_STUB_PLANS)
-        # Phase 1 Step 5 scaffold: real Anthropic client for _call_anthropic.
-        # Guarded on api_key so Phase 0 stub callers (Planner(),
-        # Planner(stub_plans_path=...)) get _client=None and the stub path
-        # is unaffected. Step 6 rewrites __init__ to load the system prompt
-        # and make the client mandatory.
+        self.vault_root = Path(vault_root) if vault_root else Path(".")
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else None
-
-    def _load_stub_plans(self) -> list[dict]:
-        try:
-            data = json.loads(self._stub_plans_path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise PlannerError(
-                f"stub plans not found at {self._stub_plans_path}"
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise PlannerError(
-                f"stub plans is not valid JSON: {exc}"
-            ) from exc
-        if not isinstance(data, list):
-            raise PlannerError("stub-plans.json must be a JSON list of plans")
-        return data
-
-    def plan_step(self, brief, state, step_idx: int) -> Plan:
-        """Phase 0: return the hardcoded plan whose step_number matches the
-        brief step at step_idx (0-based). Raises PlannerError if step_idx is
-        out of range or no stub plan matches that step number."""
-        if step_idx < 0 or step_idx >= len(brief.steps):
-            raise PlannerError(
-                f"step_idx {step_idx} out of range "
-                f"(brief has {len(brief.steps)} steps)"
-            )
-        target_number = brief.steps[step_idx].number
-        for raw in self._load_stub_plans():
-            if raw.get("step_number") == target_number:
-                try:
-                    return Plan.model_validate(raw)
-                except Exception as exc:  # pydantic ValidationError
-                    raise PlannerError(
-                        f"stub plan for step {target_number} fails the Plan "
-                        f"schema: {exc}"
-                    ) from exc
-        raise PlannerError(
-            f"no stub plan for step_number {target_number} "
-            f"(step_idx {step_idx})"
+        # Voice substitution is one-shot at construction (design Part 1):
+        # planner-system.md loaded once, {VOICE_SPEC} replaced by the live
+        # spec (load_voice_spec() reads VAULT_PATH from the env — decision
+        # #1, the Phase 0 vault_root shim is gone).
+        system_path = (
+            Path(__file__).resolve().parent / "prompts" / "planner-system.md"
         )
+        self._system_prompt = system_path.read_text(encoding="utf-8").replace(
+            "{VOICE_SPEC}", load_voice_spec()
+        )
+
+    def plan_step(self, brief, state, step_idx: int):
+        """Stage A -> Stage B (with retry). Returns a validated Plan, or an
+        escalation dict (`escalate: True`) the orchestrator routes to the
+        Telegram escalation path. Stage A failure / empty -> zero selected
+        files; Stage B still sees the brief and state (design Part 2)."""
+        vault_index = _build_vault_index(
+            [str(p) for p in brief.context_paths], self.vault_root
+        )
+        stage_a_prompt = _assemble_stage_a_prompt(
+            brief, state, step_idx, vault_index
+        )
+        stage_a_resp = self._call_anthropic(
+            system=self._system_prompt, user=stage_a_prompt,
+            timeout=_STAGE_A_TIMEOUT, step=step_idx + 1, stage="A",
+        )
+        selected = _parse_stage_a_response(stage_a_resp, vault_index)
+        result = self._run_stage_b_with_retry(brief, state, step_idx, selected)
+        if result.get("escalate"):
+            return result
+        return Plan(**result)
 
     # -----------------------------------------------------------------------
     # Phase 1 Step 5 — Anthropic call wrapper + Stage B retry loop

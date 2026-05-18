@@ -14,10 +14,9 @@ error. It does not raise, and it does not substitute a hardcoded spec —
 an empty voice spec is the design's accepted failure mode (the Planner
 runs with no voice constraints rather than with a fabricated one).
 
-VAULT_PATH from the environment is the source of truth. The `vault_root`
-parameter is a backward-compat shim for the Phase 0 call site in
-orchestrator.py; it is ignored. Step 6 migrates that call site to the
-zero-arg form and removes the shim.
+VAULT_PATH from the environment is the source of truth. (Step 6 migrated
+the Phase 0 orchestrator call site to this zero-arg form and removed the
+backward-compat vault_root shim — decision #1 closed.)
 
 Drift: when both canonical and snapshot are readable, a warning is logged
 if the canonical's mtime is more than 30 days newer than the snapshot's.
@@ -43,16 +42,9 @@ _SNAPSHOT = Path(__file__).resolve().parent / "prompts" / "_voice-snapshot.md"
 _DRIFT_SECONDS = 30 * 24 * 60 * 60
 
 
-def load_voice_spec(vault_root=None) -> str:
+def load_voice_spec() -> str:
     """Canonical (VAULT_PATH) → snapshot → empty string. Never raises.
-
-    `vault_root` is the Phase 0 backward-compat shim and is ignored;
-    VAULT_PATH from the environment is the source of truth. Step 6
-    removes the shim when orchestrator.py migrates to the zero-arg call.
-    """
-    if vault_root is not None:
-        log.debug("[voice] Phase 0 shim; VAULT_PATH env is source of truth")
-
+    VAULT_PATH from the environment is the source of truth."""
     vault_path = os.environ.get("VAULT_PATH", "").strip()
     canonical = None
     canonical_text = None

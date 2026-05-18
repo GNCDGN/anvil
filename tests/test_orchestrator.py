@@ -3,9 +3,11 @@
 Hermetic: a /tmp git repo as target_repo_path, a /tmp inbox brief, and
 ANVIL_STATE_DIR pointed at a /tmp dir (runs/ + any marker land there).
 NEVER ~/Downloads/anvil. Telegram and git_ops are mocked; the Planner is
-the real Phase-0 stub (no LLM / no network — it IS the mock-equivalent).
-run_smoke is injected (manual mode makes no real file changes, so the
-trivial brief's real smokes can't pass — we inject pass).
+a local FakePlanner returning in-scope canned Plans per brief step (no
+LLM / no network). It replaced the Phase 0 stub injection when Step 6
+deleted the stub (decision #8). run_smoke is injected (manual mode makes
+no real file changes, so the trivial brief's real smokes can't pass — we
+inject pass).
 
 Note-2 / decision-enforcing assertions: a clean run must create NO lock
 file (~/.anvil-active) and NO state/*.marker (telegram-down marker is
@@ -23,12 +25,11 @@ from pathlib import Path
 
 from anvil.config import Config
 from anvil.orchestrator import Orchestrator
-from anvil.planner import Planner
+from anvil.planner import Plan
 from anvil.state import read_state, state_dir
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 TRIVIAL = FIXTURES / "trivial-test-brief.md"
-STUB = FIXTURES / "stub-plans.json"
 ANVIL_REPO = Path(__file__).resolve().parent.parent
 
 
@@ -75,6 +76,31 @@ class FakeGit:
             "run_log_filename": run_log_filename,
         })
         return f"deadbeef{step_idx:02d}"
+
+
+class FakePlanner:
+    """Returns an in-scope Plan built from the brief step (mirrors what
+    the deleted Phase 0 stub did for the trivial brief). No LLM, no
+    network. plan_step signature matches the real Planner."""
+
+    def plan_step(self, brief, state, step_idx: int):
+        s = brief.steps[step_idx]
+        return Plan(
+            step_number=s.number,
+            step_name=s.name,
+            files_to_touch=list(s.scope_files),
+            operations=list(s.scope_operations),
+            approach=f"(fake) execute {s.name}",
+            smoke_test=s.smoke,
+            expected_outcome="ok",
+            commit_message=s.commit_message_hint or f"Step {s.number}",
+            scope_boundaries={
+                "in_scope": ", ".join(s.scope_files) or "(none)",
+                "out_of_scope": "anything not declared",
+            },
+            confidence="high",
+            escalation_triggers=[],
+        )
 
 
 class TestOrchestrator(unittest.TestCase):
@@ -127,7 +153,7 @@ class TestOrchestrator(unittest.TestCase):
         return Orchestrator(
             self.cfg,
             coder_mode="manual",
-            planner=Planner(stub_plans_path=STUB),
+            planner=FakePlanner(),
             telegram=self.tg,
             git=self.git,
             run_smoke=lambda cmd, cwd: (True, "pass"),

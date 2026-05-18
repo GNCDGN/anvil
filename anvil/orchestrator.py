@@ -34,9 +34,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from anvil import git_ops as _git_ops
-from anvil.brief import parse_brief, validate_or_reject
+from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
 from anvil.errors import AnvilError
-from anvil.planner import Planner, validate_plan_scope
+from anvil.planner import Plan, Planner
 from anvil.state import (
     PendingAction,
     init_state,
@@ -69,11 +69,18 @@ class Orchestrator:
     ) -> None:
         self.config = config
         self.coder_mode = coder_mode
-        self.planner = planner if planner is not None else Planner()
+        self.planner = planner if planner is not None else Planner(
+            api_key=config.anthropic_api_key,
+            model=config.planner_model,
+            timeout=config.planner_timeout,
+            vault_root=config.vault_path,
+        )
         self._telegram = telegram          # may be None until needed
         self.git = git if git is not None else _git_ops
         self._run_smoke = run_smoke or self._default_run_smoke
-        self.voice_spec = voice.load_voice_spec(config.vault_path)
+        # decision #1 closed: zero-arg load_voice_spec() (VAULT_PATH env is
+        # the source of truth); the Phase 0 vault_root shim is removed.
+        self.voice_spec = voice.load_voice_spec()
         self._run_log: Path | None = None
         self._state = None
 
@@ -185,6 +192,12 @@ class Orchestrator:
 
             brief = parse_brief(brief_path)
             validate_or_reject(brief)  # raises BriefValidationError on bad brief
+            # Finding 3 / decision #9: parse_brief leaves context_paths=[]
+            # (only context_links populated). Stage A's vault index needs
+            # the resolved paths, so resolve them before the step loop.
+            # Unresolved links raise BriefValidationError (an AnvilError),
+            # caught below — a brief defect surfaces, not a silent blind run.
+            brief = resolve_context_paths(brief, self.config.vault_path)
 
             started_at = datetime.now(_UK).isoformat(timespec="seconds")
             state = init_state(
@@ -205,17 +218,32 @@ class Orchestrator:
                 state = transition(state, "running")
                 self._state = state
 
-                plan = self.planner.plan_step(brief, state, idx)
-                self._log_event("planner", f"step {bstep.number}: {plan.step_name}")
+                result = self._plan_step(brief, state, idx)
 
-                if not validate_plan_scope(plan, bstep):
+                # Plan | escalation-dict split (design Part 4 / brief Step 6).
+                # Detect escalation BEFORE any .step_name access.
+                if isinstance(result, dict) and result.get("escalate"):
                     self._escalate(
-                        state, "plan exceeds declared scope",
-                        f"files={plan.files_to_touch} ops={plan.operations}",
-                        "fix the brief / re-plan",
+                        state,
+                        result.get("reason", "planner escalation"),
+                        result.get("detail", ""),
+                        result.get("options"),
                     )
                     if not self._await_user_decision(state):
                         return 1
+                    # User chose to proceed past the escalation: the step
+                    # cannot be executed without a plan, so skip it (the
+                    # decision to continue is the decision not to run it).
+                    state.steps[idx].status = "done"
+                    state.steps[idx].commit = None
+                    state = transition(state, "running")
+                    self._state = state
+                    continue
+
+                plan = result
+                self._log_event(
+                    "planner", f"step {bstep.number}: {plan.step_name}"
+                )
 
                 # 5c manual-Coder execution
                 outcome = self._manual_step(plan)
@@ -305,6 +333,36 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001 — never-raise
             log.error(f"unexpected in handle_brief: {e}", exc_info=True)
             return 2
+
+    # ---- planning (resume-reuse guard + persist) ----
+    def _plan_step(self, brief, state, idx: int):
+        """Returns Plan | escalation-dict. Resume-reuse: if
+        state.steps[idx].plan is already set, reconstruct from it without
+        calling the Planner (escalation dict passes through). In
+        Phase 0-shaped state .plan is always None so this falls through;
+        Step 7's schema work makes the reuse path live on resume.
+
+        On a fresh plan, persist immediately via the atomic write_state
+        contract (the brief's `_write_state()` shorthand) so a crash
+        between planning and execution does not lose the plan.
+        result.model_dump() not result.dict() — pydantic v2, decision #5.
+        """
+        existing = state.steps[idx].plan
+        if existing is not None:
+            if existing.get("escalate"):
+                log.info(
+                    f"[planner] reusing persisted escalation, step {idx + 1}"
+                )
+                return existing
+            log.info(f"[planner] reusing persisted plan, step {idx + 1}")
+            return Plan(**existing)
+        result = self.planner.plan_step(brief, state, idx)
+        state.steps[idx].plan = (
+            result.model_dump() if isinstance(result, Plan) else result
+        )
+        write_state(state)
+        self._state = state
+        return result
 
     # ---- manual coder ----
     def _manual_step(self, plan) -> str:
