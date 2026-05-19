@@ -91,5 +91,43 @@ class TestPhase3VpsConfig(unittest.TestCase):
         self.assertIsNone(config.vps_host)
 
 
+class TestPhase4CheckpointActivePath(unittest.TestCase):
+    """Phase 4 Step 1: Config.checkpoint_active_path derived from vault_path."""
+
+    def setUp(self) -> None:
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-config-cp-"))
+        (self._tmpdir / ".env").write_text("")
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _load(self, extra_env: dict | None = None) -> Config:
+        env = {**_REQUIRED_ENV, "ANVIL_ROOT": str(self._tmpdir)}
+        if extra_env:
+            env.update(extra_env)
+        with patch.dict(os.environ, env, clear=True):
+            return Config.load()
+
+    def test_default_derived_from_vault_path(self) -> None:
+        """With no VAULT_PATH override, checkpoint_active_path lives under the
+        default vault root at 01-Projects/second-brain/checkpoints/active."""
+        config = self._load()
+        self.assertEqual(
+            config.checkpoint_active_path,
+            config.vault_path / "01-Projects/second-brain/checkpoints/active",
+        )
+
+    def test_vault_path_override_propagates(self) -> None:
+        """Custom VAULT_PATH → checkpoint_active_path follows it."""
+        custom_vault = self._tmpdir / "custom-vault"
+        custom_vault.mkdir()
+        config = self._load({"VAULT_PATH": str(custom_vault)})
+        self.assertEqual(
+            config.checkpoint_active_path,
+            custom_vault.resolve() / "01-Projects/second-brain/checkpoints/active",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

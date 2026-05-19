@@ -43,6 +43,8 @@ class Config:
     # Phase 3 Step 2: VPS deployment config; required when running briefs with vps_deploy: yes
     vps_host: str | None = None
     vps_user: str = "root"
+    # Phase 4 Step 1: checkpoint write target; derived from vault_path at load time
+    checkpoint_active_path: Path = Path("/dev/null")  # replaced in load()
 
     @classmethod
     def load(cls, env_path: Path | None = None) -> "Config":
@@ -119,4 +121,7 @@ class Config:
             coder_mode=coder_mode,
             vps_host=vps_host,
             vps_user=vps_user,
+            checkpoint_active_path=(
+                vault_path / "01-Projects/second-brain/checkpoints/active"
+            ),
         )

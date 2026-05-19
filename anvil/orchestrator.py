@@ -64,7 +64,7 @@ class Orchestrator:
         self,
         config,
         *,
-        coder_mode: str = "manual",   # Phase 0 hardcodes manual
+        coder_mode: str | None = None,   # Phase 4 Step 1: None → resolve from config.coder_mode
         planner=None,
         telegram=None,
         git=None,
@@ -72,7 +72,11 @@ class Orchestrator:
         coder=None,
     ) -> None:
         self.config = config
-        self.coder_mode = coder_mode
+        # Phase 4 Step 1 Layer 2 fix (Step 0 Finding 1): explicit kwarg
+        # wins for test injection; otherwise config.coder_mode (read from
+        # CODER_MODE env) determines the mode. The Phase 0/1 default of
+        # 'manual' is gone — production now honours .env.
+        self.coder_mode = coder_mode if coder_mode is not None else getattr(config, "coder_mode", "manual")
         self.planner = planner if planner is not None else Planner(
             api_key=config.anthropic_api_key,
             model=config.planner_model,
@@ -90,7 +94,7 @@ class Orchestrator:
         # leaves self.coder = None and never reads it.
         if coder is not None:
             self.coder = coder
-        elif coder_mode == "auto":
+        elif self.coder_mode == "auto":
             self.coder = self._build_coder()
         else:
             self.coder = None
@@ -257,7 +261,7 @@ class Orchestrator:
                 started_at = datetime.now(_UK).isoformat(timespec="seconds")
                 state = init_state(
                     brief, started_at, brief_path=str(brief_path),
-                    coder_mode="manual",
+                    coder_mode=self.coder_mode,
                 )
                 self._state = state
 
