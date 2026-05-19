@@ -1,248 +1,239 @@
 #!/usr/bin/env python3
-"""Phase 2 Step 2 — apply the decision #15 fix to anvil/orchestrator.py.
+"""Phase 3 Step 2 patch — Config gains vps_host/vps_user; .env.example documents both.
 
-Idempotent. Run from ~/Downloads/anvil/ ; the script edits
-anvil/orchestrator.py in-place and prints what it changed.
+Idempotent: detects whether the patch has already been applied (by checking for
+'vps_host' in config.py) and exits cleanly if so. Leaves .bak files for
+modified files.
 
-What it does:
-  1. Adds `resumed_state: State | None = None` kwarg to handle_brief.
-  2. On the resume path, bypasses init_state / _open_run_log / _move_brief
-     and re-uses the loaded state.
-  3. Skips already-done steps in the step loop (status == "done").
-  4. Threads `resumed_state=st` through from Orchestrator.resume()'s call
-     to handle_brief.
+Applies edits to anvil/config.py:
+  1. Add vps_host: str | None = None, vps_user: str = "root" to Config dataclass
+  2. Config.load reads VPS_HOST and VPS_USER from env
+  3. Pass through to the cls(...) constructor
 
-If any of the expected anchor strings is missing, the script aborts
-with a non-zero exit and explains what it couldn't find — meaning the
-file has drifted from the Phase 1 shape this fix was designed against,
-and the patch needs review before being applied.
+Appends VPS_HOST and VPS_USER lines to .env.example.
+
+Creates new tests/test_config.py with four test cases.
+
+Run from ~/Downloads/anvil:
+    .venv/bin/python apply_step2_patch.py
 """
 from __future__ import annotations
 
-import re
+import shutil
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-ORCH = ROOT / "anvil" / "orchestrator.py"
+REPO = Path(__file__).resolve().parent
+CONFIG_PY = REPO / "anvil" / "config.py"
+ENV_EXAMPLE = REPO / ".env.example"
+TEST_CONFIG_PY = REPO / "tests" / "test_config.py"
 
-if not ORCH.is_file():
-    print(f"error: {ORCH} not found. Run from ~/Downloads/anvil/.",
-          file=sys.stderr)
+
+def fail(msg: str) -> None:
+    print(f"[step2-patch] FAIL: {msg}", file=sys.stderr)
     sys.exit(1)
 
-src = ORCH.read_text(encoding="utf-8")
-orig = src
 
-# ---------------------------------------------------------------------------
-# Edit 1: import the State type so the new type hint resolves.
-# ---------------------------------------------------------------------------
-import_anchor = "from anvil.state import (\n    PendingAction,\n    init_state,"
-new_import = (
-    "from anvil.state import (\n    PendingAction,\n    State,\n    init_state,"
-)
-if import_anchor not in src:
-    print("error: could not find expected `from anvil.state import` block.",
-          file=sys.stderr)
-    print("file may have drifted from Phase 1 shape; review the patch by hand.",
-          file=sys.stderr)
-    sys.exit(2)
-if "    State,\n" not in src.split("from anvil.state import (")[1].split(")")[0]:
-    src = src.replace(import_anchor, new_import, 1)
-    print("[1/4] added `State` to the anvil.state import block.")
-else:
-    print("[1/4] `State` already imported; skipping.")
+def info(msg: str) -> None:
+    print(f"[step2-patch] {msg}")
 
-# ---------------------------------------------------------------------------
-# Edit 2: handle_brief signature gains resumed_state kwarg, and the
-# init/open-log/move-brief preamble is wrapped so it only runs on a
-# fresh run (not on resume).
-# ---------------------------------------------------------------------------
-sig_anchor = "    def handle_brief(self, brief_path: Path) -> int:"
-sig_new = (
-    "    def handle_brief(\n"
-    "        self, brief_path: Path, *, resumed_state: State | None = None,\n"
-    "    ) -> int:"
-)
-if sig_anchor not in src and sig_new not in src:
-    print("error: could not find handle_brief signature anchor.", file=sys.stderr)
-    sys.exit(3)
-if sig_anchor in src:
-    src = src.replace(sig_anchor, sig_new, 1)
-    print("[2/4] handle_brief signature now accepts resumed_state kwarg.")
-else:
-    print("[2/4] handle_brief signature already patched; skipping.")
 
-# Replace the init-state preamble block with a conditional that branches on
-# resumed_state. The anchor matches everything from `brief = parse_brief(...)`
-# through `self._move_brief(brief_path)`. Whitespace tolerated via regex.
-preamble_pattern = re.compile(
-    r"(            brief = parse_brief\(brief_path\)\n"
-    r"            validate_or_reject\(brief\)[^\n]*\n"
-    r"(?:[^\n]*\n)*?"                                # comment lines (decision #9)
-    r"            brief = resolve_context_paths\(brief, self\.config\.vault_path\)\n)"
-    r"(\s*\n"
-    r"            started_at = datetime\.now\(_UK\)\.isoformat\(timespec=\"seconds\"\)\n"
-    r"            state = init_state\(\n"
-    r"                brief, started_at, brief_path=str\(brief_path\),\n"
-    r"                coder_mode=\"manual\",\n"
-    r"            \)\n"
-    r"            self\._state = state\n"
-    r"\s*\n"
-    r"            self\._open_run_log\(brief, started_at\)\n"
-    r"            state = transition\(state, \"running\",\n"
-    r"\s*run_log=str\(self\._run_log\)\)\n"
-    r"            self\._state = state\n"
-    r"            self\._log_event\(\"start\", f\"\{len\(brief\.steps\)\} steps; manual\n"
-    r"\s*mode\"\)\n"
-    r"\s*\n"
-    r"            self\._move_brief\(brief_path\)\n)"
-)
+def _backup(p: Path) -> None:
+    bak = p.with_suffix(p.suffix + ".pre-phase-3-step-2.bak")
+    if not bak.exists():
+        shutil.copy2(p, bak)
+        info(f"backed up {p.name} -> {bak.name}")
 
-# Looser fallback pattern if exact spacing has drifted.
-preamble_pattern_fallback = re.compile(
-    r"(            brief = parse_brief\(brief_path\)\n.*?"
-    r"resolve_context_paths\(brief, self\.config\.vault_path\)\n)"
-    r"(.*?self\._move_brief\(brief_path\)\n)",
-    re.DOTALL,
-)
 
-PREAMBLE_REPLACEMENT_HEAD = r"\1"
-PREAMBLE_REPLACEMENT_BODY = (
-    "\n"
-    "            if resumed_state is not None:\n"
-    "                # Decision #15 fix (Phase 2 Step 2): on resume, reuse the\n"
-    "                # loaded state instead of clobbering it with init_state.\n"
-    "                # _plan_step's reuse-guard depends on state.steps[i].plan\n"
-    "                # being populated; init_state always sets plan=None and so\n"
-    "                # silently invalidated the guard on the resume path before.\n"
-    "                state = resumed_state\n"
-    "                self._state = state\n"
-    "                # Reopen the existing run log for append, if known.\n"
-    "                if state.run_log:\n"
-    "                    self._run_log = Path(state.run_log)\n"
-    "                self._log_event(\n"
-    "                    \"resume\", f\"resumed at step {state.current_step}\"\n"
-    "                )\n"
-    "                # The brief is already in active/ from the original run; do\n"
-    "                # not re-move it. transition() back to \"running\" so the\n"
-    "                # loop's status checks see a runnable state.\n"
-    "                state = transition(state, \"running\", pending_action=None)\n"
-    "                self._state = state\n"
-    "            else:\n"
-    "                started_at = datetime.now(_UK).isoformat(timespec=\"seconds\")\n"
-    "                state = init_state(\n"
-    "                    brief, started_at, brief_path=str(brief_path),\n"
-    "                    coder_mode=\"manual\",\n"
-    "                )\n"
-    "                self._state = state\n"
-    "\n"
-    "                self._open_run_log(brief, started_at)\n"
-    "                state = transition(state, \"running\",\n"
-    "                                   run_log=str(self._run_log))\n"
-    "                self._state = state\n"
-    "                self._log_event(\n"
-    "                    \"start\", f\"{len(brief.steps)} steps; manual mode\"\n"
-    "                )\n"
-    "\n"
-    "                self._move_brief(brief_path)\n"
-)
+def _apply_unique(text: str, old: str, new: str, label: str) -> str:
+    occurrences = text.count(old)
+    if occurrences == 0:
+        fail(f"{label}: anchor not found")
+    if occurrences > 1:
+        fail(f"{label}: anchor found {occurrences} times, expected 1")
+    return text.replace(old, new, 1)
 
-if "if resumed_state is not None:" in src:
-    print("[3/4] resume-aware preamble already in place; skipping.")
-else:
-    m = preamble_pattern.search(src)
-    if m:
-        src = (
-            src[:m.start()]
-            + PREAMBLE_REPLACEMENT_HEAD.replace(r"\1", m.group(1))
-            + PREAMBLE_REPLACEMENT_BODY
-            + src[m.end():]
-        )
-        print("[3/4] resume-aware preamble inserted (exact-match pattern).")
-    else:
-        m = preamble_pattern_fallback.search(src)
-        if not m:
-            print(
-                "error: could not find the init_state preamble block in "
-                "handle_brief. The file has drifted from the Phase 1 shape; "
-                "apply the patch manually using the README in this same patch "
-                "directory.",
-                file=sys.stderr,
-            )
-            sys.exit(4)
-        src = (
-            src[:m.start()]
-            + m.group(1)
-            + PREAMBLE_REPLACEMENT_BODY
-            + src[m.end():]
-        )
-        print("[3/4] resume-aware preamble inserted (fallback pattern).")
 
-# ---------------------------------------------------------------------------
-# Edit 3: the step loop should skip already-done steps. The fix sits at the
-# top of the loop body, before the status reset.
-# ---------------------------------------------------------------------------
-loop_anchor = (
-    "            for idx, bstep in enumerate(brief.steps):\n"
-    "                state.steps[idx].status = \"running\""
-)
-loop_new = (
-    "            for idx, bstep in enumerate(brief.steps):\n"
-    "                # Decision #15 fix (Phase 2 Step 2): skip steps already\n"
-    "                # marked done from a prior session. Without this, resume\n"
-    "                # re-executes completed steps with their persisted plans —\n"
-    "                # which is worse than re-planning. The reuse-guard alone\n"
-    "                # is not enough; we must not enter the step body at all.\n"
-    "                if state.steps[idx].status == \"done\":\n"
-    "                    continue\n"
-    "                state.steps[idx].status = \"running\""
-)
-if "# Decision #15 fix (Phase 2 Step 2): skip steps already" in src:
-    print("[3b/4] done-step skip already in place; skipping.")
-elif loop_anchor in src:
-    src = src.replace(loop_anchor, loop_new, 1)
-    print("[3b/4] done-step skip inserted into the step loop.")
-else:
-    print(
-        "warning: step loop anchor not matched exactly. The patch's done-step "
-        "skip was NOT applied. Apply manually: at the top of the loop body "
-        "(inside `for idx, bstep in enumerate(brief.steps):`), add the two-line "
-        "guard `if state.steps[idx].status == \"done\": continue` BEFORE the "
-        "existing `state.steps[idx].status = \"running\"` line.",
-        file=sys.stderr,
+def patch_config_py() -> bool:
+    text = CONFIG_PY.read_text()
+    if "vps_host" in text:
+        info("config.py already has vps_host — skipping")
+        return False
+
+    _backup(CONFIG_PY)
+
+    # Edit 1: add vps_host and vps_user fields to dataclass (after coder_mode)
+    old_fields = '    claude_binary: str | None = None\n    coder_mode: str = "manual"\n\n'
+    new_fields = '    claude_binary: str | None = None\n    coder_mode: str = "manual"\n    # Phase 3 Step 2: VPS deployment config; required when running briefs with vps_deploy: yes\n    vps_host: str | None = None\n    vps_user: str = "root"\n\n'
+    text = _apply_unique(text, old_fields, new_fields, "edit 1: dataclass fields")
+
+    # Edit 2: load VPS_HOST and VPS_USER in Config.load, before the problems-raise gate
+    old_load = "        planner_timeout = int_env(\"PLANNER_TIMEOUT_SECONDS\", 120)\n        anvil_defer_window_seconds = int_env(\"ANVIL_DEFER_WINDOW_SECONDS\", 300)\n\n        if problems:\n"
+    new_load = "        planner_timeout = int_env(\"PLANNER_TIMEOUT_SECONDS\", 120)\n        anvil_defer_window_seconds = int_env(\"ANVIL_DEFER_WINDOW_SECONDS\", 300)\n        # Phase 3 Step 2: VPS deployment config (optional at load-time; runtime gate in\n        # orchestrator step 7 escalates deploy-config-missing when vps_deploy: yes but\n        # vps_host is None).\n        vps_host = os.environ.get(\"VPS_HOST\", \"\").strip() or None\n        vps_user = os.environ.get(\"VPS_USER\", \"\").strip() or \"root\"\n\n        if problems:\n"
+    text = _apply_unique(text, old_load, new_load, "edit 2: load VPS env vars")
+
+    # Edit 3: pass vps_host and vps_user to cls(...)
+    old_ctor = "            claude_binary=claude_binary,\n            coder_mode=coder_mode,\n        )\n"
+    new_ctor = "            claude_binary=claude_binary,\n            coder_mode=coder_mode,\n            vps_host=vps_host,\n            vps_user=vps_user,\n        )\n"
+    text = _apply_unique(text, old_ctor, new_ctor, "edit 3: cls constructor kwargs")
+
+    CONFIG_PY.write_text(text)
+    info("patched config.py")
+    return True
+
+
+def patch_env_example() -> bool:
+    text = ENV_EXAMPLE.read_text()
+    if "VPS_HOST" in text:
+        info(".env.example already has VPS_HOST — skipping")
+        return False
+
+    _backup(ENV_EXAMPLE)
+
+    # Append two lines; the file uses fixed-column comments so match the style
+    addition = (
+        "VPS_HOST=                                            # VPS deployment — required when running briefs with vps_deploy: yes\n"
+        "VPS_USER=root                                        # SSH user on VPS; default root matches Veronica's deploy pattern\n"
     )
+    if not text.endswith("\n"):
+        text += "\n"
+    ENV_EXAMPLE.write_text(text + addition)
+    info("appended VPS_HOST and VPS_USER to .env.example")
+    return True
 
-# ---------------------------------------------------------------------------
-# Edit 4: thread resumed_state=st from resume() into handle_brief.
-# ---------------------------------------------------------------------------
-resume_anchor = "            return self.handle_brief(Path(st.brief_path))"
-resume_new = (
-    "            return self.handle_brief(Path(st.brief_path), resumed_state=st)"
-)
-if resume_anchor not in src and resume_new not in src:
-    print(
-        "error: could not find the resume() → handle_brief call site.",
-        file=sys.stderr,
-    )
-    sys.exit(5)
-if resume_anchor in src:
-    src = src.replace(resume_anchor, resume_new, 1)
-    print("[4/4] resume() now threads resumed_state through to handle_brief.")
-else:
-    print("[4/4] resume() already threaded; skipping.")
 
-# ---------------------------------------------------------------------------
-# Write back if changed.
-# ---------------------------------------------------------------------------
-if src == orig:
-    print("\nno changes to write. file already at patched state.")
-    sys.exit(0)
+def create_test_config() -> bool:
+    if TEST_CONFIG_PY.exists():
+        info("tests/test_config.py already exists — skipping")
+        return False
 
-backup = ORCH.with_suffix(".py.pre-phase-2-step-2.bak")
-backup.write_text(orig, encoding="utf-8")
-ORCH.write_text(src, encoding="utf-8")
-print(f"\nwrote {ORCH} (backup at {backup})")
-print("verify with:")
-print("  .venv/bin/python -m py_compile anvil/orchestrator.py")
-print("  .venv/bin/python -m unittest discover tests/ -v")
+    content = '''"""Phase 3 Step 2 tests — Config gains vps_host and vps_user.
+
+Hermetic: writes a temp .env file and a temp anvil_root, no real env mutation
+beyond the in-test monkey-patching. Uses unittest.mock.patch.dict on os.environ
+to isolate from the caller's actual env (which may have VPS_HOST set from
+Step 0 — pre-build setup).
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from anvil.config import Config
+
+
+# Minimum env vars Config.load requires (without these, ConfigError fires
+# before VPS-side fields are even reached).
+_REQUIRED_ENV = {
+    "ANTHROPIC_API_KEY": "sk-test",
+    "TELEGRAM_BOT_TOKEN": "test-token",
+    "TELEGRAM_CHAT_ID": "12345",
+}
+
+
+class TestPhase3VpsConfig(unittest.TestCase):
+    """Phase 3 Step 2: Config.vps_host and Config.vps_user load from env."""
+
+    def setUp(self) -> None:
+        # Use a temp directory as anvil_root so we don't pick up the repo's
+        # real .env file. ANVIL_ROOT is read by Config.load to locate .env.
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-config-"))
+        # Create an empty .env so Config.load doesn't try to load a real one
+        (self._tmpdir / ".env").write_text("")
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _load(self, extra_env: dict | None = None) -> Config:
+        """Load Config with isolated env. `extra_env` adds/overrides keys."""
+        env = {**_REQUIRED_ENV, "ANVIL_ROOT": str(self._tmpdir)}
+        if extra_env:
+            env.update(extra_env)
+        # Use clear=True to start from an empty env (only what we pass)
+        with patch.dict(os.environ, env, clear=True):
+            return Config.load()
+
+    def test_vps_fields_unset_defaults(self) -> None:
+        """No VPS_HOST or VPS_USER in env -> vps_host=None, vps_user='root'."""
+        config = self._load()
+        self.assertIsNone(config.vps_host)
+        self.assertEqual(config.vps_user, "root")
+
+    def test_vps_host_loads_from_env(self) -> None:
+        """VPS_HOST=1.2.3.4 -> Config.vps_host == '1.2.3.4'."""
+        config = self._load({"VPS_HOST": "1.2.3.4"})
+        self.assertEqual(config.vps_host, "1.2.3.4")
+        self.assertEqual(config.vps_user, "root")  # default holds
+
+    def test_vps_user_override(self) -> None:
+        """VPS_USER=admin -> Config.vps_user == 'admin'."""
+        config = self._load({"VPS_HOST": "1.2.3.4", "VPS_USER": "admin"})
+        self.assertEqual(config.vps_host, "1.2.3.4")
+        self.assertEqual(config.vps_user, "admin")
+
+    def test_existing_config_fields_still_load(self) -> None:
+        """Regression: existing fields (claude_binary, coder_mode, etc.) still
+        load correctly alongside the new VPS fields."""
+        config = self._load({
+            "VPS_HOST": "1.2.3.4",
+            "CODER_MODE": "auto",
+            "CLAUDE_BINARY": "/usr/local/bin/claude",
+            "CODER_TIMEOUT_SECONDS": "900",
+        })
+        self.assertEqual(config.vps_host, "1.2.3.4")
+        self.assertEqual(config.coder_mode, "auto")
+        self.assertEqual(config.claude_binary, "/usr/local/bin/claude")
+        self.assertEqual(config.coder_timeout, 900)
+
+    def test_empty_string_vps_host_is_none(self) -> None:
+        """Empty VPS_HOST (e.g. unset placeholder in .env) -> None."""
+        config = self._load({"VPS_HOST": ""})
+        self.assertIsNone(config.vps_host)
+
+    def test_whitespace_vps_host_is_none(self) -> None:
+        """Whitespace-only VPS_HOST -> None (strip applied)."""
+        config = self._load({"VPS_HOST": "   "})
+        self.assertIsNone(config.vps_host)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+    TEST_CONFIG_PY.write_text(content)
+    info("created tests/test_config.py")
+    return True
+
+
+def main() -> int:
+    if not CONFIG_PY.exists():
+        fail(f"config.py not found at {CONFIG_PY}")
+    if not ENV_EXAMPLE.exists():
+        fail(f".env.example not found at {ENV_EXAMPLE}")
+
+    changed_config = patch_config_py()
+    changed_env = patch_env_example()
+    changed_test = create_test_config()
+
+    if not (changed_config or changed_env or changed_test):
+        info("nothing to do — patch already fully applied")
+        return 0
+
+    import py_compile
+    try:
+        py_compile.compile(str(CONFIG_PY), doraise=True)
+        py_compile.compile(str(TEST_CONFIG_PY), doraise=True)
+        info("compile-check passed")
+    except py_compile.PyCompileError as e:
+        fail(f"compile-check failed: {e}")
+
+    info("Step 2 patch applied. Next: run smoke")
+    info("  .venv/bin/python -m unittest tests.test_config -v")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -40,6 +40,9 @@ class Config:
     coder_timeout: int
     claude_binary: str | None = None
     coder_mode: str = "manual"
+    # Phase 3 Step 2: VPS deployment config; required when running briefs with vps_deploy: yes
+    vps_host: str | None = None
+    vps_user: str = "root"
 
     @classmethod
     def load(cls, env_path: Path | None = None) -> "Config":
@@ -90,6 +93,11 @@ class Config:
             coder_mode = "manual"
         planner_timeout = int_env("PLANNER_TIMEOUT_SECONDS", 120)
         anvil_defer_window_seconds = int_env("ANVIL_DEFER_WINDOW_SECONDS", 300)
+        # Phase 3 Step 2: VPS deployment config (optional at load-time; runtime gate in
+        # orchestrator step 7 escalates deploy-config-missing when vps_deploy: yes but
+        # vps_host is None).
+        vps_host = os.environ.get("VPS_HOST", "").strip() or None
+        vps_user = os.environ.get("VPS_USER", "").strip() or "root"
 
         if problems:
             raise ConfigError(
@@ -109,4 +117,6 @@ class Config:
             coder_timeout=coder_timeout,
             claude_binary=claude_binary,
             coder_mode=coder_mode,
+            vps_host=vps_host,
+            vps_user=vps_user,
         )
