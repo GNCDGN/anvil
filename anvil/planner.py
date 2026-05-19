@@ -85,8 +85,20 @@ class Planner:
         system_path = (
             Path(__file__).resolve().parent / "prompts" / "planner-system.md"
         )
+        voice_spec = load_voice_spec()
         self._system_prompt = system_path.read_text(encoding="utf-8").replace(
-            "{VOICE_SPEC}", load_voice_spec()
+            "{VOICE_SPEC}", voice_spec
+        )
+        # Phase 4 Step 3: completion-artefacts prompt. Loaded once at
+        # construction with {VOICE_SPEC} substituted, frozen for the
+        # build lifetime. Separate from _system_prompt because the
+        # discipline framing differs (drafting paperwork vs planning
+        # a step).
+        artefacts_path = (
+            Path(__file__).resolve().parent / "prompts" / "planner-completion-artefacts.md"
+        )
+        self._artefacts_prompt = artefacts_path.read_text(encoding="utf-8").replace(
+            "{VOICE_SPEC}", voice_spec
         )
 
     def plan_step(self, brief, state, step_idx: int):
@@ -251,6 +263,179 @@ class Planner:
                     f"Second: {e2}",
                     step_idx,
                 )
+
+
+    # -----------------------------------------------------------------------
+    # Phase 4 Step 4 — draft_completion_artefacts
+    #
+    # One-shot Stage-C call: drafts the setup-log entry and checkpoint body
+    # from the completed build state. Reuses _call_anthropic plumbing; same
+    # retry-once-with-error pattern as Stage B. Returns either the validated
+    # draft dict or a completion-artefacts-draft-failed escalation.
+    # -----------------------------------------------------------------------
+
+    def draft_completion_artefacts(self, brief, state) -> dict:
+        """Draft setup_log_entry and checkpoint body from completed state.
+
+        Returns either:
+          {"setup_log_entry": str, "checkpoint": str}
+        or an escalation dict:
+          {"escalate": True, "reason": "completion-artefacts-draft-failed",
+           "detail": <error>, "step_number": 0}
+
+        Never raises. Two API attempts max (initial + retry-with-error);
+        a second failure escalates. step_number=0 signals post-build
+        drafting, not a numbered build step.
+        """
+        system = getattr(self, "_artefacts_prompt", "")
+        user_prompt = _assemble_artefacts_prompt(brief, state)
+
+        response = self._call_anthropic(
+            system=system, user=user_prompt, timeout=self.timeout or 120,
+            step=0, stage="C",
+        )
+        if not response:
+            return {
+                "escalate": True,
+                "reason": "completion-artefacts-draft-failed",
+                "detail": "Stage C returned empty after first attempt",
+                "step_number": 0,
+            }
+        try:
+            draft = _parse_artefacts_json(response)
+            _validate_artefacts_structure(draft)
+            return draft
+        except (PlanParseError, PlanValidationError) as e:
+            retry_prompt = (
+                user_prompt
+                + "\n\n## Previous attempt failed validation\n\n"
+                + "The previous response failed validation with this "
+                + "error:\n\n<validation_error>\n"
+                + f"{e}\n</validation_error>\n\n"
+                + "Produce a corrected JSON object that addresses the "
+                + "error. Output only the JSON, no preamble."
+            )
+            response2 = self._call_anthropic(
+                system=system, user=retry_prompt, timeout=self.timeout or 120,
+                step=0, stage="C",
+            )
+            if not response2:
+                return {
+                    "escalate": True,
+                    "reason": "completion-artefacts-draft-failed",
+                    "detail": f"Retry returned empty. First error: {e}",
+                    "step_number": 0,
+                }
+            try:
+                draft = _parse_artefacts_json(response2)
+                _validate_artefacts_structure(draft)
+                return draft
+            except (PlanParseError, PlanValidationError) as e2:
+                return {
+                    "escalate": True,
+                    "reason": "completion-artefacts-draft-failed",
+                    "detail": (
+                        f"Artefact validation failed twice. "
+                        f"First: {e}. Second: {e2}"
+                    ),
+                    "step_number": 0,
+                }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Step 4 — artefact drafting helpers
+#
+# Module-level pure functions. Same shape as the Stage A/B helpers below.
+# ---------------------------------------------------------------------------
+
+
+def _assemble_artefacts_prompt(brief, state) -> str:
+    """Build the user prompt for Stage C from brief + state.
+
+    str.replace per placeholder (not str.format) — matches Stage A/B
+    discipline so JSON braces in the embedded state don\'t break parsing.
+    """
+    try:
+        brief_md = Path(state.brief_path).read_text(encoding="utf-8")
+    except OSError:
+        brief_md = ""
+
+    state_json = state.model_dump_json(indent=2)
+    deploy_block = (
+        json.dumps(state.deploy, indent=2) if state.deploy
+        else "(no deploy on this build)"
+    )
+
+    return (
+        "## Build brief\n\n"
+        "<brief>\n"
+        f"{brief_md}\n"
+        "</brief>\n\n"
+        "## Final build state\n\n"
+        "<state>\n"
+        f"{state_json}\n"
+        "</state>\n\n"
+        "## Deploy outcome\n\n"
+        f"{deploy_block}\n\n"
+        "## Instruction\n\n"
+        "Produce the completion artefacts as a JSON object matching "
+        "the schema above. Output only the JSON, no preamble, no fences."
+    )
+
+
+def _parse_artefacts_json(text: str) -> dict:
+    """json.loads the response; raise PlanParseError on JSONDecodeError.
+
+    Reuses PlanParseError so the retry-once-with-error catch contract
+    holds (Stage B and Stage C both raise PlanParseError on bad JSON).
+    Markdown fences are NOT stripped — fenced output fails deliberately.
+    """
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError as e:
+        raise PlanParseError(
+            f"Stage C output is not valid JSON ({e}). Raw text:\n{text}"
+        ) from e
+
+
+def _validate_artefacts_structure(draft: dict) -> None:
+    """Validate draft has exactly two non-empty string fields.
+
+    Reuses PlanValidationError so the retry-with-error catch contract
+    is the same shape as Stage B\'s. Also handles the escalation case:
+    if the model returns an escalate block, we accept it as-is and
+    the caller routes it.
+    """
+    if not isinstance(draft, dict):
+        raise PlanValidationError("draft is not a dict")
+    # Accept escalation block as-is
+    if draft.get("escalate") is True:
+        if not isinstance(draft.get("reason"), str):
+            raise PlanValidationError("escalation missing or non-str reason")
+        if not isinstance(draft.get("detail"), str):
+            raise PlanValidationError("escalation missing or non-str detail")
+        return None
+    # Normal draft validation
+    if set(draft.keys()) != {"setup_log_entry", "checkpoint"}:
+        raise PlanValidationError(
+            f"draft keys must be exactly {{\"setup_log_entry\", \"checkpoint\"}}; "
+            f"got {sorted(draft.keys())}"
+        )
+    for key in ("setup_log_entry", "checkpoint"):
+        if not isinstance(draft[key], str):
+            raise PlanValidationError(f"{key} must be a string")
+        if not draft[key].strip():
+            raise PlanValidationError(f"{key} is empty")
+    if not draft["setup_log_entry"].lstrip().startswith("## "):
+        raise PlanValidationError(
+            "setup_log_entry must start with \"## \" (the date heading)"
+        )
+    # Checkpoint body should start with a markdown heading (# or ##)
+    if not draft["checkpoint"].lstrip().startswith(("#", "##")):
+        raise PlanValidationError(
+            "checkpoint must start with a markdown heading"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
