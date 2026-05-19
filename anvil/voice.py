@@ -98,6 +98,20 @@ def _short(text: str, n: int = 120) -> str:
     return t if len(t) <= n else t[:n].rstrip() + "…"
 
 
+def _prefix() -> str:
+    """Return the Telegram message prefix.
+
+    Default is `"[ANVIL]"`. The v2 Phase 1 Step 6 calibration_runner
+    sets `CALIBRATION_TELEGRAM_PREFIX=[ANVIL-calibration]` for the
+    duration of the sweep so calibration messages are distinguishable
+    in Genco's Telegram scrollback. Default empty → "[ANVIL]" unchanged
+    (per notes.md Finding 8, the prefix does not interact with Veronica's
+    defer logic, so the choice is purely a scrollback discriminator).
+    """
+    override = os.environ.get("CALIBRATION_TELEGRAM_PREFIX", "").strip()
+    return override or "[ANVIL]"
+
+
 def format_step_completion(state, plan, commit_hash, smoke_result) -> str:
     """design Part 2 step-completion shape. Every line populated."""
     smoke = "pass" if smoke_result is True or smoke_result == "pass" else (
@@ -105,7 +119,7 @@ def format_step_completion(state, plan, commit_hash, smoke_result) -> str:
     )
     files = ", ".join(plan.files_to_touch) if plan.files_to_touch else "(none)"
     return (
-        f"[ANVIL] Step {plan.step_number} complete — {plan.step_name}\n"
+        f"{_prefix()} Step {plan.step_number} complete — {plan.step_name}\n"
         f"- What: {_short(plan.approach)}\n"
         f"- Files: {files}\n"
         f"- Smoke: {smoke}\n"
@@ -122,7 +136,7 @@ def format_escalation(state, reason, detail, options) -> str:
     else:
         opts = str(options) if options else "your call"
     return (
-        f"[ANVIL] Step {state.current_step} — escalation\n"
+        f"{_prefix()} Step {state.current_step} — escalation\n"
         f"- Why: {_short(reason)}\n"
         f"- Detail: {_short(detail, 400)}\n"
         f"- Options: {opts}\n"
@@ -134,7 +148,7 @@ def format_escalation(state, reason, detail, options) -> str:
 def format_completion(brief, state) -> str:
     done = sum(1 for s in state.steps if s.status == "done")
     msg = (
-        f"[ANVIL] Build complete — {brief.build_name}\n"
+        f"{_prefix()} Build complete — {brief.build_name}\n"
         f"- Steps: {done}/{len(state.steps)} done\n"
         f"- Status: {state.status}\n"
         f"- Run log: {Path(state.run_log).name if state.run_log else '(none)'}"

@@ -54,8 +54,11 @@ def render_preview_message(
     Format per design §2.8: [ANVIL] prefix, header, both artefacts side by
     side, then the go/abort prompt. Voice-bound; no emoji, no exclamation.
     """
+    # v2 Phase 1 Step 6: prefix sourced from voice helper so the
+    # CALIBRATION_TELEGRAM_PREFIX env override applies here too.
+    from anvil.voice import _prefix
     return (
-        f"[ANVIL] Build complete. Drafted artefacts for review.\n\n"
+        f"{_prefix()} Build complete. Drafted artefacts for review.\n\n"
         f"— Setup-log entry (to be appended to {setup_log_path.name}) —\n"
         f"{draft['setup_log_entry']}\n\n"
         f"— Checkpoint (to be written at checkpoints/active/{checkpoint_path.name}) —\n"

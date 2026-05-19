@@ -40,7 +40,17 @@ from anvil import git_ops as _git_ops
 from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
 from anvil.coder import Coder
 from anvil import ssh_ops
-from anvil import checkpoint as _checkpoint  # Phase 4 Step 5
+# v2 Phase 1 Step 6: `anvil.checkpoint` does `from anvil.orchestrator
+# import _slug` at module load. Importing checkpoint eagerly here
+# triggers the circular load when this module is the entry point
+# (e.g. `python -m anvil.cli run`). Defer to inside
+# `_draft_and_confirm_artefacts` — the only call site. Tests that
+# load checkpoint via a separate test module work because the other
+# test pre-loads checkpoint, which then triggers orchestrator's full
+# initialization before the cycle hits.
+# Recorded in notes.md Step 2 outcome / pre-existing issues; v2 Phase 2
+# cleanup target is to extract `_slug` to anvil/util.py and end the
+# cycle outright.
 from anvil import vault_ops as _vault_ops  # Phase 4 Step 5
 from anvil.errors import AnvilError
 from anvil.planner import Plan, Planner
@@ -241,7 +251,7 @@ class Orchestrator:
         install_interrupt_handler()
         try:
             self.telegram.send(
-                f"[ANVIL] Resuming {Path(st.brief_path).name}, step "
+                f"{voice._prefix()} Resuming {Path(st.brief_path).name}, step "
                 f"{st.current_step} ({st.status}). Reply 'resume' or 'abort'."
             )
             reply = self.telegram.wait_for_reply(timeout=None)
@@ -569,8 +579,17 @@ class Orchestrator:
                     )
                     state = transition(state, "waiting", pending_action=pa)
                     self._state = state
-                    reply = self.telegram.wait_for_reply(timeout=None)
-                    text = (reply.text.strip().lower() if reply else "")
+                    # v2 Phase 1 Step 6: AUTO_REPLY_FOR_CALIBRATION
+                    # short-circuits the explicit-confirm wait too.
+                    # The send leg above ran for real; only the wait
+                    # is bypassed. Keeps the framework profile honest
+                    # (real send legs, mocked user wait).
+                    auto = os.environ.get("AUTO_REPLY_FOR_CALIBRATION", "").strip()
+                    if auto:
+                        text = auto.lower()
+                    else:
+                        reply = self.telegram.wait_for_reply(timeout=None)
+                        text = (reply.text.strip().lower() if reply else "")
                     if text == "go":
                         state = transition(state, "running", pending_action=None)
                         self._state = state
@@ -811,7 +830,7 @@ class Orchestrator:
         'done', 'skip' → 'skip', 'abort' → 'abort'. Anything else → 'abort'
         (safe default — don't proceed on an unrecognised manual reply)."""
         self.telegram.send(
-            f"[ANVIL] Step {plan.step_number} — execute in Claude Code, then "
+            f"{voice._prefix()} Step {plan.step_number} — execute in Claude Code, then "
             f"reply 'done' (or 'skip' / 'abort').\n"
             f"Plan: {plan.approach[:300]}\n"
             f"Files: {', '.join(plan.files_to_touch)}\n"
@@ -923,8 +942,17 @@ class Orchestrator:
         'abort' as the abort path.
         """
         options = getattr(self, "_pending_options", ("go", "abort"))
-        reply = self.telegram.wait_for_reply(timeout=None)
-        text = (reply.text.strip().lower() if reply else "")
+        # v2 Phase 1 Step 6: AUTO_REPLY_FOR_CALIBRATION short-circuits
+        # the wait — calibration runs don't enter the long-poll seam,
+        # so telegram.poll.* events do NOT fire. The send leg in
+        # `_escalate` above already ran for real, so escalation.raised
+        # is present and (still) followed by escalation.resolved here.
+        auto = os.environ.get("AUTO_REPLY_FOR_CALIBRATION", "").strip()
+        if auto:
+            text = auto.lower()
+        else:
+            reply = self.telegram.wait_for_reply(timeout=None)
+            text = (reply.text.strip().lower() if reply else "")
         # v2 Phase 1 Step 2: emit escalation.resolved with the
         # wall-clock latency_ms_user (paired against the monotonic
         # baseline stashed by _escalate). Cleared after read.
@@ -1005,6 +1033,9 @@ class Orchestrator:
         (config can\'t be fixed mid-run); all other failures offer
         go to mark the build done with paperwork deferred.
         """
+        # v2 Phase 1 Step 6: lazy import — see the top-of-module
+        # comment for the circular-load reasoning.
+        from anvil import checkpoint as _checkpoint
         # 1. Derive setup-log path; soft-skip if missing.
         # Phase 4 Step 5b: a missing setup-log is a pre-flight condition
         # (brief in non-standard location, or test fixture), not an active
