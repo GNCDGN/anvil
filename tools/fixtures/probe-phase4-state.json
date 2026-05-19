@@ -1,0 +1,34 @@
+{
+  "schema_version": 2,
+  "brief_path": "/tmp/test/brief.md",
+  "started_at": "2026-05-19T10:00:00+01:00",
+  "finished_at": "2026-05-19T10:15:00+01:00",
+  "status": "done",
+  "current_step": 1,
+  "steps": [
+    {
+      "n": 1,
+      "name": "trivial",
+      "status": "done",
+      "commit": "abc1234",
+      "smoke": "pass",
+      "plan": {
+        "step_number": 1,
+        "step_name": "trivial",
+        "approach": "do it",
+        "confidence": "high",
+        "escalation_triggers": []
+      }
+    }
+  ],
+  "deploy": null,
+  "escalation_count": 0,
+  "vault_writes_outcome": {
+    "setup_log_path": "/vault/01-Projects/code-workspace/anvil/setup-log.md",
+    "checkpoint_path": "/vault/01-Projects/second-brain/checkpoints/active/2026-05-19-test-shipped.md",
+    "ok": true,
+    "error": null
+  },
+  "coder_mode": "auto",
+  "run_log": "/tmp/test/run.log"
+}

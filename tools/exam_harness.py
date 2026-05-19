@@ -115,6 +115,31 @@ PHASE3_DIMENSIONS = [
      "under 20% of Phase 1 baseline; same metric as Phase 2"),
 ]
 
+# Phase 4 grading dimensions, per design Part 8. Five dimensions —
+# artefact drafting + confirmation + writes are the substance Step 9
+# exercises. The harness emits this section in render(); the grader
+# uses it when the run reaches step 9.
+PHASE4_DIMENSIONS = [
+    ("Artefact-drafting correctness",
+     "drafted setup_log_entry and checkpoint preserve brief facts and "
+     "state.deploy without invention; cross-check raw plans + draft text"),
+    ("Anti-confabulation under sparse-notes",
+     "when brief step notes are empty, draft writes 'unclear from build "
+     "context' rather than inventing rationale; positive-evidence only "
+     "when sparse-notes step exists in the build"),
+    ("Confirmation gate routing",
+     "Telegram preview renders correctly with both artefacts and paths; "
+     "go reply triggers writes; abort or non-go defers to manual; "
+     "non-reserved replies route to paused-by-user"),
+    ("Vault-write side effects",
+     "after go, setup-log contains new entry at derived path; checkpoint "
+     "exists at derived path with seven-field frontmatter (source: anvil); "
+     "both files render in Obsidian without parse errors"),
+    ("Idempotency under re-run",
+     "re-running same brief after clean completion → step 9 detects existing "
+     "checkpoint, skips writes with log line, no escalation"),
+]
+
 # Escalation-source bins for Phase 2 scoring. Matched against the
 # `reason` field of escalation-shaped plans + run-log "escalation"
 # events. Order matters: more specific patterns first.
@@ -131,6 +156,9 @@ _ESCALATION_BINS = {
         "deploy-config-missing", "deploy-push-failed", "deploy-pull-failed",
         "deploy-restart-failed", "deploy-health-check-failed",
         "deploy-e2e-failed", "e2e-failed", "e2e-script-not-found",
+        # Phase 4 Step 6: vault-write escalation reasons
+        "completion-artefacts-draft-failed",
+        "checkpoint-write-failed", "vault-write-failed",
     ),
     "genco-initiated": (
         # paused-by-user via non-grammar reply; the run-log "pause"
@@ -203,6 +231,37 @@ def _parse_planner_lines(log_path: Path) -> list[dict]:
     return out
 
 
+_VAULT_OPS_RE = re.compile(
+    r"\[vault_ops\] (?P<kind>wrote|write failed|checkpoint exists, skipped) "
+    r"(?P<path>\S+)(?:: (?P<error>.+))?"
+)
+
+
+def _parse_vault_ops_lines(log_path: Path) -> list[dict]:
+    """Phase 4 Step 6: parse [vault_ops] log markers from anvil.log.
+
+    Same shape as _parse_planner_lines. Returns one dict per event:
+      {ts, kind: wrote|write failed|checkpoint exists, skipped, path, error}
+    """
+    if not log_path.is_file():
+        return []
+    out = []
+    for line in log_path.read_text(encoding="utf-8",
+                                    errors="replace").splitlines():
+        m = _VAULT_OPS_RE.search(line)
+        if not m:
+            continue
+        ts = line.split(" [vault_ops]", 1)[0].strip()
+        d = m.groupdict()
+        out.append({
+            "ts": ts,
+            "kind": d["kind"],
+            "path": d["path"],
+            "error": d.get("error"),
+        })
+    return out
+
+
 def _decision_lines(log_path: Path) -> list[str]:
     if not log_path.is_file():
         return []
@@ -253,6 +312,10 @@ class Capture:
         self.deploy_outcomes: list[dict] = []
         self.e2e_outcomes: list[dict] = []
         self.vps_head_shas: list[str] = []
+        # Phase 4 Step 6: vault-write outcomes from state +
+        # [vault_ops] log markers (success, failure, idempotent skip).
+        self.vault_writes_outcome: dict | None = None
+        self.vault_ops_log_events: list[dict] = []
 
     def poll(self, state: dict):
         self.last_state = state
@@ -271,6 +334,11 @@ class Capture:
             })
             if deploy.get("vps_head_sha"):
                 self.vps_head_shas.append(deploy["vps_head_sha"])
+        # Phase 4 Step 6: capture vault_writes_outcome when first observed
+        vwo = state.get("vault_writes_outcome")
+        prev_vwo = prev.get("vault_writes_outcome")
+        if vwo and vwo != prev_vwo:
+            self.vault_writes_outcome = vwo
         if state.get("status") != prev.get("status"):
             self.status_transitions.append(
                 f"{_now_iso()}  {prev.get('status', '(start)')} -> "
@@ -580,6 +648,41 @@ def render(cap: Capture, planner_calls: list[dict],
         ]
     # --- end Phase 2 Step 4 additions ---
 
+    # --- Phase 4 Step 6 additions ---
+    # Vault writes section. Emits when either vault_writes_outcome was
+    # captured from state, or [vault_ops] log markers were observed.
+    if cap.vault_writes_outcome or cap.vault_ops_log_events:
+        L += ["", "## Vault writes (Phase 4)", ""]
+        if cap.vault_writes_outcome:
+            vwo = cap.vault_writes_outcome
+            L += [
+                f"- outcome: {'ok' if vwo.get('ok') else 'failed'}",
+                f"- setup-log: {vwo.get('setup_log_path', '-')}",
+                f"- checkpoint: {vwo.get('checkpoint_path', '-')}",
+            ]
+            if vwo.get("error"):
+                L.append(f"- error: {vwo['error']}")
+            L.append("")
+        if cap.vault_ops_log_events:
+            L += ["### vault_ops log events", ""]
+            for ev in cap.vault_ops_log_events:
+                err = f" — {ev['error']}" if ev.get("error") else ""
+                L.append(f"- {ev['ts']}: {ev['kind']} {ev['path']}{err}")
+            L.append("")
+
+    # Phase 4 grading dimensions. Emitted alongside Phase 2/3 dimensions;
+    # grader uses whichever matches the phase being graded.
+    L += ["", "## Phase 4 grading dimensions (ungraded — grader plugs in here)", ""]
+    for i, (name, feeds) in enumerate(PHASE4_DIMENSIONS, 1):
+        L += [
+            f"### Phase 4 dimension {i} — {name}",
+            "",
+            f"Grader: assess against Phase 4 rubric dimension {i} ({name}). "
+            f"Evidence: {feeds}.",
+            "",
+        ]
+    # --- end Phase 4 Step 6 additions ---
+
     L += ["## Decisions register", ""]
     if decisions:
         L += [f"- {d}" for d in decisions]
@@ -645,6 +748,8 @@ def main(argv=None) -> int:
         cap.snapshot_commits()
         rl = (cap.last_state or {}).get("run_log")
         rlp = Path(rl).expanduser() if rl else None
+        # Phase 4 Step 6: parse [vault_ops] markers and surface to cap
+        cap.vault_ops_log_events = _parse_vault_ops_lines(log_file)
         doc = render(
             cap, _parse_planner_lines(log_file), _decision_lines(log_file),
             state_file, log_file, rlp, reason,
@@ -699,7 +804,11 @@ def _self_check() -> int:
     import tempfile
     fixtures_dir = Path(__file__).resolve().parent / "fixtures"
     fixtures_dir.mkdir(parents=True, exist_ok=True)
-    fixture = fixtures_dir / "probe-state.json"
+    # Phase 4 Step 6: prefer the Phase 4 fixture if present —
+    # exercises the Vault writes section. Falls back to probe-state.json
+    # for backward compatibility.
+    fixture_p4 = fixtures_dir / "probe-phase4-state.json"
+    fixture = fixture_p4 if fixture_p4.is_file() else (fixtures_dir / "probe-state.json")
     if not fixture.is_file():
         fixture.write_text(json.dumps({
             "schema_version": 2,
@@ -754,6 +863,9 @@ def _self_check() -> int:
         "## Escalation rate (Phase 2 metric)",
         "## Total Genco reply count",
         "## Phase 2 grading dimensions",
+        # Phase 4 Step 6: new section asserted when using
+        # probe-phase4-state.json fixture.
+        "## Phase 4 grading dimensions",
         "## Decisions register",
     ]
     missing = [s for s in expected_sections if s not in report]
@@ -762,9 +874,18 @@ def _self_check() -> int:
         return 1
 
     # Verify the Coder fixture rendered into the table.
-    if "deadbeef" not in report or "12.3" not in report:
-        print("self-check: Coder fixture did not render", file=sys.stderr)
-        return 1
+    # Phase 4 Step 6: Coder fixture assertion only applies when the
+    # probe-state.json fixture is in use (which carries the deadbeef
+    # coder_output). The Phase 4 fixture exercises vault writes; its
+    # check is the presence of the Vault writes section instead.
+    if "probe-phase4-state.json" not in str(fixture):
+        if "deadbeef" not in report or "12.3" not in report:
+            print("self-check: Coder fixture did not render", file=sys.stderr)
+            return 1
+    else:
+        if "## Vault writes (Phase 4)" not in report:
+            print("self-check: Vault writes section missing", file=sys.stderr)
+            return 1
 
     print("self-check: ok — all dimension sections present")
     return 0

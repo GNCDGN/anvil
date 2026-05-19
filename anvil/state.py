@@ -77,6 +77,13 @@ class State(BaseModel):
     # at step 9 to discriminate -shipped vs -shipped-with-caveats
     # outcome suffix. Back-compatible (default 0); no schema_version bump.
     escalation_count: int = 0
+    # Phase 4 Step 6: outcome of the vault-write phase (step 9).
+    # None until _draft_and_confirm_artefacts runs; on success, dict
+    # with keys: setup_log_path (str), checkpoint_path (str),
+    # ok (bool), error (str|None). Read by voice.format_completion
+    # to emit the Vault writes block and by exam_harness Capture.
+    # Back-compatible (default None); no schema_version bump.
+    vault_writes_outcome: dict | None = None
 
 
 def state_dir() -> Path:

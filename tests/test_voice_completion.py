@@ -81,5 +81,56 @@ class TestCompletionMessage(unittest.TestCase):
         self.assertIn("abcdef1", msg)
 
 
+class TestCompletionVaultWrites(unittest.TestCase):
+    """Phase 4 Step 6: Vault writes block in completion message."""
+
+    def _state_with_vwo(self, vwo) -> State:
+        return State(
+            brief_path="/tmp/test/brief.md",
+            started_at="2026-05-19T10:00:00+01:00",
+            finished_at="2026-05-19T10:15:00+01:00",
+            status="done",
+            steps=[StepState(n=1, name="trivial", status="done",
+                              commit="abc", smoke="pass")],
+            run_log="/tmp/test/run.log",
+            vault_writes_outcome=vwo,
+        )
+
+    def test_no_vwo_no_block(self) -> None:
+        """vault_writes_outcome is None → no Vault writes: in message."""
+        brief = _make_brief()
+        state = self._state_with_vwo(None)
+        msg = voice.format_completion(brief, state)
+        self.assertNotIn("Vault writes", msg)
+
+    def test_vwo_success_renders_basenames(self) -> None:
+        """ok=True → block lists both basenames."""
+        brief = _make_brief()
+        state = self._state_with_vwo({
+            "setup_log_path": "/vault/anvil/setup-log.md",
+            "checkpoint_path": "/vault/checkpoints/2026-05-19-anvil-phase-4-shipped.md",
+            "ok": True,
+            "error": None,
+        })
+        msg = voice.format_completion(brief, state)
+        self.assertIn("Vault writes:", msg)
+        self.assertIn("setup-log.md", msg)
+        self.assertIn("2026-05-19-anvil-phase-4-shipped.md", msg)
+        self.assertNotIn("deferred to manual", msg)
+
+    def test_vwo_failure_renders_deferred(self) -> None:
+        """ok=False → block reads deferred to manual with error."""
+        brief = _make_brief()
+        state = self._state_with_vwo({
+            "setup_log_path": "/vault/anvil/setup-log.md",
+            "checkpoint_path": "/vault/checkpoints/x.md",
+            "ok": False,
+            "error": "checkpoint write failed: simulated",
+        })
+        msg = voice.format_completion(brief, state)
+        self.assertIn("Vault writes: deferred to manual", msg)
+        self.assertIn("checkpoint write failed", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

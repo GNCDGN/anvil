@@ -899,6 +899,16 @@ class Orchestrator:
             return
 
         # 6. Happy path — both writes succeeded
+        # Phase 4 Step 6: persist outcome to state so format_completion
+        # can render the Vault writes block and the harness Capture
+        # parser can read it from anvil.log markers.
+        state.vault_writes_outcome = {
+            "setup_log_path": str(setup_log_path),
+            "checkpoint_path": str(checkpoint_path),
+            "ok": True,
+            "error": None,
+        }
+        write_state(state)
         self._log_event(
             "artefacts",
             f"wrote {setup_log_path.name} + {checkpoint_path.name}",

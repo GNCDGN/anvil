@@ -153,6 +153,29 @@ def format_completion(brief, state) -> str:
             f"- VPS HEAD: {sha_short}\n"
             f"- Service: {brief.service_name or '-'} ({status})"
         )
+    # Phase 4 Step 6: Vault writes block when state.vault_writes_outcome
+    # is populated. Success → list both basenames. Block is omitted
+    # entirely when None (skip path, abort path, or build did not
+    # reach step 9 — keeps the completion message tight in the common
+    # case where step 9 ran but writes were deferred).
+    vwo = getattr(state, "vault_writes_outcome", None)
+    if vwo:
+        from pathlib import Path as _P
+        sl = _P(vwo.get("setup_log_path", "")).name or "-"
+        cp = _P(vwo.get("checkpoint_path", "")).name or "-"
+        ok_w = vwo.get("ok", False)
+        if ok_w:
+            msg += (
+                f"\n\nVault writes:\n"
+                f"- Setup-log: {sl}\n"
+                f"- Checkpoint: {cp}"
+            )
+        else:
+            err = vwo.get("error") or "(unspecified)"
+            msg += (
+                f"\n\nVault writes: deferred to manual\n"
+                f"- Error: {_short(err, 200)}"
+            )
     return msg
 
 
