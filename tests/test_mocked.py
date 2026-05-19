@@ -147,6 +147,22 @@ class TestMockedPlannerCallAnthropic(_MockedTestBase):
             p._call_anthropic(system="", user="", timeout=30, step=1, stage="A")
         self.assertIn("MOCKED_TASK_ID", str(cm.exception))
 
+    def test_stage_c_missing_fixture_returns_empty(self) -> None:
+        """Step 6 prep: tasks reaching orchestrator step 9 invoke
+        draft_completion_artefacts → _call_anthropic(step=0, stage="C").
+        No T1-stepC.json exists; MockedPlanner must return "" so the
+        completion-artefacts-draft-failed escalation path fires (same
+        code path real-mode hits on an API hiccup). The synthesised
+        api_end still emits so the operations view records the call."""
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        p = MockedPlanner(model="claude-opus-4-7")
+        # Stage C is invoked from draft_completion_artefacts with step=0.
+        text = p._call_anthropic(system="", user="", timeout=30,
+                                 step=0, stage="C")
+        self.assertEqual(text, "")
+        kinds = [e["kind"] for e in self._events()]
+        self.assertIn("planner.stage_c.api_end", kinds)
+
     def test_escalation_fixture_routes_through_plan_step(self) -> None:
         """T4-step0 is an escalate:true JSON; plan_step should propagate."""
         os.environ["MOCKED_TASK_ID"] = "T4"

@@ -109,15 +109,32 @@ class MockedPlanner(Planner):
 
         task_id = _task_id()
         root = _fixture_root()
-        fixture_path = root / f"{task_id}-step{step_idx if step_idx is not None else 'C'}.json"
-        if not fixture_path.is_file():
-            raise RuntimeError(
-                f"MockedPlanner: fixture not found at {fixture_path}"
-            )
-        text = fixture_path.read_text(encoding="utf-8")
+        step_token = step_idx if step_idx is not None else "C"
+        fixture_path = root / f"{task_id}-step{step_token}.json"
+        # Stage C missing-fixture handling (v2 Phase 1 Step 6 prep):
+        # Tasks that reach orchestrator step 9 invoke
+        # `draft_completion_artefacts` which calls `_call_anthropic`
+        # with stage="C". If no `<task>-stepC.json` fixture exists,
+        # return "" — Planner.draft_completion_artefacts treats an
+        # empty response as the completion-artefacts-draft-failed
+        # escalation path, the same code path real-mode hits on an
+        # API hiccup. Preserves framework-profile fidelity (the
+        # operations view still sees the Stage C call happened via
+        # the api_end emit below) without forcing every calibration
+        # task to author a Stage C artefacts fixture. Stage A/B
+        # missing-fixture still raises — those are programming
+        # errors, not gracefully-degraded execution paths.
+        if stage == "C" and not fixture_path.is_file():
+            text = ""
+        else:
+            if not fixture_path.is_file():
+                raise RuntimeError(
+                    f"MockedPlanner: fixture not found at {fixture_path}"
+                )
+            text = fixture_path.read_text(encoding="utf-8")
 
         # Optional token-count sidecar — zeros if absent.
-        usage_path = root / f"{task_id}-step{step_idx if step_idx is not None else 'C'}.usage.json"
+        usage_path = root / f"{task_id}-step{step_token}.usage.json"
         if usage_path.is_file():
             try:
                 usage = json.loads(usage_path.read_text(encoding="utf-8"))
