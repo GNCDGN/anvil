@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 from anvil import git_ops as _git_ops
 from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
 from anvil.coder import Coder
+from anvil import ssh_ops
 from anvil.errors import AnvilError
 from anvil.planner import Plan, Planner
 from anvil.state import (
@@ -438,7 +439,83 @@ class Orchestrator:
                 # confirm == "auto" → fall through, no Telegram round-trip
                 self._log_event("step-done", f"step {bstep.number}")
 
-            # 8 wrap (no e2e/deploy: trivial brief declares neither)
+            # ---------------------------------------------------------------
+            # 6: end-to-end test (Phase 3 Step 5)
+            # ---------------------------------------------------------------
+            # Detect Mac-resident vs VPS-resident. For VPS-resident e2e the
+            # ordering flips to post-deploy (design 2.7 (ii)): pre-deploy e2e
+            # against a VPS-resident script measures the prior deploy, which
+            # is irrelevant to the new commits being deployed.
+            e2e_runs_on = None
+            if brief.end_to_end_test and state.status == "running":
+                e2e_runs_on = self._detect_e2e_location(brief)
+                self._e2e_runs_on = e2e_runs_on  # cache for post-deploy branch
+                if e2e_runs_on == "not-found":
+                    self._escalate(
+                        state, "e2e-script-not-found",
+                        f"{brief.end_to_end_test.script} not at Mac or VPS path",
+                        options=("abort",),
+                    )
+                    return 1
+                if e2e_runs_on == "mac":
+                    # Pre-deploy gate ordering (master design Part 6 nominal)
+                    e2e_ok, e2e_out = self._run_e2e_mac(brief)
+                    if not e2e_ok:
+                        self._escalate(
+                            state, "e2e-failed", e2e_out, options=("go", "abort"),
+                        )
+                        if state.status == "aborted":
+                            return 1
+                # vps-resident: defer e2e to post-deploy below
+
+            # ---------------------------------------------------------------
+            # 7: deploy (Phase 3 Step 5)
+            # ---------------------------------------------------------------
+            if brief.vps_deploy == "yes" and state.status == "running":
+                # Pre-check config
+                if self.config.vps_host is None:
+                    self._escalate(
+                        state, "deploy-config-missing",
+                        "VPS_HOST not set in .env; required for vps_deploy: yes briefs",
+                        options=("abort",),
+                    )
+                    return 1
+
+                deploy_result = ssh_ops.deploy(brief, self.config)
+                state.deploy = deploy_result
+                self._state = state
+                from anvil.state import write_state as _write_state
+                _write_state(state)
+                self._log_event("deploy", f"stage={deploy_result['stage']} ok={deploy_result['ok']}")
+
+                if not deploy_result["ok"]:
+                    stage = deploy_result["stage"]
+                    reason = f"deploy-{stage}-failed"
+                    self._escalate(
+                        state, reason, deploy_result["output"],
+                        options=("go", "abort"),
+                    )
+                    if state.status == "aborted":
+                        return 1
+                    # "go" past a deploy escalation: full deploy retry from scratch.
+                    # The orchestrator does not silently retry — the escalation
+                    # required Genco confirmation. Re-enter handle_brief with the
+                    # current state so the deploy block runs fresh.
+                    return self.handle_brief(brief_path, resumed_state=state)
+
+            # Post-deploy e2e for VPS-resident case
+            if (brief.end_to_end_test and state.status == "running"
+                    and brief.vps_deploy == "yes"
+                    and getattr(self, "_e2e_runs_on", None) == "vps"):
+                e2e_ok, e2e_out = self._run_e2e_vps(brief)
+                if not e2e_ok:
+                    self._escalate(
+                        state, "deploy-e2e-failed", e2e_out, options=("go", "abort"),
+                    )
+                    if state.status == "aborted":
+                        return 1
+
+            # 8 wrap
             state.finished_at = datetime.now(_UK).isoformat(timespec="seconds")
             state = transition(state, "done")
             self._state = state
@@ -461,6 +538,66 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001 — never-raise
             log.error(f"unexpected in handle_brief: {e}", exc_info=True)
             return 2
+
+    # ---- e2e + deploy (Phase 3 Step 5) ----
+    def _detect_e2e_location(self, brief) -> str:
+        """Return 'mac' | 'vps' | 'not-found' for brief.end_to_end_test.script.
+
+        Convention-based heuristic (no new brief field):
+        - vps_deploy: yes AND script lives under eval/ AND vps_target_path set:
+          classify VPS-resident (Phase 3 exit test shape — post-deploy smoke).
+        - Else if script exists at target_repo_path/script: Mac-resident.
+        - Else if vps_deploy: yes: best-effort VPS probe (test -e on VPS path).
+        - Else not-found.
+
+        The eval/-path convention is narrow enough to not surprise Mac-side
+        builds and broad enough to cover the Phase 3 exit-test smoke. If a
+        future brief needs a different convention, a runs_on field is the
+        upgrade path.
+        """
+        script = brief.end_to_end_test.script
+        if (brief.vps_deploy == "yes"
+                and brief.vps_target_path
+                and script.startswith("eval/")):
+            return "vps"
+        mac_path = Path(brief.target_repo_path) / script
+        if mac_path.exists():
+            return "mac"
+        if brief.vps_deploy == "yes" and brief.vps_target_path and self.config.vps_host:
+            # Best-effort VPS probe; if SSH fails or path missing, treat as not-found
+            probe_cmd = f"test -e {brief.vps_target_path}/{script}"
+            ok, _ = ssh_ops.ssh_run(
+                self.config.vps_host, self.config.vps_user, probe_cmd, timeout=15,
+            )
+            if ok:
+                return "vps"
+        return "not-found"
+
+    def _run_e2e_mac(self, brief) -> tuple[bool, str]:
+        """Run a Mac-resident e2e script. Returns (ok, output). Never raises."""
+        import subprocess
+        script_path = Path(brief.target_repo_path) / brief.end_to_end_test.script
+        try:
+            r = subprocess.run(
+                [str(script_path)],
+                cwd=str(brief.target_repo_path),
+                capture_output=True, text=True, timeout=600,
+            )
+        except subprocess.TimeoutExpired as e:
+            return (False, f"TimeoutExpired(600s): {e!r}")
+        except Exception as e:  # noqa: BLE001
+            return (False, repr(e))
+        output = (r.stdout or "") + (r.stderr or "")
+        expected = brief.end_to_end_test.expected_exit
+        return (r.returncode == expected, output)
+
+    def _run_e2e_vps(self, brief) -> tuple[bool, str]:
+        """Run a VPS-resident e2e script via SSH. Returns (ok, output). Never raises."""
+        cmd = f"cd {brief.vps_target_path} && bash {brief.end_to_end_test.script}"
+        ok, output = ssh_ops.ssh_run(
+            self.config.vps_host, self.config.vps_user, cmd, timeout=600,
+        )
+        return (ok, output)
 
     # ---- planning (resume-reuse guard + persist) ----
     def _plan_step(self, brief, state, idx: int):

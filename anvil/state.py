@@ -67,6 +67,10 @@ class State(BaseModel):
     # Added Step 8 (orchestrator-directed); not in Component 5's schema —
     # flagged for doc parity. Optional/back-compatible.
     run_log: str | None = None
+    # Phase 3 Step 5: deploy chain outcome dict from ssh_ops.deploy().
+    # Keys: stage, ok, output, vps_head_sha, service_status. None until
+    # step 7 runs. Optional/back-compatible; no schema_version bump.
+    deploy: dict | None = None
 
 
 def state_dir() -> Path:
