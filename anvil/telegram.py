@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 
 from telegram import Bot
 
+from anvil import events as _events
 from anvil.state import state_dir  # marker file lives in the gitignored state/
 
 log = logging.getLogger("anvil.telegram")
@@ -173,10 +174,32 @@ class TelegramClient:
         `max_send_retries` failed attempts (3-retry exponential backoff),
         in which case a `telegram-down.marker` is written for Genco to spot.
         Never raises."""
+        # v2 Phase 1 Step 3: one telegram.send.start at entry, one
+        # telegram.send.end per return path. Retry detail stays in the
+        # existing log lines (notes.md Finding 2 disposition "keep").
+        t_start = time.monotonic()
+        message_chars = len(text)
+        _events.emit(
+            "telegram.send.start",
+            {
+                "message_chars": message_chars,
+                "chat_id": self.chat_id,
+            },
+        )
         for attempt in range(self.max_send_retries):
             try:
                 mid = self._send_message(text)
                 log.info(f"sent message {mid} ({len(text)} chars)")
+                _events.emit(
+                    "telegram.send.end",
+                    {
+                        "message_chars": message_chars,
+                        "duration_ms": int((time.monotonic() - t_start) * 1000),
+                        "http_status": None,
+                        "ok": True,
+                        "retry_count": attempt,
+                    },
+                )
                 return mid
             except Exception as e:  # noqa: BLE001 — never-raise contract
                 log.warning(
@@ -197,6 +220,17 @@ class TelegramClient:
         except Exception as e:  # noqa: BLE001
             log.error(f"could not even write telegram-down.marker: {e}")
         log.error("telegram send failed after all retries; wrote marker")
+        _events.emit(
+            "telegram.send.end",
+            {
+                "message_chars": message_chars,
+                "duration_ms": int((time.monotonic() - t_start) * 1000),
+                "http_status": None,
+                "ok": False,
+                "retry_count": self.max_send_retries,
+                "error": "all retries exhausted",
+            },
+        )
         return -1
 
     def send_typing(self) -> None:
@@ -217,6 +251,18 @@ class TelegramClient:
         Orchestrator.run()'s handler instead of being swallowed by the
         asyncio long-poll. Honoured within one long_poll_seconds window."""
         start = time.time()
+        # v2 Phase 1 Step 3: poll.start fires once at entry. Empty
+        # long-poll cycles do NOT emit (would dwarf signal). The
+        # timeout-no-reply path also does NOT emit — only the cycle
+        # that returns a real reply emits poll.reply.
+        _t_start_monotonic = time.monotonic()
+        _events.emit(
+            "telegram.poll.start",
+            {
+                "timeout_seconds": timeout,
+                "long_poll_seconds": self.long_poll_seconds,
+            },
+        )
 
         if interrupt_requested():
             raise KeyboardInterrupt("interrupt requested before wait_for_reply")
@@ -258,6 +304,16 @@ class TelegramClient:
                     and u.text
                 ):
                     log.info(f"reply received (update {u.update_id})")
+                    _events.emit(
+                        "telegram.poll.reply",
+                        {
+                            "duration_ms": int(
+                                (time.monotonic() - _t_start_monotonic) * 1000
+                            ),
+                            "reply_text_chars": len(u.text or ""),
+                            "update_id": u.update_id,
+                        },
+                    )
                     return Reply(
                         text=u.text,
                         message_id=u.message_id or 0,
