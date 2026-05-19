@@ -154,3 +154,13 @@ def format_completion(brief, state) -> str:
             f"- Service: {brief.service_name or '-'} ({status})"
         )
     return msg
+
+
+def format_artefact_preview(draft, setup_log_path, checkpoint_path) -> str:
+    """Phase 4 Step 5: voice-bound preview for the artefact-confirmation
+    gate. Wraps anvil.checkpoint.render_preview_message — the layout
+    lives there; this function exists in voice.py for the [ANVIL]
+    prefix and any future voice-spec touches.
+    """
+    from anvil.checkpoint import render_preview_message
+    return render_preview_message(draft, setup_log_path, checkpoint_path)

@@ -37,6 +37,8 @@ from anvil import git_ops as _git_ops
 from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
 from anvil.coder import Coder
 from anvil import ssh_ops
+from anvil import checkpoint as _checkpoint  # Phase 4 Step 5
+from anvil import vault_ops as _vault_ops  # Phase 4 Step 5
 from anvil.errors import AnvilError
 from anvil.planner import Plan, Planner
 from anvil.state import (
@@ -526,6 +528,16 @@ class Orchestrator:
             self._log_event("complete", f"status={state.status}")
             self._archive_brief(brief_path, brief, state)
             self.telegram.send(voice.format_completion(brief, state))
+            # Phase 4 Step 5: step 9 — draft + confirm + write artefacts.
+            # Wrapped in try/except for never-raise contract; on any
+            # unexpected exception, log and continue (build is done).
+            try:
+                self._draft_and_confirm_artefacts(brief, brief_path, state)
+            except Exception as e:  # noqa: BLE001 — never-raise
+                log.error(
+                    f"unexpected in _draft_and_confirm_artefacts: {e}",
+                    exc_info=True,
+                )
             return 0
 
         except NotImplementedError:
@@ -665,6 +677,12 @@ class Orchestrator:
     # string-shaped options arg still works (rendered as-is, grammar
     # falls back to ('go', 'abort')) but emits a one-time warning.
     def _escalate(self, state, reason, detail, options=("go", "abort")) -> None:
+        # Phase 4 Step 5: tick escalation_count for the wrap-time
+        # outcome suffix decision in checkpoint.derive_checkpoint_path.
+        # The or-0 guard handles legacy v1 state (escalation_count
+        # absent, defaulted by pydantic to 0 but defensive anyway).
+        state.escalation_count = (state.escalation_count or 0) + 1
+        write_state(state)
         prose_lines: list[str] = []
         if isinstance(options, (list, tuple)) and options and all(
             isinstance(o, str) for o in options
@@ -772,3 +790,116 @@ class Orchestrator:
             )
         except Exception as e:  # noqa: BLE001 — non-fatal
             log.warning(f"archive_brief skipped ({e})")
+
+    # ---- artefact drafting (Phase 4 Step 5) ----
+    def _draft_and_confirm_artefacts(
+        self, brief, brief_path: Path, state
+    ) -> None:
+        """Step 9: draft setup-log entry + checkpoint via Planner,
+        Telegram-preview them, write on go, defer-to-manual on abort.
+
+        Never raises (caller still wraps for belt-and-braces). All
+        failure paths route through _escalate with (go, abort) or
+        (abort,) grammar. setup-log-path-not-found is abort-only
+        (config can\'t be fixed mid-run); all other failures offer
+        go to mark the build done with paperwork deferred.
+        """
+        # 1. Derive setup-log path; soft-skip if missing.
+        # Phase 4 Step 5b: a missing setup-log is a pre-flight condition
+        # (brief in non-standard location, or test fixture), not an active
+        # failure. Log + return rather than escalate — matches the
+        # proportionality of the existing idempotent-skip pattern
+        # (checkpoint exists → log + skip). Active failures (draft-failed,
+        # write-failed) stay as escalations.
+        setup_log_path = _vault_ops.derive_setup_log_path(brief_path)
+        if not setup_log_path.is_file():
+            log.info(
+                f"[checkpoint] setup-log path does not exist; "
+                f"skipping artefact writes: {setup_log_path}"
+            )
+            self._log_event(
+                "artefacts",
+                f"skipped (setup-log not at {setup_log_path})",
+            )
+            return
+
+        # 2. Derive checkpoint path; skip writes idempotently if it exists
+        checkpoint_path = _checkpoint.derive_checkpoint_path(
+            brief, state, self.config.vault_path,
+        )
+        if checkpoint_path.exists():
+            log.info(
+                f"[checkpoint] exists; skipping artefact writes: "
+                f"{checkpoint_path}"
+            )
+            self._log_event(
+                "artefacts", f"skipped (checkpoint exists: {checkpoint_path.name})"
+            )
+            return
+
+        # 3. Call Planner; route escalation on draft failure
+        draft, err = _checkpoint.draft_and_preview(
+            brief, state, self.planner,
+        )
+        if draft is None:
+            self._escalate(
+                state, "completion-artefacts-draft-failed", err or "draft failed",
+                options=("go", "abort"),
+            )
+            proceed = self._await_user_decision(state)
+            if not proceed:
+                # User chose abort; state already aborted by _await
+                return
+            # User chose go: skip writes, mark deferred-to-manual
+            self._log_event("artefacts", "draft failed; deferred to manual")
+            return
+
+        # 4. Telegram preview + go/abort gate (plain wait, not escalation)
+        preview = voice.format_artefact_preview(
+            draft, setup_log_path, checkpoint_path,
+        )
+        self.telegram.send(preview)
+        pa = PendingAction(
+            type="artefact_confirmation",
+            sent_at=datetime.now(_UK).isoformat(timespec="seconds"),
+            expected_reply="go",
+        )
+        state.pending_action = pa
+        write_state(state)
+        reply = self.telegram.wait_for_reply(timeout=None)
+        text = (reply.text.strip().lower() if reply else "")
+        state.pending_action = None
+        write_state(state)
+
+        if text != "go":
+            # Abort or any non-go reply → defer to manual
+            self._log_event("artefacts", f"deferred to manual (reply={text!r})")
+            return
+
+        # 5. Execute writes; route escalation on failure
+        frontmatter = _checkpoint.compose_checkpoint_frontmatter(
+            brief, state,
+            git_commit=self.git.head_hash(brief.target_repo_path),
+        )
+        ok, write_err = _checkpoint.execute_writes(
+            draft, setup_log_path, checkpoint_path, frontmatter,
+        )
+        if not ok:
+            # Discriminate checkpoint-write vs generic vault-write failure
+            reason = (
+                "checkpoint-write-failed"
+                if "checkpoint" in (write_err or "").lower()
+                else "vault-write-failed"
+            )
+            self._escalate(
+                state, reason, write_err or "vault write failed",
+                options=("go", "abort"),
+            )
+            self._await_user_decision(state)
+            return
+
+        # 6. Happy path — both writes succeeded
+        self._log_event(
+            "artefacts",
+            f"wrote {setup_log_path.name} + {checkpoint_path.name}",
+        )

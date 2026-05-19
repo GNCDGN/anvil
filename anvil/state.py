@@ -45,7 +45,8 @@ class StepState(BaseModel):
 
 class PendingAction(BaseModel):
     type: Literal[
-        "step_confirmation", "escalation", "manual_coder", "resume_confirm"
+        "step_confirmation", "escalation", "manual_coder", "resume_confirm",
+        "artefact_confirmation",  # Phase 4 Step 5
     ]
     telegram_message_id: int | None = None
     sent_at: str
@@ -71,6 +72,11 @@ class State(BaseModel):
     # Keys: stage, ok, output, vps_head_sha, service_status. None until
     # step 7 runs. Optional/back-compatible; no schema_version bump.
     deploy: dict | None = None
+    # Phase 4 Step 5: count of escalations this run. Incremented by
+    # _escalate at every escalation event. Read by checkpoint module
+    # at step 9 to discriminate -shipped vs -shipped-with-caveats
+    # outcome suffix. Back-compatible (default 0); no schema_version bump.
+    escalation_count: int = 0
 
 
 def state_dir() -> Path:
