@@ -129,7 +129,7 @@ class TestGitOps(unittest.TestCase):
         self.assertEqual(sorted(changed), ["a.txt", "b.txt"])
 
     def test_push_no_remote_returns_false(self) -> None:
-        self.assertFalse(push(self.repo))  # no 'origin' — False, no raise
+        ok, _ = push(self.repo); self.assertFalse(ok)  # no 'origin' — False, no raise
 
     def test_revert_to(self) -> None:
         (self.repo / "c.txt").write_text("c\n")

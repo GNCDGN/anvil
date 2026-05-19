@@ -158,10 +158,16 @@ def revert_to(repo_path: Path, commit_hash: str) -> bool:
         return False
 
 
-def push(repo_path: Path, remote: str = "origin", branch: str = "main") -> bool:
-    """Push `branch` to `remote`. True on success, False on any failure
-    (no remote, auth, network). Never raises. Not exercised against a real
-    remote in tests — only in a Step 10 end-to-end run if explicitly enabled.
+def push(repo_path: Path, remote: str = "origin", branch: str = "main") -> tuple[bool, str]:
+    """Push `branch` to `remote`. Returns (ok, output). Never raises.
+
+    Phase 3 Step 3: signature upgraded from bool to tuple[bool, str] to
+    surface stderr to the deploy-stage escalation message. Zero pre-existing
+    callers per Phase 3 Step 3 grep; safe to change in-place.
+
+    No-op push (nothing to push, 'Everything up-to-date') returns (True, output).
+    Non-zero exit returns (False, stdout+stderr).
     """
     r = _git(repo_path, "push", remote, branch, check=False)
-    return r.returncode == 0
+    output = (r.stdout or "") + (r.stderr or "")
+    return (r.returncode == 0, output)
