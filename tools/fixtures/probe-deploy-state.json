@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "brief_path": "/tmp/test/brief.md",
+  "started_at": "2026-05-19T10:00:00+01:00",
+  "finished_at": "2026-05-19T10:15:00+01:00",
+  "status": "done",
+  "current_step": 1,
+  "steps": [
+    {
+      "n": 1,
+      "name": "trivial",
+      "status": "done",
+      "commit": "abc1234",
+      "smoke": "pass"
+    }
+  ],
+  "deploy": {
+    "stage": "complete",
+    "ok": true,
+    "output": "",
+    "vps_head_sha": "fed987654321abc",
+    "service_status": "active"
+  },
+  "coder_mode": "auto",
+  "run_log": "/tmp/test/run.log"
+}

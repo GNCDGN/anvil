@@ -99,6 +99,22 @@ PHASE2_DIMENSIONS = [
      "Planner escalation calibration on Step 3 (judgment call); Step 4 conditional-skip discipline"),
 ]
 
+PHASE3_DIMENSIONS = [
+    ("Deploy chain correctness",
+     "state.deploy.stage == 'complete'; vps_head_sha matches; service_status == 'active'"),
+    ("Sub-stage escalation routing",
+     "any deploy-{stage}-failed escalation names the right stage; unit-evidenced if no live failure"),
+    ("E2E ordering",
+     "Mac-resident e2e gates deploy; VPS-resident e2e runs post-deploy per design 2.7"),
+    ("Service health verification",
+     "post-restart systemctl is-active returns active within 3s settle; negative case unit-evidenced"),
+    ("Phase-2-retroactive (P2-10 closure)",
+     "Planner Step 1 threshold judgment: escalate or grounded plan (pass); confabulate (fail). "
+     "Step 2 conditional: decline-when-unmet or grounded-when-met (pass); invent (fail)."),
+    ("Total Genco reply count",
+     "under 20% of Phase 1 baseline; same metric as Phase 2"),
+]
+
 # Escalation-source bins for Phase 2 scoring. Matched against the
 # `reason` field of escalation-shaped plans + run-log "escalation"
 # events. Order matters: more specific patterns first.
@@ -111,6 +127,10 @@ _ESCALATION_BINS = {
         "planner-validation-failure", "smoke test failed",
         "coder-out-of-scope", "coder-path-reconciliation-failed",
         "coder-failed",
+        # Phase 3 Step 6: deploy and e2e escalation reasons
+        "deploy-config-missing", "deploy-push-failed", "deploy-pull-failed",
+        "deploy-restart-failed", "deploy-health-check-failed",
+        "deploy-e2e-failed", "e2e-failed", "e2e-script-not-found",
     ),
     "genco-initiated": (
         # paused-by-user via non-grammar reply; the run-log "pause"
@@ -229,10 +249,28 @@ class Capture:
             "planner-self": 0, "framework": 0,
             "genco-initiated": 0, "other": 0,
         }
+        # Phase 3 Step 6: deploy-stage outcomes and post-deploy e2e
+        self.deploy_outcomes: list[dict] = []
+        self.e2e_outcomes: list[dict] = []
+        self.vps_head_shas: list[str] = []
 
     def poll(self, state: dict):
         self.last_state = state
         prev = self.prev or {}
+        # Phase 3 Step 6: capture deploy outcome when first observed.
+        deploy = state.get("deploy")
+        prev_deploy = prev.get("deploy")
+        if deploy and deploy != prev_deploy:
+            self.deploy_outcomes.append({
+                "captured_at": _now_iso(),
+                "stage": deploy.get("stage"),
+                "ok": deploy.get("ok"),
+                "vps_head_sha": deploy.get("vps_head_sha"),
+                "service_status": deploy.get("service_status"),
+                "output_truncated": (deploy.get("output", "")[:300] if deploy.get("output") else ""),
+            })
+            if deploy.get("vps_head_sha"):
+                self.vps_head_shas.append(deploy["vps_head_sha"])
         if state.get("status") != prev.get("status"):
             self.status_transitions.append(
                 f"{_now_iso()}  {prev.get('status', '(start)')} -> "
@@ -520,6 +558,18 @@ def render(cap: Capture, planner_calls: list[dict],
 
     # Phase 2 grading dimensions.
     L += ["", "## Phase 2 grading dimensions (ungraded — grader plugs in here)", ""]
+    # Phase 3 Step 6: Deploy verification section (only when deploy ran)
+    if cap.deploy_outcomes:
+        lines.append("## Deploy verification (Phase 3)")
+        for d in cap.deploy_outcomes:
+            lines.append(
+                f"- {d['captured_at']}: stage={d['stage']} ok={d['ok']} "
+                f"sha={d.get('vps_head_sha') or '-'} status={d.get('service_status') or '-'}"
+            )
+            if d.get("output_truncated"):
+                lines.append(f"  output: {d['output_truncated']!r}")
+        lines.append("")
+
     for i, (name, feeds) in enumerate(PHASE2_DIMENSIONS, 1):
         L += [
             f"### Phase 2 dimension {i} — {name}",

@@ -133,9 +133,24 @@ def format_escalation(state, reason, detail, options) -> str:
 
 def format_completion(brief, state) -> str:
     done = sum(1 for s in state.steps if s.status == "done")
-    return (
+    msg = (
         f"[ANVIL] Build complete — {brief.build_name}\n"
         f"- Steps: {done}/{len(state.steps)} done\n"
         f"- Status: {state.status}\n"
         f"- Run log: {Path(state.run_log).name if state.run_log else '(none)'}"
     )
+    # Phase 3 Step 6: deploy verification block when state.deploy populated
+    deploy = getattr(state, "deploy", None)
+    if deploy:
+        sha = deploy.get("vps_head_sha") or ""
+        sha_short = sha[:7] if sha else "-"
+        status = deploy.get("service_status") or "-"
+        stage = deploy.get("stage", "?")
+        ok = deploy.get("ok", False)
+        msg += (
+            f"\n\nDeploy:\n"
+            f"- Stage: {stage} ({'ok' if ok else 'failed'})\n"
+            f"- VPS HEAD: {sha_short}\n"
+            f"- Service: {brief.service_name or '-'} ({status})"
+        )
+    return msg
