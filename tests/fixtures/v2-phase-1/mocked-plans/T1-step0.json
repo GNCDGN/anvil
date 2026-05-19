@@ -1,0 +1,21 @@
+{
+  "step_number": 1,
+  "step_name": "Touch README",
+  "files_to_touch": [
+    "README.md"
+  ],
+  "operations": [
+    "write",
+    "smoke-test"
+  ],
+  "approach": "Append one line to README.md.",
+  "smoke_test": "test -f README.md",
+  "expected_outcome": "README.md exists.",
+  "commit_message": "T1 step 1: touch README",
+  "scope_boundaries": {
+    "in_scope": "README.md",
+    "out_of_scope": "all other files"
+  },
+  "confidence": "high",
+  "escalation_triggers": []
+}

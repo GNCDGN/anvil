@@ -1,0 +1,5 @@
+files:
+  - path: CHANGELOG.md
+    content: |
+      # CHANGELOG
+      - v2: bump

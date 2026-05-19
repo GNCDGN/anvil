@@ -1,0 +1,5 @@
+files:
+  - path: b.py
+    content: |
+      # b
+      print('b')

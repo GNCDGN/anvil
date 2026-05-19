@@ -26,6 +26,7 @@ top, persists state as `paused-mid-execution`, exits cleanly.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -81,12 +82,10 @@ class Orchestrator:
         # CODER_MODE env) determines the mode. The Phase 0/1 default of
         # 'manual' is gone — production now honours .env.
         self.coder_mode = coder_mode if coder_mode is not None else getattr(config, "coder_mode", "manual")
-        self.planner = planner if planner is not None else Planner(
-            api_key=config.anthropic_api_key,
-            model=config.planner_model,
-            timeout=config.planner_timeout,
-            vault_root=config.vault_path,
-        )
+        # v2 Phase 1 Step 5: extracted _build_planner() so the
+        # mocked-vs-real switch (Config.mocked_planner) lives in one
+        # method, mirroring the existing _build_coder seam.
+        self.planner = planner if planner is not None else self._build_planner()
         self._telegram = telegram          # may be None until needed
         self.git = git if git is not None else _git_ops
         self._run_smoke = run_smoke or self._default_run_smoke
@@ -105,12 +104,44 @@ class Orchestrator:
         self._run_log: Path | None = None
         self._state = None
 
+    def _build_planner(self) -> Planner:
+        """Construct the Planner instance (real or mocked subclass).
+
+        v2 Phase 1 Step 5: if `config.mocked_planner` is set
+        (`MOCKED_PLANNER=1`), return a `MockedPlanner` subclass that
+        substitutes `_call_anthropic` with fixture-driven responses and
+        synthesised api_end emits. Otherwise return the production
+        Planner. Lazy import of `anvil.mocked` avoids the circular
+        import path (mocked imports Planner; orchestrator imports
+        mocked only via this method).
+        """
+        if getattr(self.config, "mocked_planner", False):
+            from anvil.mocked import MockedPlanner
+            return MockedPlanner(
+                api_key=self.config.anthropic_api_key,
+                model=self.config.planner_model,
+                timeout=self.config.planner_timeout,
+                vault_root=self.config.vault_path,
+            )
+        return Planner(
+            api_key=self.config.anthropic_api_key,
+            model=self.config.planner_model,
+            timeout=self.config.planner_timeout,
+            vault_root=self.config.vault_path,
+        )
+
     def _build_coder(self) -> Coder:
         """Construct a real Coder from config. The system prompt is
         coder-system.md with {VOICE_SPEC} substituted. claude_binary
         defaults to whatever `claude` resolves to on PATH at startup,
         overridable via CLAUDE_BINARY in .env. Coder timeout reuses
         config.coder_timeout (already present since Phase 0).
+
+        v2 Phase 1 Step 5: switches to MockedCoder when
+        `config.mocked_coder` is set. The mocked Coder honours the
+        same constructor surface (claude_binary, timeout, system_prompt)
+        and overrides `_real_run` only — preflight + Layer 2 scope
+        verify still run on real disk against real git.
         """
         prompt_path = Path(__file__).resolve().parent / "prompts" / "coder-system.md"
         prompt_text = prompt_path.read_text(encoding="utf-8")
@@ -120,6 +151,13 @@ class Orchestrator:
             or shutil.which("claude")
             or "claude"
         )
+        if getattr(self.config, "mocked_coder", False):
+            from anvil.mocked import MockedCoder
+            return MockedCoder(
+                claude_binary=binary,
+                timeout=self.config.coder_timeout,
+                system_prompt=prompt_text,
+            )
         return Coder(
             claude_binary=binary,
             timeout=self.config.coder_timeout,
@@ -247,12 +285,20 @@ class Orchestrator:
             # v2 Phase 1 Step 2: determine run_id and call begin_run
             # BEFORE the brief.parsed/brief.validated emits so they
             # land in the right run's events.jsonl (not unknown-run/).
+            #
+            # v2 Phase 1 Step 5 (Step 4 outcome finding 1):
+            # ANVIL_RUN_ID_OVERRIDE env wins outright when set — the
+            # calibration_runner (Step 6) injects the task-prefixed
+            # shape (`T1-doc-edit`) so the harness's regex matches.
+            # Resume keeps using the persisted state.run_id (which the
+            # calibration_runner set on the original run).
+            override = os.environ.get("ANVIL_RUN_ID_OVERRIDE", "").strip()
             if resumed_state is not None and resumed_state.run_id:
                 run_id = resumed_state.run_id
             elif resumed_state is not None:
                 # Legacy v1 state: no run_id persisted. Mint a fresh one
                 # with a -resumed suffix and log the un-instrumented case.
-                run_id = (
+                run_id = override or (
                     f"{datetime.now(_UK).strftime('%Y-%m-%d-%H%M')}"
                     f"-{_slug(brief.build_name)}-resumed"
                 )
@@ -261,8 +307,9 @@ class Orchestrator:
                     f"{run_id}"
                 )
             else:
-                # Fresh run: same shape as the _run_log filename slug.
-                run_id = (
+                # Fresh run: env override wins; else same shape as the
+                # _run_log filename slug.
+                run_id = override or (
                     f"{datetime.now(_UK).strftime('%Y-%m-%d-%H%M')}"
                     f"-{_slug(brief.build_name)}"
                 )

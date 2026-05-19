@@ -1,0 +1,7 @@
+files:
+  - path: a.py
+    content: |
+      # a v2
+  - path: b.py
+    content: |
+      # b (out-of-scope)

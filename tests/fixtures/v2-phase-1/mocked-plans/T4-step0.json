@@ -1,0 +1,12 @@
+{
+  "escalate": true,
+  "reason": "judgment-call",
+  "detail": "The brief asks me to pick a retention period default but provides no notes or vault context to ground the choice. The anti-confabulation rule applies.",
+  "options": [
+    "7 days",
+    "30 days",
+    "90 days",
+    "ask user via Telegram"
+  ],
+  "step_number": 1
+}

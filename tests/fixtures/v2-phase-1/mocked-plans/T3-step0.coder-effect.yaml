@@ -1,0 +1,4 @@
+files:
+  - path: a.py
+    content: |
+      # a

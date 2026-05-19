@@ -1,0 +1,21 @@
+{
+  "step_number": 2,
+  "step_name": "Apply retention",
+  "files_to_touch": [
+    "retention.py"
+  ],
+  "operations": [
+    "write",
+    "smoke-test"
+  ],
+  "approach": "Make the change.",
+  "smoke_test": "test -f retention.py",
+  "expected_outcome": "It works.",
+  "commit_message": "T4 step 2",
+  "scope_boundaries": {
+    "in_scope": "retention.py",
+    "out_of_scope": "all other files"
+  },
+  "confidence": "high",
+  "escalation_triggers": []
+}

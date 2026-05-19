@@ -304,11 +304,35 @@ class Coder:
         self.timeout = int(timeout)
         self.system_prompt = system_prompt
 
+    def _real_run(self, cmd, prompt, target_repo_path):
+        """Invoke the Claude subprocess. Extracted from execute_step
+        (v2 Phase 1 Step 5) so MockedCoder can override the call site
+        without touching the surrounding event-emit + timing + scope-
+        verify shell. The signature mirrors what the caller needs:
+        the constructed argv (`cmd`), the stdin payload (`prompt`),
+        and the cwd (`target_repo_path`). Returns a
+        `subprocess.CompletedProcess` — either real (this implementation)
+        or fabricated (MockedCoder's override).
+        """
+        return subprocess.run(
+            cmd,
+            cwd=target_repo_path,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+        )
+
     def execute_step(self, plan, brief) -> dict:
         repo = Path(brief.target_repo_path)
         step_number = getattr(plan, "step_number", None)
         # step_idx is 0-based; plan.step_number is 1-based.
         step_idx_evt = (step_number - 1) if isinstance(step_number, int) else None
+        # v2 Phase 1 Step 5: stash step_idx on self so a MockedCoder
+        # subclass's _real_run can read it without changing the method
+        # signature. Defensive default (None) keeps execute_step callable
+        # from anywhere (tests don't set this).
+        self._current_step_idx = step_idx_evt
 
         # v2 Phase 1 Step 2: preflight emit.
         _events.emit(
@@ -393,19 +417,15 @@ class Coder:
         )
 
         # 4. Invoke and time.
+        # v2 Phase 1 Step 5: subprocess.run extracted to self._real_run
+        # so MockedCoder can override the call without touching the
+        # surrounding event-emit + timing + scope-verify shell.
         start = time.monotonic()
         stdout = ""
         stderr = ""
         exit_code = -1
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(repo),
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
+            proc = self._real_run(cmd, prompt, str(repo))
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
             exit_code = proc.returncode

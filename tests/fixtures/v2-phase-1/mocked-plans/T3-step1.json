@@ -1,0 +1,21 @@
+{
+  "step_number": 2,
+  "step_name": "Modify a.py",
+  "files_to_touch": [
+    "a.py"
+  ],
+  "operations": [
+    "write",
+    "smoke-test"
+  ],
+  "approach": "Modify a.py in place.",
+  "smoke_test": "test -f a.py",
+  "expected_outcome": "It works.",
+  "commit_message": "T3 step 2: modify a.py",
+  "scope_boundaries": {
+    "in_scope": "a.py",
+    "out_of_scope": "all other files"
+  },
+  "confidence": "high",
+  "escalation_triggers": []
+}

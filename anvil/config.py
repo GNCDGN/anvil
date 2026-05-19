@@ -45,6 +45,13 @@ class Config:
     vps_user: str = "root"
     # Phase 4 Step 1: checkpoint write target; derived from vault_path at load time
     checkpoint_active_path: Path = Path("/dev/null")  # replaced in load()
+    # v2 Phase 1 Step 5: calibration-framework flags. Selected by env
+    # (MOCKED_PLANNER=1, MOCKED_CODER=1) — see anvil/mocked.py. Default
+    # off, production behaviour unchanged. The Orchestrator's
+    # _build_planner / _build_coder seams switch implementations on
+    # these flags at construction time.
+    mocked_planner: bool = False
+    mocked_coder: bool = False
 
     @classmethod
     def load(cls, env_path: Path | None = None) -> "Config":
@@ -101,6 +108,12 @@ class Config:
         vps_host = os.environ.get("VPS_HOST", "").strip() or None
         vps_user = os.environ.get("VPS_USER", "").strip() or "root"
 
+        # v2 Phase 1 Step 5: calibration-framework env flags. "1" enables
+        # the mocked subclass; anything else (default empty) keeps the
+        # production class. Mirrors the existing coder_mode read pattern.
+        mocked_planner = (os.environ.get("MOCKED_PLANNER", "0").strip() == "1")
+        mocked_coder = (os.environ.get("MOCKED_CODER", "0").strip() == "1")
+
         if problems:
             raise ConfigError(
                 "Invalid ANVIL configuration (looked in "
@@ -124,4 +137,6 @@ class Config:
             checkpoint_active_path=(
                 vault_path / "01-Projects/second-brain/checkpoints/active"
             ),
+            mocked_planner=mocked_planner,
+            mocked_coder=mocked_coder,
         )

@@ -1,0 +1,4 @@
+files:
+  - path: README.md
+    content: |
+      # v2 noop deploy target

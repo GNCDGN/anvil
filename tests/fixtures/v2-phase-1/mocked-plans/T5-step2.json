@@ -1,0 +1,21 @@
+{
+  "step_number": 3,
+  "step_name": "Update README",
+  "files_to_touch": [
+    "README.md"
+  ],
+  "operations": [
+    "write",
+    "smoke-test"
+  ],
+  "approach": "Make the change.",
+  "smoke_test": "test -f README.md",
+  "expected_outcome": "It works.",
+  "commit_message": "T5 step 3: update README",
+  "scope_boundaries": {
+    "in_scope": "README.md",
+    "out_of_scope": "all other files"
+  },
+  "confidence": "high",
+  "escalation_triggers": []
+}

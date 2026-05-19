@@ -1,0 +1,21 @@
+{
+  "step_number": 1,
+  "step_name": "Bump version",
+  "files_to_touch": [
+    "version.txt"
+  ],
+  "operations": [
+    "write",
+    "smoke-test"
+  ],
+  "approach": "Bump the version constant.",
+  "smoke_test": "test -f version.txt",
+  "expected_outcome": "It works.",
+  "commit_message": "T5 step 1: bump version",
+  "scope_boundaries": {
+    "in_scope": "version.txt",
+    "out_of_scope": "all other files"
+  },
+  "confidence": "high",
+  "escalation_triggers": []
+}

@@ -1,0 +1,5 @@
+files:
+  - path: README.md
+    content: |
+      # T1 target
+      Test line.
