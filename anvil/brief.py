@@ -58,6 +58,8 @@ class Brief(BaseModel):
     target_repo_path: Path
     vps_deploy: Literal["yes", "no"]
     service_name: str | None = None
+    # Phase 3 Step 1: VPS-side path for deploy chain (cd here, then git pull --ff-only)
+    vps_target_path: str | None = None
     goal: str = ""
     context_links: list[str] = []
     context_paths: list[Path] = []
@@ -285,6 +287,9 @@ def parse_brief_raw(path: Path) -> tuple[Brief, dict]:
         service_name=(
             str(fm["service_name"]) if fm.get("service_name") else None
         ),
+        vps_target_path=(
+            str(fm["vps_target_path"]) if fm.get("vps_target_path") else None
+        ),
         goal=sections.get("goal", ""),
         context_links=_parse_context(sections.get("context", "")),
         steps=_parse_steps(sections.get("steps", "")),
@@ -373,9 +378,11 @@ def validate_or_reject(
     elif not _is_git_repo(brief.target_repo_path):
         e.append(f"target_repo_path is not a git repo: {brief.target_repo_path}")
 
-    # 4. vps_deploy: yes requires service_name
+    # 4. vps_deploy: yes requires service_name AND vps_target_path (Phase 3 Step 1)
     if brief.vps_deploy == "yes" and not brief.service_name:
         e.append("vps_deploy is 'yes' but service_name is not set")
+    if brief.vps_deploy == "yes" and not brief.vps_target_path:
+        e.append("vps_deploy is 'yes' but vps_target_path is not set")
 
     # 5. At least one step
     if not brief.steps:
