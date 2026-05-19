@@ -163,9 +163,10 @@ class TestEmitFailurePaths(_EventsTestBase):
     def test_write_failure_increments_drop_count_no_raise(self) -> None:
         events.begin_run("r1")
         start_drops = events.drop_count()
-        # Patch _real_write to raise OSError; emit must catch and drop.
+        # Patch _real_append (the hot path) to raise OSError;
+        # emit must catch and drop.
         with mock.patch.object(
-            events, "_real_write",
+            events, "_real_append",
             side_effect=OSError("disk full (simulated)"),
         ):
             ok = events.emit("step.start", {"step_number": 1})
@@ -175,7 +176,7 @@ class TestEmitFailurePaths(_EventsTestBase):
     def test_emit_never_raises_on_unexpected(self) -> None:
         events.begin_run("r1")
         with mock.patch.object(
-            events, "_real_write",
+            events, "_real_append",
             side_effect=RuntimeError("totally unexpected"),
         ):
             ok = events.emit("step.start", {})
@@ -264,6 +265,49 @@ class TestMultiEmitAndRedirect(_EventsTestBase):
         expected = self.tmp_path / "state" / "runs" / "r1" / "events.jsonl"
         self.assertTrue(expected.is_file(),
                         f"events.jsonl should land at {expected}")
+
+
+class TestAppendModeHotPath(_EventsTestBase):
+    """Step 2 prep: _real_append is the O(1) hot path, replacing the
+    Step 1 read-modify-write block. Verify the new write semantics."""
+
+    def test_real_append_used_for_each_emit(self) -> None:
+        """Patching _real_append (not _real_write) catches every emit."""
+        captured: list[tuple[Path, str]] = []
+
+        def _spy(path: Path, text: str) -> None:
+            captured.append((path, text))
+            # Still write so the file exists for subsequent assertions.
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+
+        events.begin_run("r1")
+        with mock.patch.object(events, "_real_append", side_effect=_spy):
+            events.emit("step.start", {"i": 0})
+            events.emit("step.start", {"i": 1})
+            events.emit("step.start", {"i": 2})
+        events.end_run()
+
+        # begin_run.run_start + 3 emits + end_run.run_end = 5 captured
+        # writes via _real_append (the run.start/end go through emit too).
+        # The patched scope above only covers the three middle emits;
+        # the run.start fires before mock.patch.object entered, and the
+        # run.end fires after it exited. So we count exactly 3.
+        self.assertEqual(len(captured), 3)
+
+    def test_append_path_produces_valid_jsonl_for_long_sequence(self) -> None:
+        """Appendmode integrity: 30 emits in tight succession still produce
+        a JSONL where every line parses independently."""
+        events.begin_run("r1")
+        for i in range(30):
+            events.emit("step.start", {"i": i}, step_idx=i)
+        events.end_run()
+        rows = self._read_events("r1")
+        # 1 run.start + 30 step.start + 1 run.end = 32
+        self.assertEqual(len(rows), 32)
+        # Every step row carries its i intact, in order.
+        step_rows = [r for r in rows if r["kind"] == "step.start"]
+        self.assertEqual([r["data"]["i"] for r in step_rows], list(range(30)))
 
 
 if __name__ == "__main__":

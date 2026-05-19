@@ -18,10 +18,14 @@ Design pillars:
   generic Exception; on failure it increments `_drop_count` and returns
   False. No emit failure ever propagates to the caller — instrumentation
   is best-effort, never load-bearing.
-- **`_real_write` capture.** `Path.write_text` is captured at module
-  import time, before any code uses it. Production code uses the
-  captured reference via the `_append_line` helper; tests patch
-  `anvil.events._real_write` to inject failure modes. Same shape as
+- **`_real_write` + `_real_append` captures.** `Path.write_text` and a
+  module-level `_real_append` helper (append-mode `open`) are captured
+  at module import time, before any code uses them. Production code
+  uses `_real_append` via the `_append_line` helper for the O(1)
+  emit hot path; `_real_write` is retained for any future caller
+  needing atomic-replace semantics. Tests patch
+  `anvil.events._real_append` (and `_real_write` for whole-file
+  callers) to inject failure modes. Same shape as
   `anvil/vault_ops.py:29` and `anvil/ssh_ops.py:17`.
 - **Validated kind catalogue.** `VALID_KINDS` is a frozenset of 45 dotted
   event kinds (notes.md Finding 1 + brief Step 1 spec; the brief
@@ -53,11 +57,29 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-# Module-scope capture — production uses _real_write; tests patch this
-# attribute to inject failure modes. Captured before any code below
-# uses Path.write_text directly. Mirrors vault_ops._real_write (line 29)
-# and ssh_ops._real_run (line 17).
+# Module-scope captures — production uses these via the helpers below;
+# tests patch the attributes to inject failure modes. Captured before
+# any code below uses them directly. Mirrors vault_ops._real_write
+# (line 29) and ssh_ops._real_run (line 17).
+#
+# `_real_write` is the kept-for-back-compat handle (whole-file rewrite
+# semantics, exposed for any future emit that needs atomic replace).
+# `_real_append` is the hot path: append one line at a time, O(1) per
+# emit, used by `_append_line`. Step 1 used read-modify-write because
+# only `_real_write` existed; Step 2 prep added the second capture so
+# Step 7's calibration sweep doesn't pay quadratic bytes in event count.
 _real_write = Path.write_text
+
+
+def _real_append(path: Path, text: str) -> None:
+    """Append `text` to `path` in O(1) per call (no read-modify-write).
+
+    Production code uses this via `_append_line`. Tests patch
+    `anvil.events._real_append` to inject IOError shapes that the
+    read-modify-write path could not naturally exercise.
+    """
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
 
 log = logging.getLogger("anvil.events")
 
@@ -307,22 +329,15 @@ def _events_path_for(run_id: str) -> Path:
 def _append_line(path: Path, line: str) -> None:
     """Append `line` (plus newline) to `path`, creating parent dirs.
 
-    Uses `_real_write` indirectly: the existing-content read + concat +
-    rewrite pattern is read-modify-write, which is slow but correct
-    under the never-raises contract. The Step 1 brief calls out
-    "correctness over micro-optimisation"; per-emit cost is trivial
-    against the API-call cost it instruments.
+    Uses `_real_append` — O(1) per emit. Step 2 prep replaced the
+    Step 1 read-modify-write block (which was O(file-size) per emit
+    and would cost quadratic bytes across Step 7's calibration sweep).
 
-    Tests patch `anvil.events._real_write` to inject OSError; this
+    Tests patch `anvil.events._real_append` to inject OSError; this
     helper propagates the exception so `emit`'s outer handler catches
-    it and increments `_drop_count`.
+    it and increments `_drop_count`. `_real_write` is still captured
+    at module top for any future caller that needs atomic-replace
+    semantics, but the hot path no longer touches it.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-        content = existing + line + "\n"
-    else:
-        content = line + "\n"
-    _real_write(path, content, encoding="utf-8")
+    _real_append(path, line + "\n")
