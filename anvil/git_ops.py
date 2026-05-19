@@ -127,12 +127,39 @@ def commit_step(
     """`git add -A`, then commit with the Component 7 message. Returns the
     new commit SHA, or "" if there was nothing to commit (caller records
     `commit: null` — Component 7 safety check 3: never commit empty)."""
+    import time as _time
+    from anvil import events as _events
+
+    t0 = _time.monotonic()
+    try:
+        _events.emit(
+            "git.commit.start",
+            {"step_idx": step_idx, "repo_path": str(repo_path)},
+            step_idx=step_idx,
+        )
+    except Exception:  # noqa: BLE001 — never-raise
+        pass
+
     _git(repo_path, "add", "-A")
     # Anything staged? `git diff --cached --quiet` exits 1 iff there are
     # staged changes; 0 iff nothing to commit.
     staged = _git(repo_path, "diff", "--cached", "--quiet", check=False)
     if staged.returncode == 0:
+        try:
+            _events.emit(
+                "git.commit.end",
+                {
+                    "step_idx": step_idx,
+                    "duration_ms": int((_time.monotonic() - t0) * 1000),
+                    "ok": True,
+                    "sha": "",
+                },
+                step_idx=step_idx,
+            )
+        except Exception:  # noqa: BLE001 — never-raise
+            pass
         return ""  # nothing to commit — caller records commit: null
+
     msg = _build_commit_message(
         plan,
         brief_name=brief_name,
@@ -145,7 +172,21 @@ def commit_step(
         "-c", f"user.email={_GIT_EMAIL}",
         "commit", "-m", msg,
     )
-    return _git(repo_path, "rev-parse", "HEAD").stdout.strip()
+    sha = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
+    try:
+        _events.emit(
+            "git.commit.end",
+            {
+                "step_idx": step_idx,
+                "duration_ms": int((_time.monotonic() - t0) * 1000),
+                "ok": True,
+                "sha": sha,
+            },
+            step_idx=step_idx,
+        )
+    except Exception:  # noqa: BLE001 — never-raise
+        pass
+    return sha
 
 
 def revert_to(repo_path: Path, commit_hash: str) -> bool:
@@ -168,6 +209,27 @@ def push(repo_path: Path, remote: str = "origin", branch: str = "main") -> tuple
     No-op push (nothing to push, 'Everything up-to-date') returns (True, output).
     Non-zero exit returns (False, stdout+stderr).
     """
+    import time as _time
+    from anvil import events as _events
+
+    t0 = _time.monotonic()
+    try:
+        _events.emit("git.push.start", {"remote": remote, "branch": branch})
+    except Exception:  # noqa: BLE001 — never-raise
+        pass
+
     r = _git(repo_path, "push", remote, branch, check=False)
     output = (r.stdout or "") + (r.stderr or "")
-    return (r.returncode == 0, output)
+    ok = (r.returncode == 0)
+    try:
+        _events.emit(
+            "git.push.end",
+            {
+                "duration_ms": int((_time.monotonic() - t0) * 1000),
+                "ok": ok,
+                "output_chars": len(output),
+            },
+        )
+    except Exception:  # noqa: BLE001 — never-raise
+        pass
+    return (ok, output)

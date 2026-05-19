@@ -48,6 +48,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from anvil import events as _events
+
 log = logging.getLogger("anvil.coder")
 
 # Tools the model uses to read or search the repo. Always permitted —
@@ -304,23 +306,51 @@ class Coder:
 
     def execute_step(self, plan, brief) -> dict:
         repo = Path(brief.target_repo_path)
+        step_number = getattr(plan, "step_number", None)
+        # step_idx is 0-based; plan.step_number is 1-based.
+        step_idx_evt = (step_number - 1) if isinstance(step_number, int) else None
+
+        # v2 Phase 1 Step 2: preflight emit.
+        _events.emit(
+            "coder.preflight.start",
+            {"step_idx": step_idx_evt, "step_number": step_number},
+            step_idx=step_idx_evt,
+        )
 
         # 1. Pre-flight: path reconciliation.
         plan_files = list(getattr(plan, "files_to_touch", []) or [])
         resolved_paths, reconciliations = _reconcile_paths(plan_files, repo)
+        _events.emit(
+            "coder.preflight.reconciled",
+            {
+                "step_idx": step_idx_evt,
+                "reconciliations": reconciliations,
+            },
+            step_idx=step_idx_evt,
+        )
         failed = [r for r in reconciliations if r["status"] == "failed"]
         if failed:
             detail_lines = [
                 f"- {r['original']}: {r['reason']}" for r in failed
             ]
+            detail = (
+                "Could not reconcile the following plan paths against "
+                f"target_repo_path ({repo}):\n" + "\n".join(detail_lines)
+            )
+            _events.emit(
+                "coder.preflight.escalate",
+                {
+                    "step_idx": step_idx_evt,
+                    "reason": "coder-path-reconciliation-failed",
+                    "detail": detail[:500],
+                },
+                step_idx=step_idx_evt,
+            )
             return {
                 "escalate": True,
                 "reason": "coder-path-reconciliation-failed",
-                "detail": (
-                    "Could not reconcile the following plan paths against "
-                    f"target_repo_path ({repo}):\n" + "\n".join(detail_lines)
-                ),
-                "step_number": getattr(plan, "step_number", None),
+                "detail": detail,
+                "step_number": step_number,
                 "reconciliations": reconciliations,
             }
 
@@ -348,6 +378,18 @@ class Coder:
             ",".join(operations) or "(none)",
             ",".join(allow_list) or "(empty)",
             ",".join(deny_list) or "(empty)",
+        )
+
+        _events.emit(
+            "coder.subprocess.start",
+            {
+                "step_idx": step_idx_evt,
+                "allowed_tools": allow_list,
+                "disallowed_tools": deny_list,
+                "prompt_chars": len(prompt),
+                "claude_binary": str(self.claude_binary),
+            },
+            step_idx=step_idx_evt,
         )
 
         # 4. Invoke and time.
@@ -394,6 +436,18 @@ class Coder:
             exit_code = -3
         duration_s = time.monotonic() - start
 
+        _events.emit(
+            "coder.subprocess.end",
+            {
+                "step_idx": step_idx_evt,
+                "exit_code": exit_code,
+                "duration_ms": int(duration_s * 1000),
+                "stdout_chars": len(stdout),
+                "stderr_chars": len(stderr),
+            },
+            step_idx=step_idx_evt,
+        )
+
         # 5. Layer 2 — post-hoc scope verification via git.
         files_touched = _git_files_touched(repo)
         # Compute out_of_scope against the RESOLVED path set. If the
@@ -401,6 +455,18 @@ class Coder:
         # in scope, reporter/x.py is not — match accordingly.
         in_scope = set(resolved_paths) | set(plan_files)
         out_of_scope = [f for f in files_touched if f not in in_scope]
+
+        _events.emit(
+            "coder.scope_verify",
+            {
+                "step_idx": step_idx_evt,
+                "files_touched": files_touched,
+                "files_touched_count": len(files_touched),
+                "out_of_scope": out_of_scope,
+                "out_of_scope_count": len(out_of_scope),
+            },
+            step_idx=step_idx_evt,
+        )
 
         return {
             "stdout": stdout,

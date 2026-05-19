@@ -84,6 +84,13 @@ class State(BaseModel):
     # to emit the Vault writes block and by exam_harness Capture.
     # Back-compatible (default None); no schema_version bump.
     vault_writes_outcome: dict | None = None
+    # v2 Phase 1 Step 2: run-level identifier threaded through the
+    # events.py emit layer. Set by handle_brief at orchestrator entry
+    # (or reused on resume) so the events.jsonl path is stable across
+    # a build's lifetime. None on legacy v1 states; resume falls back
+    # to constructing a fresh id and logging the un-instrumented case.
+    # Back-compatible (default None); no schema_version bump.
+    run_id: str | None = None
 
 
 def state_dir() -> Path:
@@ -129,18 +136,37 @@ def init_state(brief, started_at: str, brief_path: str | None = None,
 def write_state(state: State) -> None:
     """Write current-run.json then regenerate current-run.md, each atomically
     (`.tmp` + os.rename). Creates the state dir if absent."""
+    import time as _time
+    from anvil import events as _events
+
+    t0 = _time.monotonic()
     d = state_dir()
     d.mkdir(parents=True, exist_ok=True)
 
+    json_blob = state.model_dump_json(indent=2)
     json_path = _json_path()
     tmp_json = json_path.parent / (json_path.name + ".tmp")
-    tmp_json.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+    tmp_json.write_text(json_blob, encoding="utf-8")
     os.rename(tmp_json, json_path)
 
     md_path = _md_path()
     tmp_md = md_path.parent / (md_path.name + ".tmp")
     tmp_md.write_text(_render_state_md(state), encoding="utf-8")
     os.rename(tmp_md, md_path)
+
+    # v2 Phase 1 Step 2: emit state.write with byte/duration metadata.
+    # Lazy import + never-raise wrap so a write failure on the events
+    # layer cannot tank a state write (state correctness > observability).
+    try:
+        _events.emit(
+            "state.write",
+            {
+                "bytes_written": len(json_blob),
+                "duration_ms": int((_time.monotonic() - t0) * 1000),
+            },
+        )
+    except Exception:  # noqa: BLE001 — never-raise
+        pass
 
 
 def read_state() -> State | None:

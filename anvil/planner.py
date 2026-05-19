@@ -30,6 +30,7 @@ import anthropic
 import yaml
 from pydantic import BaseModel
 
+from anvil import events as _events
 from anvil.brief import Step
 from anvil.voice import load_voice_spec
 
@@ -106,19 +107,73 @@ class Planner:
         escalation dict (`escalate: True`) the orchestrator routes to the
         Telegram escalation path. Stage A failure / empty -> zero selected
         files; Stage B still sees the brief and state (design Part 2)."""
+        # v2 Phase 1 Step 2: emit Stage A sub-events. Every emit is
+        # never-raise; if events.py is misconfigured, planning still works.
         vault_index = _build_vault_index(
             [str(p) for p in brief.context_paths], self.vault_root
+        )
+        _events.emit(
+            "planner.stage_a.start",
+            {"step_idx": step_idx, "vault_index_size": len(vault_index)},
+            step_idx=step_idx,
         )
         stage_a_prompt = _assemble_stage_a_prompt(
             brief, state, step_idx, vault_index
         )
+        _events.emit(
+            "planner.stage_a.prompt_assembled",
+            {
+                "step_idx": step_idx,
+                "prompt_chars": len(stage_a_prompt),
+                "vault_index_size": len(vault_index),
+            },
+            step_idx=step_idx,
+        )
+        _events.emit(
+            "planner.stage_a.api_start",
+            {
+                "step_idx": step_idx,
+                "prompt_chars": len(stage_a_prompt),
+                "model": self.model,
+                "stage": "A",
+            },
+            step_idx=step_idx,
+        )
+        # _call_anthropic emits planner.stage_a.api_end from inside.
+        # Stash step_idx on self so the wrapper picks it up.
+        self._current_step_idx = step_idx
         stage_a_resp = self._call_anthropic(
             system=self._system_prompt, user=stage_a_prompt,
             timeout=_STAGE_A_TIMEOUT, step=step_idx + 1, stage="A",
         )
         selected = _parse_stage_a_response(stage_a_resp, vault_index)
+        # paths_dropped_as_hallucinated = paths the model returned that
+        # weren't in the vault_index. The parser already filters them
+        # via `_parse_stage_a_response`; count via the difference.
+        raw_lines = [
+            ln.strip() for ln in stage_a_resp.splitlines() if ln.strip()
+        ]
+        dropped = max(0, len(raw_lines) - len(selected))
+        _events.emit(
+            "planner.stage_a.parsed",
+            {
+                "step_idx": step_idx,
+                "paths_returned": len(selected),
+                "paths_dropped_as_hallucinated": dropped,
+            },
+            step_idx=step_idx,
+        )
         result = self._run_stage_b_with_retry(brief, state, step_idx, selected)
         if result.get("escalate"):
+            _events.emit(
+                "planner.escalate",
+                {
+                    "step_idx": step_idx,
+                    "reason": result.get("reason", ""),
+                    "detail": (result.get("detail") or "")[:500],
+                },
+                step_idx=step_idx,
+            )
             return result
         return Plan(**result)
 
@@ -171,6 +226,27 @@ class Planner:
                 f"{u.cache_read_input_tokens or 0} "
                 f"duration_s={duration:.1f}"
             )
+            # v2 Phase 1 Step 2 (notes.md Finding 1 constraint 2):
+            # emit planner.stage_<X>.api_end from inside the wrapper,
+            # keyed on the `stage` kwarg. Stage A/B/C all flow through
+            # here; the [planner] log line above stays unchanged for
+            # backward-compat with tools/exam_harness.py.
+            _events.emit(
+                f"planner.stage_{stage.lower()}.api_end",
+                {
+                    "step_idx": getattr(self, "_current_step_idx", None),
+                    "model": self.model,
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                    "cache_creation_input_tokens":
+                        u.cache_creation_input_tokens or 0,
+                    "cache_read_input_tokens":
+                        u.cache_read_input_tokens or 0,
+                    "duration_ms": int(duration * 1000),
+                    "ok": True,
+                },
+                step_idx=getattr(self, "_current_step_idx", None),
+            )
             return text
 
         def _retry_after(exc: Exception) -> int:
@@ -196,11 +272,31 @@ class Planner:
                         f"[planner] step={step} stage={stage} "
                         f"rate-limit/timeout twice ({e2}); returning empty"
                     )
+                    _events.emit(
+                        f"planner.stage_{stage.lower()}.api_end",
+                        {
+                            "step_idx": getattr(self, "_current_step_idx", None),
+                            "model": self.model,
+                            "ok": False,
+                            "error": "rate-limit/timeout",
+                        },
+                        step_idx=getattr(self, "_current_step_idx", None),
+                    )
                     return ""
         except Exception as e:  # noqa: BLE001 — never-raise contract
             log.error(
                 f"[planner] step={step} stage={stage} call failed "
                 f"({e}); returning empty"
+            )
+            _events.emit(
+                f"planner.stage_{stage.lower()}.api_end",
+                {
+                    "step_idx": getattr(self, "_current_step_idx", None),
+                    "model": self.model,
+                    "ok": False,
+                    "error": str(e)[:300],
+                },
+                step_idx=getattr(self, "_current_step_idx", None),
             )
             return ""
 
@@ -215,9 +311,45 @@ class Planner:
         system = getattr(self, "_system_prompt", "")
         vault_root = getattr(self, "vault_root", Path("."))
         files = _load_files(selected_paths, vault_root)
+        files_loaded_chars = sum(len(c) for c in files.values())
+        _events.emit(
+            "planner.stage_b.start",
+            {"step_idx": step_idx, "retry_attempt": 0},
+            step_idx=step_idx,
+        )
+        _events.emit(
+            "planner.stage_b.files_loaded",
+            {
+                "step_idx": step_idx,
+                "files_loaded_count": len(files),
+                "files_loaded_chars": files_loaded_chars,
+            },
+            step_idx=step_idx,
+        )
         user_prompt = _assemble_stage_b_prompt(brief, state, step_idx, files)
+        _events.emit(
+            "planner.stage_b.prompt_assembled",
+            {
+                "step_idx": step_idx,
+                "prompt_chars": len(user_prompt),
+                "retry_attempt": 0,
+            },
+            step_idx=step_idx,
+        )
         step_no = step_idx + 1
 
+        _events.emit(
+            "planner.stage_b.api_start",
+            {
+                "step_idx": step_idx,
+                "prompt_chars": len(user_prompt),
+                "model": self.model,
+                "stage": "B",
+                "retry_attempt": 0,
+            },
+            step_idx=step_idx,
+        )
+        self._current_step_idx = step_idx
         response = self._call_anthropic(
             system=system, user=user_prompt, timeout=self.timeout,
             step=step_no, stage="B",
@@ -231,8 +363,32 @@ class Planner:
         try:
             plan = _parse_plan_json(response)
             _validate_plan_structure(plan, brief.steps[step_idx])
+            _events.emit(
+                "planner.stage_b.parsed",
+                {"step_idx": step_idx, "retry_attempt": 0},
+                step_idx=step_idx,
+            )
+            _events.emit(
+                "planner.validation.pass",
+                {"step_idx": step_idx, "retry_attempt": 0},
+                step_idx=step_idx,
+            )
             return plan
         except (PlanParseError, PlanValidationError) as e:
+            _events.emit(
+                "planner.validation.fail",
+                {
+                    "step_idx": step_idx,
+                    "first_error": str(e)[:500],
+                    "retry_attempt": 0,
+                },
+                step_idx=step_idx,
+            )
+            _events.emit(
+                "planner.retry.start",
+                {"step_idx": step_idx, "first_error": str(e)[:500]},
+                step_idx=step_idx,
+            )
             retry_prompt = (
                 user_prompt
                 + "\n\n## Previous attempt failed validation\n\n"
@@ -242,11 +398,39 @@ class Planner:
                 + "Produce a corrected JSON object that addresses the "
                 + "error. Output only the JSON, no preamble."
             )
+            _events.emit(
+                "planner.stage_b.prompt_assembled",
+                {
+                    "step_idx": step_idx,
+                    "prompt_chars": len(retry_prompt),
+                    "retry_attempt": 1,
+                },
+                step_idx=step_idx,
+            )
+            _events.emit(
+                "planner.stage_b.api_start",
+                {
+                    "step_idx": step_idx,
+                    "prompt_chars": len(retry_prompt),
+                    "model": self.model,
+                    "stage": "B",
+                    "retry_attempt": 1,
+                },
+                step_idx=step_idx,
+            )
             response2 = self._call_anthropic(
                 system=system, user=retry_prompt, timeout=self.timeout,
                 step=step_no, stage="B",
             )
             if not response2:
+                _events.emit(
+                    "planner.retry.end",
+                    {
+                        "step_idx": step_idx,
+                        "second_error_or_none": "empty-response",
+                    },
+                    step_idx=step_idx,
+                )
                 return _escalation_block(
                     "planner-validation-failure",
                     f"Stage B retry returned empty. First error: {e}",
@@ -255,8 +439,40 @@ class Planner:
             try:
                 plan = _parse_plan_json(response2)
                 _validate_plan_structure(plan, brief.steps[step_idx])
+                _events.emit(
+                    "planner.retry.end",
+                    {"step_idx": step_idx, "second_error_or_none": None},
+                    step_idx=step_idx,
+                )
+                _events.emit(
+                    "planner.stage_b.parsed",
+                    {"step_idx": step_idx, "retry_attempt": 1},
+                    step_idx=step_idx,
+                )
+                _events.emit(
+                    "planner.validation.pass",
+                    {"step_idx": step_idx, "retry_attempt": 1},
+                    step_idx=step_idx,
+                )
                 return plan
             except (PlanParseError, PlanValidationError) as e2:
+                _events.emit(
+                    "planner.retry.end",
+                    {
+                        "step_idx": step_idx,
+                        "second_error_or_none": str(e2)[:500],
+                    },
+                    step_idx=step_idx,
+                )
+                _events.emit(
+                    "planner.validation.fail",
+                    {
+                        "step_idx": step_idx,
+                        "first_error": str(e2)[:500],
+                        "retry_attempt": 1,
+                    },
+                    step_idx=step_idx,
+                )
                 return _escalation_block(
                     "planner-validation-failure",
                     f"Plan validation failed twice. First: {e}. "

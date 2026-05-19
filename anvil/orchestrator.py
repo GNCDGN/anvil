@@ -29,10 +29,12 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from anvil import events as _events
 from anvil import git_ops as _git_ops
 from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
 from anvil.coder import Coder
@@ -225,14 +227,60 @@ class Orchestrator:
     def handle_brief(
         self, brief_path: Path, *, resumed_state: State | None = None,
     ) -> int:
+        # v2 Phase 1 Step 2 (notes.md Finding 1 constraint 4): the
+        # existing try/except gains a `finally:` clause at the end of
+        # the function body to guarantee events.end_run() fires on
+        # every exit path — success, early return, exception. The
+        # finally on a try/except/finally runs after any except's
+        # return or re-raise. end_run() is a no-op when begin_run()
+        # never fired (e.g. parse_brief raised), so the wrapper
+        # handles partial-initialisation cases without special-casing.
         try:
             if self.coder_mode == "auto":
                 # Phase 2 Step 9 wires this path through the step loop;
                 # no-op here. The auto branch in step 5c does the work.
                 pass
 
+            # Parse brief first — build_name seeds the run_id slug.
             brief = parse_brief(brief_path)
+
+            # v2 Phase 1 Step 2: determine run_id and call begin_run
+            # BEFORE the brief.parsed/brief.validated emits so they
+            # land in the right run's events.jsonl (not unknown-run/).
+            if resumed_state is not None and resumed_state.run_id:
+                run_id = resumed_state.run_id
+            elif resumed_state is not None:
+                # Legacy v1 state: no run_id persisted. Mint a fresh one
+                # with a -resumed suffix and log the un-instrumented case.
+                run_id = (
+                    f"{datetime.now(_UK).strftime('%Y-%m-%d-%H%M')}"
+                    f"-{_slug(brief.build_name)}-resumed"
+                )
+                log.info(
+                    "[events] resume of un-instrumented run; new run_id="
+                    f"{run_id}"
+                )
+            else:
+                # Fresh run: same shape as the _run_log filename slug.
+                run_id = (
+                    f"{datetime.now(_UK).strftime('%Y-%m-%d-%H%M')}"
+                    f"-{_slug(brief.build_name)}"
+                )
+            _events.begin_run(run_id)
+
+            _events.emit(
+                "brief.parsed",
+                {
+                    "brief_name": brief.build_name,
+                    "brief_path": str(brief_path),
+                    "step_count": len(brief.steps),
+                },
+            )
             validate_or_reject(brief)  # raises BriefValidationError on bad brief
+            _events.emit(
+                "brief.validated",
+                {"brief_name": brief.build_name, "step_count": len(brief.steps)},
+            )
             # Finding 3 / decision #9: parse_brief leaves context_paths=[]
             # (only context_links populated). Stage A's vault index needs
             # the resolved paths, so resolve them before the step loop.
@@ -247,10 +295,18 @@ class Orchestrator:
                 # being populated; init_state always sets plan=None and so
                 # silently invalidated the guard on the resume path before.
                 state = resumed_state
+                state.run_id = run_id  # ensure set (covers legacy v1 case)
                 self._state = state
                 # Reopen the existing run log for append, if known.
                 if state.run_log:
                     self._run_log = Path(state.run_log)
+                _events.emit(
+                    "run.resume",
+                    {
+                        "run_id": run_id,
+                        "from_step": state.current_step,
+                    },
+                )
                 self._log_event(
                     "resume", f"resumed at step {state.current_step}"
                 )
@@ -265,6 +321,7 @@ class Orchestrator:
                     brief, started_at, brief_path=str(brief_path),
                     coder_mode=self.coder_mode,
                 )
+                state.run_id = run_id
                 self._state = state
 
                 self._open_run_log(brief, started_at)
@@ -289,6 +346,19 @@ class Orchestrator:
                 state.current_step = bstep.number
                 state = transition(state, "running")
                 self._state = state
+
+                # v2 Phase 1 Step 2: emit step.start after the done-skip
+                # guard so resumed builds don't re-emit step.start for
+                # already-completed steps.
+                _events.emit(
+                    "step.start",
+                    {
+                        "step_idx": idx,
+                        "step_number": bstep.number,
+                        "step_name": bstep.name,
+                    },
+                    step_idx=idx,
+                )
 
                 result = self._plan_step(brief, state, idx)
 
@@ -381,8 +451,28 @@ class Orchestrator:
                         state = transition(state, "running")
                         continue
 
-                # 5d smoke
+                # 5d smoke — v2 Phase 1 Step 2 emit pair wraps the
+                # injected indirection (notes.md Finding 1 constraint
+                # 3: instrumentation lands at the call site, not
+                # inside _default_run_smoke, preserving the test seam).
+                _events.emit(
+                    "smoke.start",
+                    {"step_idx": idx, "command": bstep.smoke},
+                    step_idx=idx,
+                )
+                _smoke_t0 = time.monotonic()
                 ok, smoke_out = self._run_smoke(bstep.smoke, brief.target_repo_path)
+                _events.emit(
+                    "smoke.end",
+                    {
+                        "step_idx": idx,
+                        "command": bstep.smoke,
+                        "duration_ms": int((time.monotonic() - _smoke_t0) * 1000),
+                        "ok": bool(ok),
+                        "output_chars": len(smoke_out or ""),
+                    },
+                    step_idx=idx,
+                )
                 state.steps[idx].smoke = "pass" if ok else "fail"
                 state.steps[idx].smoke_output = smoke_out[:1000]
                 self._log_event("smoke", f"step {bstep.number}: "
@@ -444,6 +534,19 @@ class Orchestrator:
                         return 1
                 # confirm == "auto" → fall through, no Telegram round-trip
                 self._log_event("step-done", f"step {bstep.number}")
+                # v2 Phase 1 Step 2: emit step.end at the natural
+                # fall-through. Steps that returned early via escalation
+                # or pause do not emit step.end — the step did not
+                # complete and the events.jsonl reflects that asymmetry.
+                _events.emit(
+                    "step.end",
+                    {
+                        "step_idx": idx,
+                        "status": state.steps[idx].status,
+                        "commit": state.steps[idx].commit,
+                    },
+                    step_idx=idx,
+                )
 
             # ---------------------------------------------------------------
             # 6: end-to-end test (Phase 3 Step 5)
@@ -554,6 +657,15 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001 — never-raise
             log.error(f"unexpected in handle_brief: {e}", exc_info=True)
             return 2
+        finally:
+            # v2 Phase 1 Step 2: events.end_run() fires on every exit
+            # path. No-op if begin_run never ran. Wrapped in try/except
+            # so an events-layer failure cannot replace the real return
+            # value with a raise.
+            try:
+                _events.end_run()
+            except Exception:  # noqa: BLE001 — never-raise
+                pass
 
     # ---- e2e + deploy (Phase 3 Step 5) ----
     def _detect_e2e_location(self, brief) -> str:
@@ -726,6 +838,26 @@ class Orchestrator:
         else:
             detail_with_options = detail
 
+        # v2 Phase 1 Step 2: emit escalation.raised before the telegram
+        # send and stash the monotonic baseline so the paired
+        # escalation.resolved in _await_user_decision can compute the
+        # round-trip latency_ms_user.
+        _step_idx_evt = (
+            (state.current_step - 1) if isinstance(state.current_step, int)
+            else None
+        )
+        _events.emit(
+            "escalation.raised",
+            {
+                "step_idx": _step_idx_evt,
+                "reason": reason,
+                "detail": (detail or "")[:500],
+                "options": list(grammar),
+            },
+            step_idx=_step_idx_evt,
+        )
+        self._pending_escalation_sent_at = time.monotonic()
+
         self.telegram.send(
             voice.format_escalation(state, reason, detail_with_options, display)
         )
@@ -746,6 +878,28 @@ class Orchestrator:
         options = getattr(self, "_pending_options", ("go", "abort"))
         reply = self.telegram.wait_for_reply(timeout=None)
         text = (reply.text.strip().lower() if reply else "")
+        # v2 Phase 1 Step 2: emit escalation.resolved with the
+        # wall-clock latency_ms_user (paired against the monotonic
+        # baseline stashed by _escalate). Cleared after read.
+        sent_at = getattr(self, "_pending_escalation_sent_at", None)
+        latency_ms = (
+            int((time.monotonic() - sent_at) * 1000) if sent_at is not None
+            else None
+        )
+        _step_idx_evt = (
+            (state.current_step - 1) if isinstance(state.current_step, int)
+            else None
+        )
+        _events.emit(
+            "escalation.resolved",
+            {
+                "step_idx": _step_idx_evt,
+                "reply": text,
+                "latency_ms_user": latency_ms,
+            },
+            step_idx=_step_idx_evt,
+        )
+        self._pending_escalation_sent_at = None
         # An empty/missing reply is treated as paused-by-user, same as
         # any other non-matching reply.
         if text and text != "abort" and text in options:
