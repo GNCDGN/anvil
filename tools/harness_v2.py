@@ -16,6 +16,7 @@ CLI surface:
     python tools/harness_v2.py operations [--run-id <id>]
     python tools/harness_v2.py per-run-summary [--run-id <id>]
     python tools/harness_v2.py per-task-comparison
+    python tools/harness_v2.py validation-failure-episodes
     python tools/harness_v2.py export-xlsx <out.xlsx>
     python tools/harness_v2.py --self-check
 
@@ -178,6 +179,9 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(_OPERATIONS_VIEW_SQL)
     con.execute(_PER_RUN_SUMMARY_VIEW_SQL)
     con.execute(_PER_TASK_COMPARISON_VIEW_SQL)
+    # v2 Phase 2 Step 2: registered last because it SELECTs from
+    # `operations` (cost_usd source) and `run_metadata` (task_id).
+    con.execute(_VALIDATION_FAILURE_EPISODES_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +391,122 @@ _PER_TASK_COMPARISON_COLUMNS: tuple[str, ...] = (
 )
 
 
+# v2 Phase 2 Step 2: validation_failure_episodes
+#
+# One row per (run_id, mode, step_idx) that had at least one
+# `planner.validation.fail` event. The shape answers "how much did
+# validation failure cost on this run, and did it recover or escalate?"
+# in one SELECT — which the v2 Phase 1 exam (Q3) and the v2 Phase 2 exam
+# (Q2) both want to grade against the calibration sweep.
+#
+# Episode terminator simplification (per the brief's carve-out): rather
+# than encoding "a stage_b.api_end exists after the last fail with no
+# escalate in between", we encode the inverse — `recovered = NOT
+# EXISTS(planner.escalate on (run_id, step_idx))`. These are logically
+# equivalent for the two-attempt retry pattern in `_run_stage_b_with_retry`
+# (the only Stage-B retry shape in production); the brief explicitly
+# permits the swap. Comment kept in the view body so future me sees
+# the call.
+#
+# cost_usd source: the production cost formula lives in the `operations`
+# view (token-weighted CASE). To avoid duplicating the formula, this
+# view SELECTs `operations.cost_usd` for `operation_kind =
+# 'planner.stage_b.api_end'`. Any future cost-formula change in
+# `operations` flows through automatically.
+#
+# first_error / second_error come straight from `events.data` on the
+# `planner.validation.fail` rows; the field name is `first_error` per
+# planner.py:382 (and `:471` for the retry's fail). Note: each fail
+# event records its OWN error under the `first_error` key — the names
+# `first_error` / `second_error` on this view refer to the chronological
+# 1st/2nd validation failure within the episode, not the JSON field
+# name on the source event.
+_VALIDATION_FAILURE_EPISODES_VIEW_SQL = """
+CREATE OR REPLACE VIEW validation_failure_episodes AS
+WITH
+    fails_numbered AS (
+        SELECT
+            e.run_id,
+            e.mode,
+            e.step_idx,
+            e.ts,
+            json_extract_string(e.data, '$.first_error') AS error_text,
+            ROW_NUMBER() OVER (
+                PARTITION BY e.run_id, e.mode, e.step_idx ORDER BY e.ts
+            ) AS rn
+        FROM events e
+        WHERE e.kind = 'planner.validation.fail'
+          AND e.step_idx IS NOT NULL
+    ),
+    fail_metrics AS (
+        SELECT
+            run_id,
+            mode,
+            step_idx,
+            COUNT(*) AS n_validation_fails,
+            MAX(CASE WHEN rn = 1 THEN error_text END) AS first_error,
+            MAX(CASE WHEN rn = 2 THEN error_text END) AS second_error
+        FROM fails_numbered
+        GROUP BY run_id, mode, step_idx
+    ),
+    stage_b_calls AS (
+        SELECT
+            run_id,
+            mode,
+            step_idx,
+            cost_usd,
+            ts_end,
+            ROW_NUMBER() OVER (
+                PARTITION BY run_id, mode, step_idx ORDER BY ts_end
+            ) AS rn
+        FROM operations
+        WHERE operation_kind = 'planner.stage_b.api_end'
+          AND step_idx IS NOT NULL
+    ),
+    api_metrics AS (
+        SELECT
+            run_id,
+            mode,
+            step_idx,
+            COUNT(*) FILTER (WHERE rn > 1) AS extra_api_calls,
+            COALESCE(
+                SUM(cost_usd) FILTER (WHERE rn > 1), 0.0
+            ) AS total_extra_cost_usd
+        FROM stage_b_calls
+        GROUP BY run_id, mode, step_idx
+    ),
+    escalations AS (
+        SELECT DISTINCT run_id, mode, step_idx
+        FROM events
+        WHERE kind = 'planner.escalate'
+          AND step_idx IS NOT NULL
+    )
+SELECT
+    f.run_id,
+    rm.task_id,
+    f.mode,
+    f.step_idx,
+    f.n_validation_fails,
+    f.first_error,
+    f.second_error,
+    (esc.run_id IS NULL) AS recovered,
+    COALESCE(am.extra_api_calls, 0)        AS extra_api_calls,
+    COALESCE(am.total_extra_cost_usd, 0.0) AS total_extra_cost_usd
+FROM fail_metrics f
+LEFT JOIN run_metadata rm USING (run_id, mode)
+LEFT JOIN api_metrics am  USING (run_id, mode, step_idx)
+LEFT JOIN escalations esc USING (run_id, mode, step_idx)
+"""
+
+_VALIDATION_FAILURE_EPISODES_COLUMNS: tuple[str, ...] = (
+    "run_id", "task_id", "mode", "step_idx",
+    "n_validation_fails",
+    "first_error", "second_error",
+    "recovered",
+    "extra_api_calls", "total_extra_cost_usd",
+)
+
+
 # ---------------------------------------------------------------------------
 # Ingest
 # ---------------------------------------------------------------------------
@@ -576,13 +696,32 @@ def query_per_task_comparison(con: duckdb.DuckDBPyConnection) -> list[tuple]:
     ).fetchall()
 
 
+def query_validation_failure_episodes(
+    con: duckdb.DuckDBPyConnection,
+) -> list[tuple]:
+    """v2 Phase 2 Step 2: one row per (run_id, mode, step_idx) episode
+    that had at least one `planner.validation.fail`. See the
+    `_VALIDATION_FAILURE_EPISODES_VIEW_SQL` docstring for the columns
+    and the recovered-vs-escalated simplification rationale."""
+    return con.execute(
+        f"SELECT {', '.join(_VALIDATION_FAILURE_EPISODES_COLUMNS)} "
+        "FROM validation_failure_episodes "
+        "ORDER BY run_id, step_idx"
+    ).fetchall()
+
+
 # ---------------------------------------------------------------------------
 # XLSX export
 # ---------------------------------------------------------------------------
 
 def export_xlsx(con: duckdb.DuckDBPyConnection, out_path: Path) -> None:
-    """Export three sheets (operations, per_run_summary, per_task_comparison)
-    to `out_path`. Header row bold, frozen panes on row 1, no charts."""
+    """Export four sheets to `out_path`:
+      - operations
+      - per_run_summary
+      - per_task_comparison
+      - validation_episodes (v2 Phase 2 Step 2)
+
+    Header row bold, frozen panes on row 1, no charts."""
     wb = Workbook()
     # Default sheet → operations.
     ws_ops = wb.active
@@ -599,6 +738,15 @@ def export_xlsx(con: duckdb.DuckDBPyConnection, out_path: Path) -> None:
     _write_sheet(ws_tasks, _PER_TASK_COMPARISON_COLUMNS,
                  query_per_task_comparison(con),
                  cost_columns={"total_cost_real"})
+
+    # v2 Phase 2 Step 2: validation_episodes sheet. Column order
+    # mirrors `_VALIDATION_FAILURE_EPISODES_COLUMNS`; the
+    # `total_extra_cost_usd` column gets the `$` number format like
+    # the other cost columns elsewhere in the export.
+    ws_eps = wb.create_sheet("validation_episodes")
+    _write_sheet(ws_eps, _VALIDATION_FAILURE_EPISODES_COLUMNS,
+                 query_validation_failure_episodes(con),
+                 cost_columns={"total_extra_cost_usd"})
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -645,8 +793,14 @@ _SELF_CHECK_FIXTURES = (
     # run_id. The T1 mock+real pair gives the self-check direct coverage
     # of the new composite-key invariant: ingesting both does not
     # clobber the mock half.
+    #
+    # v2 Phase 2 Step 2: T2-two-step-real synthesises the
+    # "validation.fail → retry → escalate" episode shape so the
+    # `validation_failure_episodes` view has direct fixture coverage.
+    # See the fixture's events.jsonl for the inline event sequence.
     "T1-doc-edit-mock",
     "T1-doc-edit-real",
+    "T2-two-step-real",
     "T3-out-of-scope-real",
 )
 
@@ -712,6 +866,39 @@ def self_check() -> int:
                 )
                 return 1
 
+            # v2 Phase 2 Step 2: validation_failure_episodes must
+            # surface the T2-two-step-real fixture's synthetic episode
+            # — one row with n_validation_fails=1 and extra_api_calls=1
+            # (the retry's stage_b.api_end). Direct regression coverage
+            # for the view's two load-bearing aggregates.
+            episodes = query_validation_failure_episodes(con)
+            t2_episodes = [
+                r for r in episodes if r[0] == "T2-two-step-real"
+            ]
+            if len(t2_episodes) != 1:
+                print(
+                    "self-check: FAIL — validation_failure_episodes for "
+                    f"T2-two-step-real expected 1 row, got {len(t2_episodes)}"
+                )
+                return 1
+            ep = t2_episodes[0]
+            # Columns per _VALIDATION_FAILURE_EPISODES_COLUMNS:
+            #   (run_id, task_id, mode, step_idx,
+            #    n_validation_fails, first_error, second_error,
+            #    recovered, extra_api_calls, total_extra_cost_usd)
+            if ep[4] != 1:
+                print(
+                    "self-check: FAIL — T2 episode n_validation_fails "
+                    f"expected 1, got {ep[4]}"
+                )
+                return 1
+            if ep[8] != 1:
+                print(
+                    "self-check: FAIL — T2 episode extra_api_calls "
+                    f"expected 1, got {ep[8]}"
+                )
+                return 1
+
             xlsx_path = tmp_path / "self-check.xlsx"
             export_xlsx(con, xlsx_path)
             if not xlsx_path.is_file():
@@ -719,7 +906,14 @@ def self_check() -> int:
                 return 1
             from openpyxl import load_workbook
             wb = load_workbook(xlsx_path)
-            expected_sheets = {"operations", "per_run_summary", "per_task_comparison"}
+            expected_sheets = {
+                "operations",
+                "per_run_summary",
+                "per_task_comparison",
+                # v2 Phase 2 Step 2: validation_episodes sheet is the
+                # XLSX surface of the new view.
+                "validation_episodes",
+            }
             actual_sheets = set(wb.sheetnames)
             if not expected_sheets.issubset(actual_sheets):
                 missing = expected_sheets - actual_sheets
@@ -732,7 +926,10 @@ def self_check() -> int:
                 return 1
 
             con.close()
-        print(f"self-check: PASS ({len(ops)} ops, {len(runs)} runs, {len(tasks)} tasks)")
+        print(
+            f"self-check: PASS ({len(ops)} ops, {len(runs)} runs, "
+            f"{len(tasks)} tasks, {len(episodes)} episodes)"
+        )
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"self-check: FAIL — {type(e).__name__}: {e}")
@@ -774,7 +971,18 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("per-task-comparison", help="Print per_task_comparison view.")
 
-    p_xlsx = sub.add_parser("export-xlsx", help="Export three sheets to <out.xlsx>.")
+    # v2 Phase 2 Step 2: validation_failure_episodes is the v2 Phase 2
+    # exam Q2 view. Same shape as the other view sub-commands: prints
+    # tab-separated rows; pipe to less / a spreadsheet / grep.
+    sub.add_parser(
+        "validation-failure-episodes",
+        help="Print validation_failure_episodes view.",
+    )
+
+    p_xlsx = sub.add_parser(
+        "export-xlsx",
+        help="Export four sheets to <out.xlsx>.",
+    )
     p_xlsx.add_argument("out_path", type=Path)
 
     args = parser.parse_args(argv)
@@ -804,6 +1012,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "per-task-comparison":
             _print_rows(_PER_TASK_COMPARISON_COLUMNS, query_per_task_comparison(con))
+            return 0
+        if args.command == "validation-failure-episodes":
+            _print_rows(
+                _VALIDATION_FAILURE_EPISODES_COLUMNS,
+                query_validation_failure_episodes(con),
+            )
             return 0
         if args.command == "export-xlsx":
             export_xlsx(con, args.out_path)

@@ -27,6 +27,11 @@ _FIX_ROOT = Path(__file__).resolve().parent.parent / "tools" / "fixtures" / "v2-
 _CLEAN_DIR = _FIX_ROOT / "T1-doc-edit-mock"
 _CLEAN_DIR_REAL = _FIX_ROOT / "T1-doc-edit-real"
 _ESC_DIR = _FIX_ROOT / "T3-out-of-scope-real"
+# v2 Phase 2 Step 2: T2-two-step-real fixture synthesises the
+# "validation.fail → retry → escalate" episode shape (2 stage_b.api_end
+# events with tokens, 1 validation.fail, 1 escalate). Direct fixture
+# coverage for validation_failure_episodes.
+_RETRY_ESC_DIR = _FIX_ROOT / "T2-two-step-real"
 
 
 def _event_row(t_ms, kind, data, *, run_id, step_idx=None):
@@ -283,6 +288,47 @@ class TestPerTaskComparison(_HarnessTestBase):
         self.assertIsNotNone(row[5], "framework_overhead_s NULL")
 
 
+class TestValidationFailureEpisodes(_HarnessTestBase):
+    """v2 Phase 2 Step 2: validation_failure_episodes view.
+
+    The T2-two-step-real fixture encodes the production
+    "validation.fail → retry → escalate" episode shape (planner.py
+    `_run_stage_b_with_retry`, second-attempt empty path). The view
+    must surface one episode row for the fixture's step_idx=0 with
+    n_validation_fails=1 and extra_api_calls=1 (the retry's
+    stage_b.api_end is "beyond the first")."""
+
+    def test_episode_row_shape(self) -> None:
+        harness_v2.ingest(self.con, _RETRY_ESC_DIR)
+        rows = harness_v2.query_validation_failure_episodes(self.con)
+        self.assertEqual(len(rows), 1, f"expected 1 episode, got {rows}")
+        # Columns per _VALIDATION_FAILURE_EPISODES_COLUMNS:
+        #   (run_id, task_id, mode, step_idx, n_validation_fails,
+        #    first_error, second_error, recovered,
+        #    extra_api_calls, total_extra_cost_usd)
+        r = rows[0]
+        self.assertEqual(r[0], "T2-two-step-real")
+        self.assertEqual(r[1], "T2")
+        self.assertEqual(r[2], "real")
+        self.assertEqual(r[3], 0)
+        self.assertEqual(r[4], 1, "n_validation_fails")
+        self.assertEqual(r[5], "missing field: scope_boundaries",
+                         "first_error")
+        self.assertIsNone(r[6], "second_error should be NULL")
+        self.assertFalse(r[7], "recovered should be FALSE (escalated)")
+        self.assertEqual(r[8], 1, "extra_api_calls")
+        # total_extra_cost_usd = cost of the retry stage_b.api_end =
+        # (2000 input * 15 + 20 output * 75) / 1e6 = 0.0315
+        self.assertAlmostEqual(r[9], 0.0315, places=6,
+                               msg="total_extra_cost_usd")
+
+    def test_empty_db_returns_no_episodes(self) -> None:
+        """No validation.fail events → empty view."""
+        harness_v2.ingest(self.con, _CLEAN_DIR)  # T1-mock: no fails
+        rows = harness_v2.query_validation_failure_episodes(self.con)
+        self.assertEqual(rows, [])
+
+
 class TestModeResolution(_HarnessTestBase):
 
     def test_mode_present(self) -> None:
@@ -329,15 +375,25 @@ class TestIngestAllDiscovery(_HarnessTestBase):
 
 class TestXLSXExport(_HarnessTestBase):
 
-    def test_xlsx_has_three_sheets_with_bold_headers(self) -> None:
+    def test_xlsx_has_four_sheets_with_bold_headers(self) -> None:
+        # v2 Phase 2 Step 2: export grew a fourth sheet
+        # (validation_episodes) sourced from the new view.
         harness_v2.ingest(self.con, _CLEAN_DIR)
         harness_v2.ingest(self.con, _ESC_DIR)
+        harness_v2.ingest(self.con, _RETRY_ESC_DIR)
         out = self.tmp_path / "out.xlsx"
         harness_v2.export_xlsx(self.con, out)
         self.assertTrue(out.is_file())
         wb = load_workbook(out)
-        self.assertEqual(set(wb.sheetnames),
-                         {"operations", "per_run_summary", "per_task_comparison"})
+        self.assertEqual(
+            set(wb.sheetnames),
+            {
+                "operations",
+                "per_run_summary",
+                "per_task_comparison",
+                "validation_episodes",
+            },
+        )
         # Header row 1 bold on every sheet, frozen panes at A2.
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -345,6 +401,29 @@ class TestXLSXExport(_HarnessTestBase):
                             f"{sheet_name} header not bold")
             self.assertEqual(ws.freeze_panes, "A2",
                              f"{sheet_name} not frozen at A2")
+
+    def test_xlsx_validation_episodes_sheet_header_order(self) -> None:
+        """The validation_episodes sheet's header row must match
+        `_VALIDATION_FAILURE_EPISODES_COLUMNS` 1:1 (column order is the
+        contract the v2 Phase 2 exam reads against)."""
+        harness_v2.ingest(self.con, _RETRY_ESC_DIR)
+        out = self.tmp_path / "out.xlsx"
+        harness_v2.export_xlsx(self.con, out)
+        wb = load_workbook(out)
+        ws = wb["validation_episodes"]
+        actual_headers = tuple(
+            ws.cell(row=1, column=ix).value
+            for ix in range(1, len(harness_v2._VALIDATION_FAILURE_EPISODES_COLUMNS) + 1)
+        )
+        self.assertEqual(
+            actual_headers,
+            harness_v2._VALIDATION_FAILURE_EPISODES_COLUMNS,
+        )
+        # The single data row in the T2-fixture-only export carries the
+        # expected episode shape.
+        self.assertEqual(ws.cell(row=2, column=1).value, "T2-two-step-real")
+        self.assertEqual(ws.cell(row=2, column=5).value, 1)  # n_validation_fails
+        self.assertEqual(ws.cell(row=2, column=9).value, 1)  # extra_api_calls
 
 
 class TestSelfCheck(unittest.TestCase):
