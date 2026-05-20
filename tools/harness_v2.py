@@ -145,11 +145,17 @@ def open_db(path: Path | None = None) -> duckdb.DuckDBPyConnection:
 
 
 def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
+    # v2 Phase 2 Step 1: `mode` is a first-class column on events (sourced
+    # from `<run_dir>/mode.txt` at ingest time, default `'unknown'`). The
+    # delete-then-insert idempotency key is the composite (run_id, mode);
+    # a mock-then-real ingest of the same task no longer clobbers the
+    # mock half. run_metadata's PK is the same composite.
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
             ts          TIMESTAMP,
             run_id      VARCHAR,
+            mode        VARCHAR NOT NULL DEFAULT 'unknown',
             step_idx    INTEGER,
             kind        VARCHAR,
             data        JSON,
@@ -160,11 +166,12 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS run_metadata (
-            run_id        VARCHAR PRIMARY KEY,
+            run_id        VARCHAR,
+            mode          VARCHAR NOT NULL DEFAULT 'unknown',
             task_id       VARCHAR,
             task_label    VARCHAR,
-            mode          VARCHAR,
-            ingested_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ingested_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (run_id, mode)
         )
         """
     )
@@ -267,7 +274,11 @@ SELECT
     CAST(json_extract(e.data, '$.out_of_scope_count') AS BIGINT) AS out_of_scope_count,
     CAST(json_extract(e.data, '$.reply_text_chars') AS BIGINT) AS poll_reply_chars
 FROM events e
-LEFT JOIN run_metadata rm USING (run_id)
+-- v2 Phase 2 Step 1: JOIN on the composite (run_id, mode) to match
+-- run_metadata's composite PK. With the same run_id potentially
+-- present under both 'mock' and 'real', a run_id-only JOIN would
+-- duplicate every event row.
+LEFT JOIN run_metadata rm USING (run_id, mode)
 WHERE e.kind IN (
     'planner.stage_a.api_end',
     'planner.stage_b.api_end',
@@ -321,7 +332,8 @@ SELECT
         WHERE e2.run_id = e.run_id ORDER BY e2.ts DESC LIMIT 1
     ) AS terminal_event
 FROM events e
-LEFT JOIN run_metadata rm USING (run_id)
+-- v2 Phase 2 Step 1: composite-key JOIN; see operations view comment.
+LEFT JOIN run_metadata rm USING (run_id, mode)
 GROUP BY e.run_id, rm.task_id, rm.task_label, rm.mode
 """
 
@@ -333,19 +345,37 @@ _PER_RUN_SUMMARY_COLUMNS: tuple[str, ...] = (
 )
 
 
+# v2 Phase 2 Step 1: rewrite per_task_comparison as a FULL OUTER JOIN
+# between the mock half and the real half of `per_run_summary`, keyed on
+# task_id. Each half is a WHERE-mode-filtered subquery — explicit about
+# which mode column each metric is sourced from. The prior CASE-pivot
+# version was functionally equivalent under v2 Phase 1's run_id-unique
+# constraint; under v2 Phase 2's composite key, T1 mock and T1 real are
+# two rows sharing task_id, and the JOIN shape makes the cross-mode read
+# unambiguous (no MAX() across the two rows).
 _PER_TASK_COMPARISON_VIEW_SQL = """
 CREATE OR REPLACE VIEW per_task_comparison AS
+WITH
+    mock_runs AS (
+        SELECT task_id, planner_calls, total_duration_s, total_cost_usd
+        FROM per_run_summary
+        WHERE mode = 'mock' AND task_id IS NOT NULL
+    ),
+    real_runs AS (
+        SELECT task_id, planner_calls, total_duration_s, total_cost_usd
+        FROM per_run_summary
+        WHERE mode = 'real' AND task_id IS NOT NULL
+    )
 SELECT
-    task_id,
-    MAX(CASE WHEN mode = 'mock' THEN planner_calls END) AS planner_calls_mock,
-    MAX(CASE WHEN mode = 'real' THEN planner_calls END) AS planner_calls_real,
-    MAX(CASE WHEN mode = 'mock' THEN total_duration_s END) AS total_duration_mock,
-    MAX(CASE WHEN mode = 'real' THEN total_duration_s END) AS total_duration_real,
-    MAX(CASE WHEN mode = 'real' THEN total_cost_usd END) AS total_cost_real,
-    MAX(CASE WHEN mode = 'mock' THEN total_duration_s END) AS framework_overhead_s
-FROM per_run_summary
-WHERE task_id IS NOT NULL
-GROUP BY task_id
+    COALESCE(m.task_id, r.task_id) AS task_id,
+    m.planner_calls   AS planner_calls_mock,
+    r.planner_calls   AS planner_calls_real,
+    m.total_duration_s AS total_duration_mock,
+    r.total_duration_s AS total_duration_real,
+    r.total_cost_usd  AS total_cost_real,
+    m.total_duration_s AS framework_overhead_s
+FROM mock_runs m
+FULL OUTER JOIN real_runs r USING (task_id)
 """
 
 _PER_TASK_COMPARISON_COLUMNS: tuple[str, ...] = (
@@ -363,15 +393,28 @@ _PER_TASK_COMPARISON_COLUMNS: tuple[str, ...] = (
 
 _RUN_DIR_RE = re.compile(r"^(T\d+)(?:-(.+))?$")
 
+# v2 Phase 2 Step 1: calibration run_ids carry the mode as a trailing
+# segment (`T1-doc-edit-mock`, `T1-doc-edit-real`). The task_label is
+# conceptually mode-independent — mode is its own column. Strip the
+# suffix before applying the regex so `task_label` stays `doc-edit`,
+# `out-of-scope`, etc., not `doc-edit-mock`.
+_MODE_SUFFIXES = ("-mock", "-real", "-unknown")
+
 
 def derive_task(run_id: str) -> tuple[str, str]:
     """Derive (task_id, task_label) from a run-dir name.
 
-    Calibration runs use `T<N>` or `T<N>-<label>` prefixes. Real ANVIL
-    runs use `<YYYY-MM-DD-HHMM>-<slug>`. For non-calibration shapes,
-    task_id falls back to the run_id and task_label to the empty string.
+    Calibration runs use `T<N>` or `T<N>-<label>` prefixes; v2 Phase 2
+    appends a `-mock`/`-real`/`-unknown` mode segment after the label.
+    Real ANVIL runs use `<YYYY-MM-DD-HHMM>-<slug>`. For non-calibration
+    shapes, task_id falls back to the run_id and task_label to "".
     """
-    m = _RUN_DIR_RE.match(run_id)
+    stripped = run_id
+    for suf in _MODE_SUFFIXES:
+        if stripped.endswith(suf):
+            stripped = stripped[: -len(suf)]
+            break
+    m = _RUN_DIR_RE.match(stripped)
     if m:
         return m.group(1), (m.group(2) or "")
     return run_id, ""
@@ -423,22 +466,33 @@ def ingest(con: duckdb.DuckDBPyConnection, run_dir: Path) -> dict:
 
     con.execute("BEGIN")
     try:
-        con.execute("DELETE FROM events WHERE run_id = ?", [run_id])
-        con.execute("DELETE FROM run_metadata WHERE run_id = ?", [run_id])
+        # v2 Phase 2 Step 1: composite (run_id, mode) idempotency key.
+        # A mock-then-real ingest of the same task no longer clobbers the
+        # mock half because the modes differ. `mode` is stamped on every
+        # event row at ingest time (sourced from `<run_dir>/mode.txt`).
         con.execute(
-            "INSERT INTO run_metadata (run_id, task_id, task_label, mode) "
+            "DELETE FROM events WHERE run_id = ? AND mode = ?",
+            [run_id, mode],
+        )
+        con.execute(
+            "DELETE FROM run_metadata WHERE run_id = ? AND mode = ?",
+            [run_id, mode],
+        )
+        con.execute(
+            "INSERT INTO run_metadata (run_id, mode, task_id, task_label) "
             "VALUES (?, ?, ?, ?)",
-            [run_id, task_id, task_label, mode],
+            [run_id, mode, task_id, task_label],
         )
         for ev in rows:
             con.execute(
                 """
-                INSERT INTO events (ts, run_id, step_idx, kind, data, elapsed_ms)
-                VALUES (CAST(? AS TIMESTAMP), ?, ?, ?, CAST(? AS JSON), ?)
+                INSERT INTO events (ts, run_id, mode, step_idx, kind, data, elapsed_ms)
+                VALUES (CAST(? AS TIMESTAMP), ?, ?, ?, ?, CAST(? AS JSON), ?)
                 """,
                 [
                     ev.get("ts"),
                     ev.get("run_id") or run_id,
+                    mode,
                     ev.get("step_idx"),
                     ev.get("kind"),
                     json.dumps(ev.get("data") or {}),
@@ -584,12 +638,16 @@ def _write_sheet(
 # ---------------------------------------------------------------------------
 
 _SELF_CHECK_FIXTURES = (
-    # Fixture dir name == run_id (T1-doc-edit, T3-out-of-scope). Required
-    # because the JOIN between events and run_metadata is on run_id, and
-    # the events.jsonl carries that run_id verbatim. The dir name and
-    # the embedded run_id must agree.
-    "T1-doc-edit",
-    "T3-out-of-scope",
+    # v2 Phase 2 Step 1: fixture dir names carry the mode segment
+    # (`T1-doc-edit-mock`, `T1-doc-edit-real`, `T3-out-of-scope-real`).
+    # Dir name == run_id, and the events.jsonl carries that run_id
+    # verbatim — the JOIN between events and run_metadata stays on
+    # run_id. The T1 mock+real pair gives the self-check direct coverage
+    # of the new composite-key invariant: ingesting both does not
+    # clobber the mock half.
+    "T1-doc-edit-mock",
+    "T1-doc-edit-real",
+    "T3-out-of-scope-real",
 )
 
 
@@ -620,12 +678,38 @@ def self_check() -> int:
                 print(f"self-check: FAIL — operations rows too few ({len(ops)})")
                 return 1
             runs = query_per_run_summary(con)
-            if len(runs) != 2:
-                print(f"self-check: FAIL — per_run_summary expected 2, got {len(runs)}")
+            expected_runs = len(_SELF_CHECK_FIXTURES)
+            if len(runs) != expected_runs:
+                print(
+                    f"self-check: FAIL — per_run_summary expected "
+                    f"{expected_runs}, got {len(runs)}"
+                )
                 return 1
             tasks = query_per_task_comparison(con)
+            # v2 Phase 2 Step 1: per_task_comparison groups by task_id;
+            # T1 contributes one row (mock + real on a single task_id),
+            # T3 contributes one row (real-only). Two task_id rows total.
             if len(tasks) < 1:
                 print("self-check: FAIL — per_task_comparison returned 0 rows")
+                return 1
+            # v2 Phase 2 Step 1: the T1 row must have BOTH mock and real
+            # halves populated — the regression that the composite-key
+            # fix is meant to prevent.
+            t1_row = next(
+                (r for r in tasks if r[0] == "T1"), None,
+            )
+            if t1_row is None:
+                print("self-check: FAIL — T1 missing from per_task_comparison")
+                return 1
+            # Columns per _PER_TASK_COMPARISON_COLUMNS:
+            #   (task_id, planner_calls_mock, planner_calls_real,
+            #    total_duration_mock, total_duration_real,
+            #    total_cost_real, framework_overhead_s)
+            if t1_row[1] is None or t1_row[2] is None:
+                print(
+                    "self-check: FAIL — T1 mock+real key-shape regression: "
+                    f"mock={t1_row[1]} real={t1_row[2]}"
+                )
                 return 1
 
             xlsx_path = tmp_path / "self-check.xlsx"

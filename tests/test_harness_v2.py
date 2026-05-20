@@ -20,8 +20,13 @@ from tools import harness_v2
 
 
 _FIX_ROOT = Path(__file__).resolve().parent.parent / "tools" / "fixtures" / "v2-phase-1"
-_CLEAN_DIR = _FIX_ROOT / "T1-doc-edit"
-_ESC_DIR = _FIX_ROOT / "T3-out-of-scope"
+# v2 Phase 2 Step 1: fixture dirs are mode-suffixed (`-mock`, `-real`),
+# and the events.jsonl run_id field carries the same mode segment. The
+# T1-mock + T1-real pair lives under one task_id (T1) and gives the
+# composite-key regression test direct fixture coverage.
+_CLEAN_DIR = _FIX_ROOT / "T1-doc-edit-mock"
+_CLEAN_DIR_REAL = _FIX_ROOT / "T1-doc-edit-real"
+_ESC_DIR = _FIX_ROOT / "T3-out-of-scope-real"
 
 
 def _event_row(t_ms, kind, data, *, run_id, step_idx=None):
@@ -85,12 +90,12 @@ class TestIngestRoundTrip(_HarnessTestBase):
     def test_idempotent_reingest(self) -> None:
         harness_v2.ingest(self.con, _CLEAN_DIR)
         first_count = self.con.execute(
-            "SELECT COUNT(*) FROM events WHERE run_id = 'T1-doc-edit'"
+            "SELECT COUNT(*) FROM events WHERE run_id = 'T1-doc-edit-mock'"
         ).fetchone()[0]
         # Re-ingest the same dir.
         harness_v2.ingest(self.con, _CLEAN_DIR)
         second_count = self.con.execute(
-            "SELECT COUNT(*) FROM events WHERE run_id = 'T1-doc-edit'"
+            "SELECT COUNT(*) FROM events WHERE run_id = 'T1-doc-edit-mock'"
         ).fetchone()[0]
         self.assertEqual(first_count, second_count)
 
@@ -99,7 +104,7 @@ class TestOperationsView(_HarnessTestBase):
 
     def test_clean_fixture_operations_count_and_columns(self) -> None:
         harness_v2.ingest(self.con, _CLEAN_DIR)
-        rows = harness_v2.query_operations(self.con, run_id="T1-doc-edit")
+        rows = harness_v2.query_operations(self.con, run_id="T1-doc-edit-mock")
         # 7 cost-bearing operations for a clean single-step run:
         # planner.stage_a.api_end, planner.stage_b.api_end,
         # planner.validation.pass, coder.subprocess.end,
@@ -112,7 +117,7 @@ class TestOperationsView(_HarnessTestBase):
         harness_v2.ingest(self.con, _ESC_DIR)
         rows = self.con.execute(
             "SELECT operation_kind, escalation_reason, escalation_user_latency_ms "
-            "FROM operations WHERE run_id = 'T3-out-of-scope' "
+            "FROM operations WHERE run_id = 'T3-out-of-scope-real' "
             "  AND operation_kind = 'escalation.resolved'"
         ).fetchall()
         self.assertEqual(len(rows), 1)
@@ -129,7 +134,7 @@ class TestOperationsView(_HarnessTestBase):
         #   cost = (10500*15 + 115*75) / 1e6 = (157500 + 8625) / 1e6 = 0.166125
         rows = self.con.execute(
             "SELECT cost_usd FROM operations "
-            "WHERE run_id = 'T1-doc-edit' AND operation_kind = 'planner.stage_a.api_end'"
+            "WHERE run_id = 'T1-doc-edit-mock' AND operation_kind = 'planner.stage_a.api_end'"
         ).fetchall()
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0][0], 0.166125, places=4)
@@ -146,7 +151,7 @@ class TestOperationsView(_HarnessTestBase):
         # No poll.reply event in fixtures → that column is NULL for all rows.
         rows = self.con.execute(
             "SELECT escalation_user_latency_ms, poll_reply_chars "
-            "FROM operations WHERE run_id = 'T3-out-of-scope' "
+            "FROM operations WHERE run_id = 'T3-out-of-scope-real' "
             "  AND operation_kind = 'escalation.resolved'"
         ).fetchall()
         self.assertEqual(rows[0][0], 5000)
@@ -157,13 +162,16 @@ class TestPerRunSummary(_HarnessTestBase):
 
     def test_clean_fixture_summary_fields(self) -> None:
         harness_v2.ingest(self.con, _CLEAN_DIR)
-        rows = harness_v2.query_per_run_summary(self.con, run_id="T1-doc-edit")
+        rows = harness_v2.query_per_run_summary(self.con, run_id="T1-doc-edit-mock")
         self.assertEqual(len(rows), 1)
         # Columns: run_id, task_id, task_label, mode,
         # total_cost_usd, total_duration_s, planner_calls, coder_calls,
         # escalations, resumed, terminal_event
         row = rows[0]
-        self.assertEqual(row[0], "T1-doc-edit")
+        # v2 Phase 2 Step 1: run_id carries `-mock` suffix; task_label
+        # stays mode-independent (`doc-edit`, not `doc-edit-mock`)
+        # because derive_task() strips the mode suffix before parsing.
+        self.assertEqual(row[0], "T1-doc-edit-mock")
         self.assertEqual(row[1], "T1")
         self.assertEqual(row[2], "doc-edit")
         self.assertEqual(row[3], "mock")
@@ -212,6 +220,67 @@ class TestPerTaskComparison(_HarnessTestBase):
         self.assertIsNotNone(t3[2])
         # framework_overhead_s == total_duration_mock (per brief).
         self.assertIsNotNone(t1[3])  # T1 has mock data → has overhead
+
+    # v2 Phase 2 Step 1 ----------------------------------------------------
+    # The composite (run_id, mode) idempotency key is the load-bearing
+    # invariant of Step 1. The two tests below give it direct fixture
+    # coverage: ingesting mock-then-real for the same task_id must
+    # preserve both halves on disk, in the events table, and in the
+    # derived per_task_comparison view.
+
+    def test_mock_then_real_same_task_preserves_both_halves(self) -> None:
+        """Mock ingest followed by real ingest for the SAME task_id must
+        not clobber the mock rows. Under v2 Phase 1's run_id-only
+        idempotency key this would have lost the mock half (V2P1-4)."""
+        harness_v2.ingest(self.con, _CLEAN_DIR)         # T1 / mock
+        mock_count = self.con.execute(
+            "SELECT COUNT(*) FROM events "
+            "WHERE run_id = 'T1-doc-edit-mock' AND mode = 'mock'"
+        ).fetchone()[0]
+        self.assertGreater(mock_count, 0)
+
+        harness_v2.ingest(self.con, _CLEAN_DIR_REAL)    # T1 / real
+        # After the real ingest, the mock rows must still be there.
+        mock_count_after = self.con.execute(
+            "SELECT COUNT(*) FROM events "
+            "WHERE run_id = 'T1-doc-edit-mock' AND mode = 'mock'"
+        ).fetchone()[0]
+        real_count_after = self.con.execute(
+            "SELECT COUNT(*) FROM events "
+            "WHERE run_id = 'T1-doc-edit-real' AND mode = 'real'"
+        ).fetchone()[0]
+        self.assertEqual(mock_count_after, mock_count,
+                         "real ingest clobbered the mock half")
+        self.assertGreater(real_count_after, 0,
+                           "real ingest produced no rows")
+        # run_metadata also holds both halves.
+        rm_rows = self.con.execute(
+            "SELECT run_id, mode FROM run_metadata WHERE task_id = 'T1' "
+            "ORDER BY mode"
+        ).fetchall()
+        self.assertEqual(rm_rows,
+                         [("T1-doc-edit-mock", "mock"),
+                          ("T1-doc-edit-real", "real")])
+
+    def test_per_task_comparison_non_null_both_halves(self) -> None:
+        """After ingesting a mock+real pair for the same task, the T1
+        per_task_comparison row has BOTH mock and real columns populated
+        — the load-bearing exam-question of v2 Phase 2 Q1."""
+        harness_v2.ingest(self.con, _CLEAN_DIR)         # T1 / mock
+        harness_v2.ingest(self.con, _CLEAN_DIR_REAL)    # T1 / real
+        row = self.con.execute(
+            "SELECT task_id, planner_calls_mock, planner_calls_real, "
+            "       total_duration_mock, total_duration_real, "
+            "       framework_overhead_s "
+            "FROM per_task_comparison WHERE task_id = 'T1'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "T1")
+        self.assertIsNotNone(row[1], "planner_calls_mock NULL")
+        self.assertIsNotNone(row[2], "planner_calls_real NULL")
+        self.assertIsNotNone(row[3], "total_duration_mock NULL")
+        self.assertIsNotNone(row[4], "total_duration_real NULL")
+        self.assertIsNotNone(row[5], "framework_overhead_s NULL")
 
 
 class TestModeResolution(_HarnessTestBase):

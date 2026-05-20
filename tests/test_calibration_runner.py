@@ -52,6 +52,41 @@ class TestCalibrationBriefs(unittest.TestCase):
             self.assertTrue(ok, f"{task} failed: {err}")
 
 
+class TestRunIdAndDirShape(unittest.TestCase):
+    """v2 Phase 2 Step 1: run_id and run-dir both carry the mode segment
+    so mock and real of the same task do not share state. This pairs
+    with harness_v2's composite (run_id, mode) idempotency key — see
+    test_harness_v2.TestPerTaskComparison."""
+
+    def test_run_id_for_includes_mode_suffix(self) -> None:
+        self.assertEqual(
+            calibration_runner.run_id_for("T1", "mock"),
+            "T1-doc-edit-mock",
+        )
+        self.assertEqual(
+            calibration_runner.run_id_for("T1", "real"),
+            "T1-doc-edit-real",
+        )
+
+    def test_run_dir_for_includes_mode_suffix(self) -> None:
+        d_mock = calibration_runner.run_dir_for("T2", "mock")
+        d_real = calibration_runner.run_dir_for("T2", "real")
+        self.assertEqual(d_mock.name, "T2-two-step-mock")
+        self.assertEqual(d_real.name, "T2-two-step-real")
+        # Mock and real are siblings under the same runs/ root.
+        self.assertEqual(d_mock.parent, d_real.parent)
+        # The runs/ root lives under ANVIL_REPO/state/runs.
+        self.assertEqual(d_mock.parent.name, "runs")
+
+    def test_build_env_run_id_override_carries_mode(self) -> None:
+        env_mock = calibration_runner.build_env("T3", "mock")
+        env_real = calibration_runner.build_env("T3", "real")
+        self.assertEqual(env_mock["ANVIL_RUN_ID_OVERRIDE"],
+                         "T3-out-of-scope-mock")
+        self.assertEqual(env_real["ANVIL_RUN_ID_OVERRIDE"],
+                         "T3-out-of-scope-real")
+
+
 class TestDryRun(unittest.TestCase):
     """--dry-run lists the plan, validates briefs, runs no subprocess."""
 

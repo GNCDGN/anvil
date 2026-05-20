@@ -169,12 +169,21 @@ def target_repo_path_for(task: str) -> Path:
     return ANVIL_REPO / "state" / "v2-phase-1" / "targets" / task
 
 
-def run_id_for(task: str) -> str:
-    return f"{task}-{TASK_LABELS[task]}"
+def run_id_for(task: str, mode: str) -> str:
+    """v2 Phase 2 Step 1: run_id carries the mode segment so mock and
+    real ingests do not share a run_id. Pairs with harness_v2's
+    composite (run_id, mode) idempotency key — the run_id itself is
+    mode-distinguishing, the composite key is the defensive second
+    line. `mode` must be one of `mock`, `real`, or `unknown`."""
+    return f"{task}-{TASK_LABELS[task]}-{mode}"
 
 
-def run_dir_for(task: str) -> Path:
-    return ANVIL_REPO / "state" / "runs" / run_id_for(task)
+def run_dir_for(task: str, mode: str) -> Path:
+    """v2 Phase 2 Step 1: run-dir name carries the mode segment, so
+    `shutil.rmtree(run_dir_for(task, mode))` between mock and real for
+    the same task only wipes that mode's events.jsonl — the sibling
+    mode's data survives on disk."""
+    return ANVIL_REPO / "state" / "runs" / run_id_for(task, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +295,7 @@ def build_env(task: str, mode: str) -> dict[str, str]:
     # MOCKED_TASK_ID is read by MockedPlanner/MockedCoder when mock-mode
     # is on; harmless when off. Keep set unconditionally for clarity.
     env["MOCKED_TASK_ID"] = task
-    env["ANVIL_RUN_ID_OVERRIDE"] = run_id_for(task)
+    env["ANVIL_RUN_ID_OVERRIDE"] = run_id_for(task, mode)
     env["AUTO_REPLY_FOR_CALIBRATION"] = AUTO_REPLIES[task]
     env["CALIBRATION_TELEGRAM_PREFIX"] = "[ANVIL-calibration]"
     # CODER_MODE must be auto for the orchestrator to invoke the Coder.
@@ -348,7 +357,11 @@ def run_one(task: str, mode: str, env: dict[str, str]) -> dict:
     # Clear any prior events.jsonl for this run_id — events.py appends
     # in O(1) mode, so a re-run of the same task would otherwise mix
     # the new events into the prior file.
-    prior = run_dir_for(task)
+    # v2 Phase 2 Step 1: the run-dir is mode-suffixed, so this rmtree
+    # only wipes the current mode's dir — the sibling mode's data
+    # (e.g. a prior mock run, when this is the real run) survives on
+    # disk and remains ingestable.
+    prior = run_dir_for(task, mode)
     if prior.is_dir():
         shutil.rmtree(prior, ignore_errors=True)
     stage_brief_into_inbox(task)
@@ -365,7 +378,7 @@ def run_one(task: str, mode: str, env: dict[str, str]) -> dict:
 
     # mode.txt — written even if the run dir is missing (subprocess
     # crashed before any emit), so harness ingest is robust.
-    rd = run_dir_for(task)
+    rd = run_dir_for(task, mode)
     rd.mkdir(parents=True, exist_ok=True)
     (rd / "mode.txt").write_text(mode + "\n", encoding="utf-8")
 
@@ -380,16 +393,20 @@ def run_one(task: str, mode: str, env: dict[str, str]) -> dict:
     }
 
 
-def ingest_run(task: str) -> dict:
+def ingest_run(task: str, mode: str) -> dict:
     """Ingest the run-dir into the harness DuckDB. Returns the harness's
-    per-run summary dict."""
+    per-run summary dict.
+
+    v2 Phase 2 Step 1: takes `mode` so the per-mode run-dir is targeted
+    and the per_run_summary lookup is keyed on the mode-suffixed run_id.
+    """
     from tools import harness_v2
-    con = harness_v2.open_db()
+    con = harness_v2.open_db(_db_path_for_v2_phase_2())
     try:
-        summary = harness_v2.ingest(con, run_dir_for(task))
+        summary = harness_v2.ingest(con, run_dir_for(task, mode))
         # Pull per_run_summary row.
         per_run = harness_v2.query_per_run_summary(
-            con, run_id=run_id_for(task),
+            con, run_id=run_id_for(task, mode),
         )
         summary["per_run"] = per_run[0] if per_run else None
         return summary
@@ -400,7 +417,7 @@ def ingest_run(task: str) -> dict:
 def cumulative_real_spend() -> float:
     """Sum `total_cost_usd` across `mode='real'` runs in the harness DB."""
     from tools import harness_v2
-    con = harness_v2.open_db()
+    con = harness_v2.open_db(_db_path_for_v2_phase_2())
     try:
         row = con.execute(
             "SELECT COALESCE(SUM(total_cost_usd), 0.0) FROM per_run_summary "
@@ -411,12 +428,29 @@ def cumulative_real_spend() -> float:
         con.close()
 
 
+# v2 Phase 2 Step 1: DuckDB path is settable via a module-level override
+# and a CLI flag. Default is `state/v2-phase-2/calibration.duckdb` for
+# the v2 Phase 2 sweep — distinct from v2 Phase 1's path so the prior
+# calibration data is untouched. Set via `--db-path` or by assigning
+# `calibration_runner._DB_PATH_OVERRIDE` directly in tests.
+_DB_PATH_OVERRIDE: Path | None = None
+
+
+def _db_path_for_v2_phase_2() -> Path:
+    if _DB_PATH_OVERRIDE is not None:
+        return _DB_PATH_OVERRIDE
+    return ANVIL_REPO / "state" / "v2-phase-2" / "calibration.duckdb"
+
+
 # ---------------------------------------------------------------------------
 # Budget log
 # ---------------------------------------------------------------------------
 
 def budget_log_path() -> Path:
-    return ANVIL_REPO / "state" / "v2-phase-1" / "budget-log.md"
+    # v2 Phase 2 Step 1: budget log moves alongside the v2 Phase 2
+    # DuckDB so a single state/v2-phase-2/ dir holds the whole sweep's
+    # artefacts (DuckDB, budget log, future XLSX export).
+    return ANVIL_REPO / "state" / "v2-phase-2" / "budget-log.md"
 
 
 def append_budget_log(line: str) -> None:
@@ -543,7 +577,7 @@ def sweep(
         print(f"  exit={result['exit_code']} "
               f"stderr_chars={result['stderr_chars']}")
         try:
-            ingest = ingest_run(task)
+            ingest = ingest_run(task, mode)
             result["ingest"] = ingest
             per = ingest.get("per_run")
             if per:
@@ -585,7 +619,22 @@ def main(argv: list[str] | None = None) -> int:
                         help="print the plan, validate briefs, do not execute")
     parser.add_argument("--budget-cap", type=float, default=30.00,
                         help="hard ceiling on cumulative real-mode spend (USD)")
+    parser.add_argument(
+        "--db-path", default=None,
+        help=(
+            "DuckDB path for ingest + budget queries. Default: "
+            "<ANVIL_REPO>/state/v2-phase-2/calibration.duckdb"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # v2 Phase 2 Step 1: --db-path overrides the default sweep DuckDB
+    # path. Threaded through module-level `_DB_PATH_OVERRIDE` so
+    # `ingest_run` and `cumulative_real_spend` (called from sweep) both
+    # pick it up without further plumbing.
+    global _DB_PATH_OVERRIDE
+    if args.db_path:
+        _DB_PATH_OVERRIDE = Path(args.db_path).expanduser().resolve()
 
     tasks = tuple(t.strip() for t in args.tasks.split(",") if t.strip())
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
