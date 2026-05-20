@@ -57,7 +57,14 @@ DEFAULT_MODES = ("mock", "real")
 # this map keeps both in one place. The label is also the second hyphen-
 # separated segment of the run_id (so the harness's task_id regex sees
 # "T1" as task_id and "doc-edit" as task_label).
+#
+# T0 added v2 Phase 1 Step 7 option 3: verbose-brief baseline whose
+# purpose is to give the Planner unambiguous signal for every required
+# Plan field so a validation-passing plan reaches the Coder. Used to
+# measure the dashboard-vs-DuckDB Coder-subprocess multiplier. Not in
+# DEFAULT_TASKS — must be invoked explicitly via --tasks T0.
 TASK_LABELS = {
+    "T0": "baseline",
     "T1": "doc-edit",
     "T2": "two-step",
     "T3": "out-of-scope",
@@ -66,12 +73,10 @@ TASK_LABELS = {
 }
 
 # Per-task auto-reply for AUTO_REPLY_FOR_CALIBRATION:
-#   T1, T2, T5: explicit confirms / escalations → "go" (proceed)
-#   T3, T4:     trap / judgment-escalation       → "abort" (the calibration
-#                                                  test is "did the
-#                                                  escalation fire" not
-#                                                  "does the user override")
+#   T0, T1, T2, T5: explicit confirms / escalations → "go" (proceed)
+#   T3, T4:         trap / judgment-escalation       → "abort"
 AUTO_REPLIES = {
+    "T0": "go",
     "T1": "go",
     "T2": "go",
     "T3": "abort",
@@ -82,6 +87,8 @@ AUTO_REPLIES = {
 # Pre-estimated real-mode cost per task (USD, 1.3× safety margin applied
 # per notes.md Finding 7). Used for the budget pre-check.
 ESTIMATES_USD = {
+    "T0": 1.50,  # 1 Stage A + 1 Stage B + 1 Coder; verbose brief slightly
+                 # bigger Stage B prompt than T1's $1.25.
     "T1": 1.25,
     "T2": 2.50,
     "T3": 2.50,
@@ -104,6 +111,9 @@ ANVIL_REPO = Path(__file__).resolve().parent.parent
 #
 # Per task: list of (relative_path, content) tuples.
 SEED_FILES: dict[str, tuple[tuple[str, str], ...]] = {
+    "T0": (
+        ("README.md", "# T0 baseline target\n\n"),
+    ),
     "T1": (
         ("README.md", "# T1 calibration target\n"),
     ),
