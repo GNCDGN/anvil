@@ -1,5 +1,4 @@
 files:
   - path: a.py
     content: |
-      # a
-      print('a')
+      def hello(): return "hello"

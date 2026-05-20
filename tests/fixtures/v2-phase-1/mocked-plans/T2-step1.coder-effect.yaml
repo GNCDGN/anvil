@@ -1,5 +1,4 @@
 files:
   - path: b.py
     content: |
-      # b
-      print('b')
+      def world(): return "world"

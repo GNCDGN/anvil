@@ -8,9 +8,9 @@
     "write",
     "smoke-test"
   ],
-  "approach": "Bump the version constant.",
+  "approach": "Replace v1 with v2 in version.txt.",
   "smoke_test": "test -f version.txt",
-  "expected_outcome": "It works.",
+  "expected_outcome": "version.txt contains v2.",
   "commit_message": "T5 step 1: bump version",
   "scope_boundaries": {
     "in_scope": "version.txt",

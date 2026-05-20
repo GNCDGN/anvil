@@ -1,7 +1,7 @@
 files:
   - path: a.py
     content: |
-      # a v2
+      def hello(): return "world"
   - path: b.py
     content: |
-      # b (out-of-scope)
+      """b.py placeholder"""

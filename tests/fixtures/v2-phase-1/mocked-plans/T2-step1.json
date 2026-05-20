@@ -1,6 +1,6 @@
 {
   "step_number": 2,
-  "step_name": "Create b.py",
+  "step_name": "Modify b.py",
   "files_to_touch": [
     "b.py"
   ],
@@ -8,10 +8,10 @@
     "write",
     "smoke-test"
   ],
-  "approach": "Make the change.",
+  "approach": "Replace placeholder with world() function.",
   "smoke_test": "test -f b.py",
-  "expected_outcome": "It works.",
-  "commit_message": "T2 step 2: create b.py",
+  "expected_outcome": "b.py contains world().",
+  "commit_message": "T2 step 2: modify b.py",
   "scope_boundaries": {
     "in_scope": "b.py",
     "out_of_scope": "all other files"

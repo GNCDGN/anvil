@@ -439,22 +439,28 @@ class TestTargetRepoBootstrap(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertTrue(r.stdout.strip())  # non-empty SHA
 
-    def test_bootstrap_is_idempotent(self) -> None:
+    def test_bootstrap_yields_identical_baseline_files_across_calls(self) -> None:
+        """v2 Phase 1 Step 7 triage: bootstrap now wipes + re-seeds to
+        guarantee deterministic _git_files_touched results across re-runs
+        (e.g. mock then real of the same task). The HEAD SHA differs per
+        call because git's commit timestamp varies; the baseline FILE
+        SET is what we assert on."""
         target = self._tmp / "T9"
         with mock.patch.object(calibration_runner, "target_repo_path_for",
                                return_value=target):
             calibration_runner.bootstrap_target_repo("T9")
-            sha1 = subprocess.run(
-                ["git", "-C", str(target), "rev-parse", "HEAD"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            # Re-invoke.
+            files_1 = sorted(
+                str(p.relative_to(target))
+                for p in target.rglob("*")
+                if p.is_file() and ".git" not in p.parts
+            )
             calibration_runner.bootstrap_target_repo("T9")
-            sha2 = subprocess.run(
-                ["git", "-C", str(target), "rev-parse", "HEAD"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-        self.assertEqual(sha1, sha2)  # no new commit on idempotent call
+            files_2 = sorted(
+                str(p.relative_to(target))
+                for p in target.rglob("*")
+                if p.is_file() and ".git" not in p.parts
+            )
+        self.assertEqual(files_1, files_2)
 
 
 if __name__ == "__main__":

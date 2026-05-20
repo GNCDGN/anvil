@@ -1,6 +1,6 @@
 {
   "step_number": 2,
-  "step_name": "Modify a.py",
+  "step_name": "Modify a.py again",
   "files_to_touch": [
     "a.py"
   ],
@@ -8,9 +8,9 @@
     "write",
     "smoke-test"
   ],
-  "approach": "Modify a.py in place.",
+  "approach": "Modify a.py per notes.",
   "smoke_test": "test -f a.py",
-  "expected_outcome": "It works.",
+  "expected_outcome": "a.py modified.",
   "commit_message": "T3 step 2: modify a.py",
   "scope_boundaries": {
     "in_scope": "a.py",

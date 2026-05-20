@@ -2,4 +2,4 @@ files:
   - path: CHANGELOG.md
     content: |
       # CHANGELOG
-      - v2: bump
+      - v2: calibration deploy test

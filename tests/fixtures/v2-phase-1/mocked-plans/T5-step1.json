@@ -1,6 +1,6 @@
 {
   "step_number": 2,
-  "step_name": "Add changelog",
+  "step_name": "Update CHANGELOG",
   "files_to_touch": [
     "CHANGELOG.md"
   ],
@@ -8,10 +8,10 @@
     "write",
     "smoke-test"
   ],
-  "approach": "Make the change.",
+  "approach": "Append v2 bullet to CHANGELOG.md.",
   "smoke_test": "test -f CHANGELOG.md",
-  "expected_outcome": "It works.",
-  "commit_message": "T5 step 2: add changelog",
+  "expected_outcome": "CHANGELOG.md mentions v2.",
+  "commit_message": "T5 step 2: update CHANGELOG",
   "scope_boundaries": {
     "in_scope": "CHANGELOG.md",
     "out_of_scope": "all other files"

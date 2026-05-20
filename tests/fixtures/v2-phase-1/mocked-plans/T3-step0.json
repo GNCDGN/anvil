@@ -1,6 +1,6 @@
 {
   "step_number": 1,
-  "step_name": "Create a.py",
+  "step_name": "Modify a.py",
   "files_to_touch": [
     "a.py"
   ],
@@ -8,10 +8,10 @@
     "write",
     "smoke-test"
   ],
-  "approach": "Make the change.",
+  "approach": "Replace placeholder with hello() function.",
   "smoke_test": "test -f a.py",
-  "expected_outcome": "It works.",
-  "commit_message": "T3 step 1: create a.py",
+  "expected_outcome": "a.py contains hello().",
+  "commit_message": "T3 step 1: modify a.py",
   "scope_boundaries": {
     "in_scope": "a.py",
     "out_of_scope": "all other files"

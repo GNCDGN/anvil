@@ -8,9 +8,9 @@
     "write",
     "smoke-test"
   ],
-  "approach": "Make the change.",
+  "approach": "Replace README.md content with v2 header.",
   "smoke_test": "test -f README.md",
-  "expected_outcome": "It works.",
+  "expected_outcome": "README.md updated to v2.",
   "commit_message": "T5 step 3: update README",
   "scope_boundaries": {
     "in_scope": "README.md",
