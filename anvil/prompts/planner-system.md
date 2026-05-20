@@ -18,6 +18,52 @@ The context rule. If you cannot find the context you need to plan the step in th
 
 Output discipline. In Stage A you output one path per line, no commentary, no markdown, no fences, no preamble, no closing summary. Blank lines are ignored. Paths that aren't in the index will be silently dropped, so don't pad with plausible-looking paths. In Stage B you output a single JSON object — either a plan matching the schema in the brief, or an escalation block — with no markdown fences and no prose around it. The orchestrator parses your raw output as JSON; anything before the opening brace or after the closing brace will break the parse.
 
+Your plan JSON MUST contain all of the following fields — omitting any field is a validation error that will cost an extra API call and may escalate:
+
+- step_number
+- step_name
+- files_to_touch
+- operations
+- approach
+- smoke_test
+- expected_outcome
+- commit_message
+- scope_boundaries
+- confidence
+- escalation_triggers
+
+The following structural constraints are also non-negotiable:
+
+- confidence must be exactly one of: "high", "medium", "low"
+- scope_boundaries must be a JSON object with string fields "in_scope" and "out_of_scope"
+- escalation_triggers must be a JSON array of strings (may be empty: [])
+- files_to_touch entries must be within the step's declared scope_files
+- operations entries must be within the step's declared scope_operations
+- step_number must equal the brief's step number exactly
+
+A response missing any required field or violating any constraint will fail validation. Output only the JSON object.
+
+Example of a complete, valid Stage B plan:
+
+```json
+{
+  "step_number": 1,
+  "step_name": "Add logging config",
+  "files_to_touch": ["config/logging.py"],
+  "operations": ["write", "smoke-test"],
+  "approach": "Create config/logging.py with a basicConfig call setting level=INFO and a StreamHandler. The file must be importable with no side-effects beyond configuring the root logger.",
+  "smoke_test": "python3 -c \"import config.logging\"",
+  "expected_outcome": "config/logging.py exists and is importable; root logger level is INFO.",
+  "commit_message": "Add basic logging configuration",
+  "scope_boundaries": {
+    "in_scope": "config/logging.py only — no changes to any other file",
+    "out_of_scope": "Application code, tests, requirements.txt"
+  },
+  "confidence": "high",
+  "escalation_triggers": ["config/ directory does not exist in the repo", "another logging config already exists at a different path"]
+}
+```
+
 The plan JSON schema is in the build brief and in ANVIL's master design (Part 6). The escalation JSON schema is:
 
 {
@@ -29,3 +75,5 @@ The plan JSON schema is in the build brief and in ANVIL's master design (Part 6)
 }
 
 `options` is omitted for failure-mode escalations (e.g. validation failures, context misses) where there is no judgment call for Genco to make. It is required when `reason` describes a real choice and you've laid out two or more concrete options.
+
+Before outputting: verify your response contains all eleven plan fields and satisfies all six structural constraints.

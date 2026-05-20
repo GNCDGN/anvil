@@ -37,4 +37,4 @@ Brief's notes for this step:
 
 ## Instruction
 
-Produce the plan for step {STEP_NUMBER} as a JSON object matching the schema in the brief and ANVIL's master design Part 6. Do not include preamble, explanation, or markdown fences — output only the JSON object. If you cannot plan this step within its declared scope, or you cannot ground the approach in the brief plus the files above, output an escalation block instead of a plan.
+Produce the plan for step {STEP_NUMBER} as a JSON object matching the schema in the brief and ANVIL's master design Part 6. Do not include preamble, explanation, or markdown fences — output only the JSON object. If you cannot plan this step within its declared scope, or you cannot ground the approach in the brief plus the files above, output an escalation block instead of a plan. Check that your output contains all eleven required fields (step_number, step_name, files_to_touch, operations, approach, smoke_test, expected_outcome, commit_message, scope_boundaries, confidence, escalation_triggers) before outputting.
