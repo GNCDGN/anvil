@@ -195,12 +195,201 @@ class TestCalibrationPrefix(_OrchEnvTestBase):
                         f"expected default [ANVIL] prefix, got: {msg[:30]}")
 
 
+class TestAutoReplyArtefactPreview(_OrchEnvTestBase):
+    """v2 Phase 1 Step 7 prep: the third short-circuit site (artefact-
+    preview wait at orchestrator.py:~1101) is wired and bypasses
+    telegram.wait_for_reply when AUTO_REPLY_FOR_CALIBRATION is set.
+    """
+
+    def test_artefact_preview_wait_short_circuits(self) -> None:
+        # Reach the wait by entering _draft_and_confirm_artefacts past
+        # the soft-skip paths. The cheapest entry: ensure setup_log_path
+        # exists (so the soft-skip doesn't fire), checkpoint_path doesn't
+        # exist (so the idempotent skip doesn't fire), draft_and_preview
+        # returns a valid draft, and the telegram.send is benign.
+        # Build the minimum shape inline.
+        from anvil import checkpoint, vault_ops
+
+        # Synthetic vault layout: VAULT/01-Projects/.../project/setup-log.md
+        vault = self._tmp / "v"
+        project_dir = (
+            vault / "01-Projects" / "p" / "project"
+        )
+        builds_dir = project_dir / "builds" / "2026-05-20-x"
+        builds_dir.mkdir(parents=True)
+        brief_path = builds_dir / "brief.md"
+        brief_path.write_text("---\n---\n", encoding="utf-8")
+        (project_dir / "setup-log.md").write_text("seed\n", encoding="utf-8")
+
+        cfg = Config(
+            anthropic_api_key="x", telegram_bot_token="t",
+            telegram_chat_id="1", vault_path=vault,
+            anvil_root=ANVIL_REPO, anvil_defer_window_seconds=300,
+            planner_model="claude-opus-4-7", planner_timeout=120,
+            coder_timeout=600,
+        )
+        tg = mock.MagicMock()
+        orch = Orchestrator(cfg, coder_mode="manual",
+                            planner=mock.MagicMock(),
+                            telegram=tg, git=mock.MagicMock())
+
+        # Stub draft_and_preview to return a benign draft.
+        draft = {
+            "setup_log_entry": "## 2026-05-20\n\nEntry.\n",
+            "checkpoint": "# CP\n\nBody.\n",
+        }
+        os.environ["AUTO_REPLY_FOR_CALIBRATION"] = "go"
+
+        # Synthetic brief + state.
+        brief = SimpleNamespace(
+            target_repo_path=self._tmp / "repo",
+            build_name="x",
+            project="p",
+            service_name=None,
+        )
+        state = SimpleNamespace(
+            steps=[SimpleNamespace(status="done", commit=None)],
+            current_step=1,
+            status="done",
+            started_at="2026-05-20T00:00:00",
+            finished_at="2026-05-20T00:00:00",
+            run_log=None,
+            deploy=None,
+            escalation_count=0,
+            pending_action=None,
+            vault_writes_outcome=None,
+        )
+
+        with mock.patch.object(checkpoint, "draft_and_preview",
+                               return_value=(draft, "")), \
+             mock.patch.object(checkpoint, "execute_writes",
+                               return_value=(True, "")), \
+             mock.patch.object(checkpoint, "compose_checkpoint_frontmatter",
+                               return_value={}), \
+             mock.patch("anvil.orchestrator.write_state"):
+            orch._draft_and_confirm_artefacts(brief, brief_path, state)
+
+        # The artefact-preview send fired, the wait did NOT.
+        tg.send.assert_called_once()
+        tg.wait_for_reply.assert_not_called()
+
+
+class TestAutoReplyTelemetry(unittest.TestCase):
+    """When CALIBRATION_TELEGRAM_PREFIX is set AND the env short-circuit
+    fires, a `[calibration] auto-replied ...` log line surfaces."""
+
+    def setUp(self) -> None:
+        self._tmp = Path(tempfile.mkdtemp(prefix="anvil-cal-tel-"))
+        self._prev_root = os.environ.get("ANVIL_ROOT")
+        os.environ["ANVIL_ROOT"] = str(self._tmp)
+        os.environ.pop("AUTO_REPLY_FOR_CALIBRATION", None)
+        os.environ.pop("CALIBRATION_TELEGRAM_PREFIX", None)
+
+    def tearDown(self) -> None:
+        if self._prev_root is None:
+            os.environ.pop("ANVIL_ROOT", None)
+        else:
+            os.environ["ANVIL_ROOT"] = self._prev_root
+        for k in ("AUTO_REPLY_FOR_CALIBRATION", "CALIBRATION_TELEGRAM_PREFIX"):
+            os.environ.pop(k, None)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _orch(self):
+        cfg = Config(
+            anthropic_api_key="x", telegram_bot_token="t",
+            telegram_chat_id="1", vault_path=self._tmp / "v",
+            anvil_root=ANVIL_REPO, anvil_defer_window_seconds=300,
+            planner_model="claude-opus-4-7", planner_timeout=120,
+            coder_timeout=600,
+        )
+        return Orchestrator(cfg, coder_mode="manual",
+                            planner=mock.MagicMock(),
+                            telegram=mock.MagicMock(),
+                            git=mock.MagicMock())
+
+    def test_telemetry_logs_when_calibration_prefix_set(self) -> None:
+        os.environ["AUTO_REPLY_FOR_CALIBRATION"] = "go"
+        os.environ["CALIBRATION_TELEGRAM_PREFIX"] = "[ANVIL-calibration]"
+        orch = self._orch()
+        orch._pending_options = ("go", "abort")
+        state = SimpleNamespace(current_step=1, status="running")
+        with mock.patch("anvil.orchestrator.transition", lambda s, *a, **k: s), \
+             self.assertLogs("anvil.orchestrator", level="INFO") as captured:
+            orch._await_user_decision(state)
+        joined = "\n".join(captured.output)
+        self.assertIn("[calibration] auto-replied 'go'", joined)
+        self.assertIn("_await_user_decision", joined)
+
+    def test_telemetry_silent_when_prefix_unset(self) -> None:
+        # AUTO_REPLY set but no CALIBRATION_TELEGRAM_PREFIX → no log line.
+        os.environ["AUTO_REPLY_FOR_CALIBRATION"] = "go"
+        os.environ.pop("CALIBRATION_TELEGRAM_PREFIX", None)
+        orch = self._orch()
+        orch._pending_options = ("go", "abort")
+        state = SimpleNamespace(current_step=1, status="running")
+        with mock.patch("anvil.orchestrator.transition", lambda s, *a, **k: s):
+            # assertNoLogs available in 3.10+; use captureWarnings fallback.
+            import logging
+            handler = logging.Handler()
+            captured: list[str] = []
+            handler.emit = lambda r: captured.append(r.getMessage())  # type: ignore[assignment]
+            logger = logging.getLogger("anvil.orchestrator")
+            logger.addHandler(handler)
+            try:
+                orch._await_user_decision(state)
+            finally:
+                logger.removeHandler(handler)
+        # No "[calibration]" message in captured logs.
+        self.assertFalse(any("[calibration]" in m for m in captured),
+                         f"telemetry leaked without prefix: {captured}")
+
+
+class TestBootstrapGpgConflict(unittest.TestCase):
+    """bootstrap_target_repo surfaces a pre-commit-blocking config as a
+    clear RuntimeError (Step 6 outcome finding 5)."""
+
+    def test_bootstrap_raises_on_dry_run_failure(self) -> None:
+        from unittest.mock import patch as up
+        tmp = Path(tempfile.mkdtemp(prefix="anvil-cal-gpg-"))
+        try:
+            # Real bootstrap up to the dry-run check, then inject a
+            # non-zero returncode for the --dry-run commit only.
+            real_run = subprocess.run
+
+            def selective(cmd, *a, **kw):
+                # The Step 7 preflight commit is identified by its
+                # commit-message string. Inject a GPG-signing failure
+                # for that specific commit, let everything else (init,
+                # baseline commit) run for real.
+                if (
+                    isinstance(cmd, list)
+                    and "commit" in cmd
+                    and any("calibration bootstrap dry-run" in str(c) for c in cmd)
+                ):
+                    return subprocess.CompletedProcess(
+                        args=cmd, returncode=1, stdout="",
+                        stderr="error: gpg failed to sign the data\n",
+                    )
+                return real_run(cmd, *a, **kw)
+
+            with up.object(calibration_runner, "target_repo_path_for",
+                           return_value=tmp / "T9"), \
+                 up("subprocess.run", side_effect=selective):
+                with self.assertRaises(RuntimeError) as cm:
+                    calibration_runner.bootstrap_target_repo("T9")
+            self.assertIn("git config", str(cm.exception))
+            self.assertIn("gpg", str(cm.exception).lower())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestBudgetCap(unittest.TestCase):
     """Real-mode runs abort when cumulative + estimate exceeds budget_cap."""
 
     def test_t5_real_aborts_when_cumulative_at_28(self) -> None:
         # Stub cumulative_real_spend → 28.00; T5 estimate = 3.75; cap = 30.
-        # 28 + 3.75 = 31.75 > 30 → abort.
+        # 28 + 3.75 = 31.75 > 30 → abort. Patch the pre-sweep warning
+        # so the test doesn't wait 5 seconds.
         captured: list[str] = []
 
         def fake_append_budget(line: str) -> None:
@@ -210,7 +399,9 @@ class TestBudgetCap(unittest.TestCase):
                                return_value=28.00), \
              mock.patch.object(calibration_runner, "run_one") as run_mock, \
              mock.patch.object(calibration_runner, "append_budget_log",
-                               side_effect=fake_append_budget):
+                               side_effect=fake_append_budget), \
+             mock.patch.object(calibration_runner,
+                               "_print_pre_sweep_warning"):
             rc = calibration_runner.sweep(
                 tasks=("T5",), modes=("real",),
                 dry_run=False, budget_cap=30.00,

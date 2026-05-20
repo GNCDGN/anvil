@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -182,6 +183,34 @@ def bootstrap_target_repo(task: str) -> Path:
             cwd=str(p), check=True, capture_output=True,
         )
 
+    # v2 Phase 1 Step 7 prep: surface GPG-signing / strict-identity hook
+    # conflicts BEFORE the sweep launches. `git commit --dry-run` is
+    # buggy with `--allow-empty` (returns exit 1 with "nothing to
+    # commit"), so the check makes a REAL empty commit and then
+    # resets HEAD~1 if it succeeds. Net repo state unchanged.
+    # If GPG signing is required and the env can't satisfy it, the
+    # commit fails — we surface a RuntimeError with a clear remediation
+    # hint, better than silent failure mid-sweep.
+    check = subprocess.run(
+        ["git", "-C", str(p), "commit", "--allow-empty",
+         "-m", "calibration bootstrap dry-run"],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0:
+        raise RuntimeError(
+            f"Target repo bootstrap blocked by git config at {p}: "
+            f"{(check.stderr or check.stdout).strip()}. "
+            f"Likely cause: GPG-signing requirement or strict identity hook. "
+            f"Either disable signing for this repo "
+            f"(git -C {p} config commit.gpgsign false) or unset the "
+            f"global hook for the duration of the sweep."
+        )
+    # Undo the test commit so the repo is exactly as we left it.
+    subprocess.run(
+        ["git", "-C", str(p), "reset", "--hard", "HEAD~1"],
+        check=True, capture_output=True,
+    )
+
     return p
 
 
@@ -254,13 +283,21 @@ def run_one(task: str, mode: str, env: dict[str, str]) -> dict:
 
     Steps:
       1. clear_current_run_state
-      2. stage_brief_into_inbox
-      3. bootstrap_target_repo
-      4. subprocess: `anvil run` with the calibration env
-      5. write `mode.txt` into the run-dir (creating the dir if absent)
-      6. (caller separately calls harness ingest)
+      2. clear the prior run-dir for this task (events.jsonl appends
+         in events.py; without this, re-runs accumulate)
+      3. stage_brief_into_inbox
+      4. bootstrap_target_repo
+      5. subprocess: `anvil run` with the calibration env
+      6. write `mode.txt` into the run-dir (creating the dir if absent)
+      7. (caller separately calls harness ingest)
     """
     clear_current_run_state()
+    # Clear any prior events.jsonl for this run_id — events.py appends
+    # in O(1) mode, so a re-run of the same task would otherwise mix
+    # the new events into the prior file.
+    prior = run_dir_for(task)
+    if prior.is_dir():
+        shutil.rmtree(prior, ignore_errors=True)
     stage_brief_into_inbox(task)
     bootstrap_target_repo(task)
 
@@ -362,6 +399,38 @@ def parse_brief_only(task: str) -> tuple[bool, str]:
         return (False, f"{type(e).__name__}: {e}")
 
 
+def _print_pre_sweep_warning(
+    tasks: tuple[str, ...], modes: tuple[str, ...], budget_cap: float,
+) -> None:
+    """v2 Phase 1 Step 7 prep: pre-flight notice before a live sweep.
+
+    Five-second pause gives Genco time to ctrl-C if the terminal is in
+    the wrong directory, env vars are missing, etc. Dry-run skips this.
+    """
+    print("=" * 70)
+    print("CALIBRATION SWEEP — pre-flight notice")
+    print("=" * 70)
+    print()
+    print("Real Telegram messages will land in your chat during this sweep,")
+    print("prefixed [ANVIL-calibration]. You do NOT need to reply — the")
+    print("AUTO_REPLY_FOR_CALIBRATION env flag short-circuits all wait-for-")
+    print("reply sites in the orchestrator.")
+    print()
+    print("During the sweep, watch:")
+    print("  - The terminal output (per-run summary lines + auto-reply telemetry)")
+    print("  - The Anthropic billing dashboard (real-mode spend)")
+    print()
+    print("The Telegram chat can be ignored.")
+    print()
+    print(f"Tasks: {', '.join(tasks)}  Modes: {', '.join(modes)}")
+    print(f"In-app budget cap: ${budget_cap:.2f}")
+    print("Provider hard cap (Anthropic dashboard): set manually by user")
+    print()
+    print("Press Ctrl-C to abort. Sweep begins in 5 seconds...")
+    print("=" * 70)
+    time.sleep(5)
+
+
 def sweep(
     tasks: tuple[str, ...] = DEFAULT_TASKS,
     modes: tuple[str, ...] = DEFAULT_MODES,
@@ -392,7 +461,9 @@ def sweep(
         print(f"--- dry-run {'PASS' if all_ok else 'FAIL'} ---")
         return 0 if all_ok else 1
 
-    # Real sweep
+    # Real sweep — print the pre-flight notice and pause briefly.
+    _print_pre_sweep_warning(tasks, modes, budget_cap)
+
     results: list[dict] = []
     aborted: list[tuple[str, str, str]] = []
     for task, mode in plan:
@@ -412,6 +483,10 @@ def sweep(
         env = build_env(task, mode)
         print(f"[calibration_runner] starting {task} ({mode})")
         result = run_one(task, mode, env)
+        # Surface [calibration] telemetry from the subprocess's stderr.
+        for line in (result.get("stderr_tail") or "").splitlines():
+            if "[calibration]" in line:
+                print(f"  {line}")
         print(f"  exit={result['exit_code']} "
               f"stderr_chars={result['stderr_chars']}")
         try:

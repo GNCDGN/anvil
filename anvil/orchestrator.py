@@ -68,6 +68,28 @@ log = logging.getLogger("anvil.orchestrator")
 _UK = ZoneInfo("Europe/London")
 
 
+def _calibration_auto_reply_log(site: str, reply: str, step_idx) -> None:
+    """v2 Phase 1 Step 7 prep: telemetry for AUTO_REPLY_FOR_CALIBRATION
+    short-circuits. Gated on `CALIBRATION_TELEGRAM_PREFIX` being set so
+    the line only appears during calibration sweeps, not in production.
+
+    Surfaces via anvil.log (file handler wired by cli.py:_setup_logging)
+    AND via stderr (so calibration_runner's captured-stderr can echo it
+    back to the operator's terminal). Direct stderr write rather than a
+    logger.StreamHandler so we don't perturb the global anvil.* logger
+    config — `[planner]` and `[coder]` lines remain file-only.
+    """
+    if not os.environ.get("CALIBRATION_TELEGRAM_PREFIX", "").strip():
+        return
+    step_token = step_idx if step_idx is not None else "run-level"
+    line = (
+        f"[calibration] auto-replied {reply!r} at {site} (step={step_token})"
+    )
+    log.info(line)
+    import sys as _sys
+    print(line, file=_sys.stderr, flush=True)
+
+
 def _slug(build_name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (build_name or "").lower())
     s = re.sub(r"-+", "-", s).strip("-")
@@ -587,6 +609,9 @@ class Orchestrator:
                     auto = os.environ.get("AUTO_REPLY_FOR_CALIBRATION", "").strip()
                     if auto:
                         text = auto.lower()
+                        _calibration_auto_reply_log(
+                            "step-completion-wait", text, idx,
+                        )
                     else:
                         reply = self.telegram.wait_for_reply(timeout=None)
                         text = (reply.text.strip().lower() if reply else "")
@@ -950,6 +975,13 @@ class Orchestrator:
         auto = os.environ.get("AUTO_REPLY_FOR_CALIBRATION", "").strip()
         if auto:
             text = auto.lower()
+            _step_idx_for_log = (
+                (state.current_step - 1) if isinstance(state.current_step, int)
+                else None
+            )
+            _calibration_auto_reply_log(
+                "_await_user_decision", text, _step_idx_for_log,
+            )
         else:
             reply = self.telegram.wait_for_reply(timeout=None)
             text = (reply.text.strip().lower() if reply else "")
@@ -1098,8 +1130,18 @@ class Orchestrator:
         )
         state.pending_action = pa
         write_state(state)
-        reply = self.telegram.wait_for_reply(timeout=None)
-        text = (reply.text.strip().lower() if reply else "")
+        # v2 Phase 1 Step 7 prep: defensive AUTO_REPLY_FOR_CALIBRATION
+        # short-circuit at the artefact-preview wait. Calibration runs
+        # normally hit the soft-skip path higher up (no setup-log at
+        # the ANVIL repo root), but any future shape that reaches here
+        # would have hung the sweep without this guard.
+        auto = os.environ.get("AUTO_REPLY_FOR_CALIBRATION", "").strip()
+        if auto:
+            text = auto.lower()
+            _calibration_auto_reply_log("artefact-preview-wait", text, None)
+        else:
+            reply = self.telegram.wait_for_reply(timeout=None)
+            text = (reply.text.strip().lower() if reply else "")
         state.pending_action = None
         write_state(state)
 
