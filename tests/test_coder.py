@@ -435,7 +435,15 @@ class T6CalibrationBriefTests(unittest.TestCase):
     # --- (7c) T6 brief passes validate_or_reject ---
     def test_t6_brief_validates(self):
         from anvil.brief import parse_brief_raw, validate_or_reject
+        from tools import calibration_runner
         self.assertTrue(_T6_BRIEF.is_file(), f"T6 brief missing: {_T6_BRIEF}")
+        # v2 Phase 2 Step 4 follow-up: target_repo_path is the isolated
+        # throwaway state/v2-phase-1/targets/T6, which only exists after
+        # bootstrap (matches T1-T5 — validate_or_reject rule 3 requires
+        # the target to exist + be a git repo). Bootstrap first, exactly
+        # as test_calibration_runner.test_all_six_briefs_parse does via
+        # parse_brief_only.
+        calibration_runner.bootstrap_target_repo("T6")
         brief, raw = parse_brief_raw(_T6_BRIEF)
         # One write+smoke-test step touching the new utils file.
         self.assertEqual(len(brief.steps), 1)

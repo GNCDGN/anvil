@@ -50,7 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
 # `harness_v2.open_db` is called from `cumulative_real_spend` and `ingest_run`.
 
 
-DEFAULT_TASKS = ("T1", "T2", "T3", "T4", "T5")
+DEFAULT_TASKS = ("T1", "T2", "T3", "T4", "T5", "T6")
 DEFAULT_MODES = ("mock", "real")
 
 # Task → vault-folder slug. The vault folder is named `<task>-<label>`;
@@ -70,6 +70,10 @@ TASK_LABELS = {
     "T3": "out-of-scope",
     "T4": "judgment-escalation",
     "T5": "deploy",
+    # v2 Phase 2 Step 4 follow-up: write-new calibration. Exercises the
+    # _reconcile_paths fall-through fix (V2P2-4) — a step that creates a
+    # strictly-new file must reach the Coder, not escalate at preflight.
+    "T6": "write-new",
 }
 
 # Per-task auto-reply for AUTO_REPLY_FOR_CALIBRATION:
@@ -82,6 +86,8 @@ AUTO_REPLIES = {
     "T3": "abort",
     "T4": "abort",
     "T5": "go",
+    # T6 write-new: a clean create, proceed.
+    "T6": "go",
 }
 
 # Pre-estimated real-mode cost per task (USD, 1.3× safety margin applied
@@ -94,6 +100,7 @@ ESTIMATES_USD = {
     "T3": 2.50,
     "T4": 1.25,
     "T5": 3.75,
+    "T6": 1.25,  # 1 Stage A + 1 Stage B + 1 Coder; T1-sized single-step.
 }
 
 ANVIL_REPO = Path(__file__).resolve().parent.parent
@@ -136,6 +143,15 @@ SEED_FILES: dict[str, tuple[tuple[str, str], ...]] = {
         ("version.txt", "v1\n"),
         ("CHANGELOG.md", "# CHANGELOG\n"),
         ("README.md", "# T5 v1 deploy target\n"),
+    ),
+    # T6 deliberately does NOT seed its planned file (anvil/utils/hello.py)
+    # — the whole point is to exercise the write-new fall-through, so the
+    # planned path must be ABSENT at preflight. Seed only a baseline
+    # README so the bootstrap's initial commit has content (HEAD must
+    # resolve for Layer 2 git-diff). This is the inverse of T1–T5, which
+    # seed their planned files as placeholders.
+    "T6": (
+        ("README.md", "# T6 write-new target\n"),
     ),
 }
 

@@ -38,15 +38,15 @@ from tools import calibration_runner  # noqa: E402
 
 
 class TestCalibrationBriefs(unittest.TestCase):
-    """Each of the five vault briefs parses + validates."""
+    """Each DEFAULT_TASKS vault brief parses + validates.
 
-    def setUp(self) -> None:
-        # The five target_repo_paths must exist + be git repos for
-        # validate_or_reject rule 3. calibration_runner.parse_brief_only
-        # already bootstraps; we just exercise it.
-        pass
+    v2 Phase 2 Step 4 follow-up: DEFAULT_TASKS gained T6 (write-new), so
+    this now covers six briefs. parse_brief_only bootstraps each task's
+    throwaway target repo before validating (rule 3 needs the target to
+    exist + be a git repo)."""
 
-    def test_all_five_briefs_parse(self) -> None:
+    def test_all_six_briefs_parse(self) -> None:
+        self.assertIn("T6", calibration_runner.DEFAULT_TASKS)
         for task in calibration_runner.DEFAULT_TASKS:
             ok, err = calibration_runner.parse_brief_only(task)
             self.assertTrue(ok, f"{task} failed: {err}")
