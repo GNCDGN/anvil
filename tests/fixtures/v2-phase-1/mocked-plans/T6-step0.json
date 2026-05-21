@@ -8,13 +8,13 @@
     "write",
     "smoke-test"
   ],
-  "approach": "Create anvil/utils/hello.py with a module-level hello() function returning the string 'hello'. Create anvil/utils/__init__.py if the utils package does not already exist.",
+  "approach": "Create anvil/utils/hello.py with a module-level hello() function returning the string 'hello'. The smoke is a file-existence + grep check (no import), so no __init__.py is required.",
   "smoke_test": "test -f anvil/utils/hello.py && grep -q 'def hello' anvil/utils/hello.py",
   "expected_outcome": "anvil/utils/hello.py exists and exports hello() returning 'hello'.",
   "commit_message": "T6 write-new calibration: create anvil/utils/hello.py",
   "scope_boundaries": {
-    "in_scope": "anvil/utils/hello.py and anvil/utils/__init__.py if absent",
-    "out_of_scope": "All other files"
+    "in_scope": "anvil/utils/hello.py only",
+    "out_of_scope": "All other files, including anvil/utils/__init__.py"
   },
   "confidence": "high",
   "escalation_triggers": [
