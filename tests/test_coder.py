@@ -23,6 +23,7 @@ extractor) because the helper is the orchestrator's parsing contract.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -227,10 +228,15 @@ class CoderPathReconciliationTests(unittest.TestCase):
         self.assertEqual(result["out_of_scope"], [])
 
     # --- (d-2) zero matches → escalation block ---
+    # v2 Phase 2 Step 4: operations changed from ["write"] to ["read"].
+    # The write carve-out (V2P2-4) now treats an unresolved path as a
+    # 'new-file' (not 'failed') whenever "write" is declared, so this
+    # escalation path is only reachable for non-write operations. The
+    # write-new behaviour is covered by ReconcileWriteNewTests below.
     def test_d2_zero_matches_escalation_block(self):
         _init_repo(self.repo, {".keep": ""})  # empty repo
         plan = _make_plan(files_to_touch=["totally_missing.py"],
-                          operations=["write"])
+                          operations=["read"])
         brief = _make_brief(self.repo)
         # subprocess.run is not invoked because reconciliation pre-fails
         with mock.patch.object(coder.subprocess, "run") as run_mock:
@@ -246,13 +252,17 @@ class CoderPathReconciliationTests(unittest.TestCase):
             self.assertNotIn("claude", " ".join(cmd))
 
     # --- (d-3) multiple matches → escalation block ---
+    # v2 Phase 2 Step 4: operations changed from ["write"] to ["read"]
+    # for the same reason as d-2 — with "write" declared, an ambiguous
+    # (multiple-basename-match) path now falls through to 'new-file'
+    # rather than escalating. Ambiguity still escalates for non-write.
     def test_d3_multiple_matches_escalation_block(self):
         _init_repo(self.repo, {
             "a/ambiguous.py": "# a\n",
             "b/ambiguous.py": "# b\n",
         })
         plan = _make_plan(files_to_touch=["c/ambiguous.py"],
-                          operations=["write"])
+                          operations=["read"])
         brief = _make_brief(self.repo)
         with mock.patch.object(coder.subprocess, "run"):
             result = _make_coder().execute_step(plan, brief)
@@ -342,6 +352,112 @@ class CoderAnvilBlockParserTests(unittest.TestCase):
         )
         blocks = parse_anvil_coder_blocks(text)
         self.assertEqual(len(blocks), 2)
+
+
+# ---------------------------------------------------------------------------
+# v2 Phase 2 Step 4 — _reconcile_paths write-new carve-out (V2P2-4)
+# ---------------------------------------------------------------------------
+
+class ReconcileWriteNewTests(unittest.TestCase):
+    """The write-new fall-through: an unresolved path (no existing file,
+    no single basename match) is recorded as 'new-file' (the Coder
+    creates it) when the plan declares `write`, and as 'failed' (preflight
+    escalation) when it does not. Tests _reconcile_paths at the function
+    level — no execute_step, no subprocess."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="anvil-test-reconcile-"))
+        self.repo = self._tmp / "repo"
+        # No git needed — _reconcile_paths only stats files and walks
+        # for basename matches. An empty dir is a strictly-new repo.
+        self.repo.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # --- (7a) strictly-new path WITH write → status 'new-file' ---
+    def test_new_path_with_write_is_new_file(self):
+        resolved, recs = coder._reconcile_paths(
+            ["anvil/utils/hello.py"], self.repo, ["write", "smoke-test"]
+        )
+        # Path returned unchanged — the Coder creates it.
+        self.assertEqual(resolved, ["anvil/utils/hello.py"])
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["status"], "new-file")
+        self.assertEqual(recs[0]["original"], "anvil/utils/hello.py")
+        self.assertIsNone(recs[0]["resolved"])
+        self.assertIn("write operation declared", recs[0]["reason"])
+
+    # --- (7b) strictly-new path WITHOUT write → status 'failed' ---
+    def test_new_path_without_write_is_failed(self):
+        resolved, recs = coder._reconcile_paths(
+            ["anvil/utils/hello.py"], self.repo, ["read"]
+        )
+        # Existing behaviour: original is still returned, but the
+        # reconciliation is a failure that the caller escalates on.
+        self.assertEqual(resolved, ["anvil/utils/hello.py"])
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["status"], "failed")
+        self.assertIsNone(recs[0]["resolved"])
+        self.assertIn("no single basename match", recs[0]["reason"])
+
+    def test_empty_operations_treated_as_no_write(self):
+        # Defensive: an empty/None operations list must not be read as
+        # write-permitted. Unresolved path → 'failed'.
+        resolved, recs = coder._reconcile_paths(
+            ["anvil/utils/hello.py"], self.repo, []
+        )
+        self.assertEqual(recs[0]["status"], "failed")
+
+
+# ---------------------------------------------------------------------------
+# v2 Phase 2 Step 4 — T6 write-new calibration brief + mocked fixture
+# ---------------------------------------------------------------------------
+
+_T6_BRIEF = (
+    Path.home()
+    / "vaults" / "second-brain" / "01-Projects" / "code-workspace"
+    / "anvil" / "builds" / "2026-05-20-anvil-v2-phase-1-calibration"
+    / "T6-write-new" / "brief.md"
+)
+_T6_FIXTURE = (
+    Path(__file__).resolve().parent
+    / "fixtures" / "v2-phase-1" / "mocked-plans" / "T6-step0.json"
+)
+
+
+class T6CalibrationBriefTests(unittest.TestCase):
+    """The T6 write-new calibration brief parses + validates, and its
+    MockedPlanner step-0 fixture is a valid Plan. These guard the
+    Step-5 sweep inputs: a malformed brief or fixture would only
+    surface mid-sweep otherwise."""
+
+    # --- (7c) T6 brief passes validate_or_reject ---
+    def test_t6_brief_validates(self):
+        from anvil.brief import parse_brief_raw, validate_or_reject
+        self.assertTrue(_T6_BRIEF.is_file(), f"T6 brief missing: {_T6_BRIEF}")
+        brief, raw = parse_brief_raw(_T6_BRIEF)
+        # One write+smoke-test step touching the new utils file.
+        self.assertEqual(len(brief.steps), 1)
+        self.assertEqual(brief.steps[0].scope_files, ["anvil/utils/hello.py"])
+        self.assertIn("write", brief.steps[0].scope_operations)
+        # Should not raise.
+        validate_or_reject(brief, raw_frontmatter=raw)
+
+    # --- (7d) T6 MockedPlanner fixture is a valid Plan ---
+    def test_t6_fixture_is_valid_plan(self):
+        from anvil.planner import Plan
+        self.assertTrue(_T6_FIXTURE.is_file(),
+                        f"T6 fixture missing: {_T6_FIXTURE}")
+        data = json.loads(_T6_FIXTURE.read_text(encoding="utf-8"))
+        # Constructs without ValidationError → satisfies all eleven
+        # _REQUIRED_PLAN_FIELDS and the six structural constraints
+        # (confidence enum, scope_boundaries shape, etc.).
+        plan = Plan(**data)
+        self.assertEqual(plan.step_number, 1)
+        self.assertEqual(plan.files_to_touch, ["anvil/utils/hello.py"])
+        self.assertEqual(plan.operations, ["write", "smoke-test"])
+        self.assertEqual(plan.confidence, "high")
 
 
 if __name__ == "__main__":

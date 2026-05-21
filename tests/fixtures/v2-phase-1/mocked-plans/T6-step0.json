@@ -1,0 +1,23 @@
+{
+  "step_number": 1,
+  "step_name": "Create new utility file",
+  "files_to_touch": [
+    "anvil/utils/hello.py"
+  ],
+  "operations": [
+    "write",
+    "smoke-test"
+  ],
+  "approach": "Create anvil/utils/hello.py with a module-level hello() function returning the string 'hello'. Create anvil/utils/__init__.py if the utils package does not already exist.",
+  "smoke_test": "cd ~/Code/anvil && .venv/bin/python3 -c \"from anvil.utils.hello import hello; assert hello() == 'hello'\"",
+  "expected_outcome": "anvil/utils/hello.py exists and exports hello() returning 'hello'.",
+  "commit_message": "T6 write-new calibration: create anvil/utils/hello.py",
+  "scope_boundaries": {
+    "in_scope": "anvil/utils/hello.py and anvil/utils/__init__.py if absent",
+    "out_of_scope": "All other files"
+  },
+  "confidence": "high",
+  "escalation_triggers": [
+    "anvil/utils/ directory conflicts with an existing module of a different shape"
+  ]
+}

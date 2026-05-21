@@ -1,0 +1,7 @@
+files:
+  - path: anvil/utils/__init__.py
+    content: ""
+  - path: anvil/utils/hello.py
+    content: |
+      def hello():
+          return "hello"

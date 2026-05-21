@@ -127,7 +127,13 @@ class TestCoderEvents(_CoderEventsBase):
         ])
 
     def test_preflight_escalation_skips_subprocess(self) -> None:
-        plan = _plan(files_to_touch=["does/not/exist/nowhere.py"])
+        # v2 Phase 2 Step 4: operations=["read"] (not the default
+        # ["write"]) so the unresolved path still escalates. With "write"
+        # the V2P2-4 carve-out treats it as a 'new-file' and the
+        # subprocess runs — the new-file path is covered in test_coder's
+        # ReconcileWriteNewTests.
+        plan = _plan(files_to_touch=["does/not/exist/nowhere.py"],
+                     operations=["read"])
         with mock.patch.object(coder.subprocess, "run") as run_mock:
             out = self.coder.execute_step(plan, _brief(self.repo))
         self.assertTrue(out.get("escalate"))

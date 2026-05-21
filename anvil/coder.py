@@ -99,7 +99,9 @@ def _basename_match(repo: Path, target: str) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
-def _reconcile_paths(plan_files: list[str], repo: Path) -> tuple[list[str], list[dict]]:
+def _reconcile_paths(
+    plan_files: list[str], repo: Path, operations: list[str]
+) -> tuple[list[str], list[dict]]:
     """For each path in plan_files, check existence at repo/path. If
     missing, look for a single-basename match. Returns (resolved_paths,
     reconciliations) where resolved_paths is the path list as the Coder
@@ -107,25 +109,48 @@ def _reconcile_paths(plan_files: list[str], repo: Path) -> tuple[list[str], list
     reconciliations is the structured record per design Part 4 layer 3.
 
     Reconciliation dict shape:
-      {original: str, resolved: str | None, status: 'resolved' | 'failed',
-       reason: str}
+      {original: str, resolved: str | None,
+       status: 'resolved' | 'new-file' | 'failed', reason: str}
+
+    v2 Phase 2 Step 4 (V2P2-4): write-new fall-through. A path that
+    resolves to no existing file AND has no single-basename match used
+    to be a uniform 'failed' → preflight escalation. That made it
+    impossible to plan a step that creates a new file. Now, when the
+    plan declares the `write` operation, an unresolved path is recorded
+    as 'new-file' rather than 'failed': the Coder subprocess will
+    create it. Without `write` in operations, the prior 'failed'
+    behaviour holds (an unresolved read/edit target is still a real
+    error worth escalating).
     """
     resolved: list[str] = []
     reconciliations: list[dict] = []
+    can_write = "write" in (operations or [])
     for p in plan_files:
         if (repo / p).exists():
             resolved.append(p)
             continue
         match = _basename_match(repo, p)
         if match is None:
-            reconciliations.append({
-                "original": p,
-                "resolved": None,
-                "status": "failed",
-                "reason": "no single basename match in repo",
-            })
-            # Still include the original — the failed reconciliation is
-            # what the escalation block surfaces; the caller decides.
+            if can_write:
+                # Write-new carve-out: the step is allowed to create
+                # files, so an unresolved path is a new file, not a
+                # reconciliation failure. The Coder creates it.
+                reconciliations.append({
+                    "original": p,
+                    "resolved": None,
+                    "status": "new-file",
+                    "reason": "write operation declared; treating as new file",
+                })
+            else:
+                reconciliations.append({
+                    "original": p,
+                    "resolved": None,
+                    "status": "failed",
+                    "reason": "no single basename match in repo",
+                })
+            # Either way, the original path is what the Coder uses
+            # (create-new or surface-the-failure); the caller's failure
+            # filter decides which reconciliation statuses escalate.
             resolved.append(p)
         else:
             reconciliations.append({
@@ -343,7 +368,13 @@ class Coder:
 
         # 1. Pre-flight: path reconciliation.
         plan_files = list(getattr(plan, "files_to_touch", []) or [])
-        resolved_paths, reconciliations = _reconcile_paths(plan_files, repo)
+        # v2 Phase 2 Step 4 (V2P2-4): pass the plan's operations so
+        # _reconcile_paths can fall through to 'new-file' (rather than
+        # 'failed') for an unresolved path when the step declares write.
+        plan_operations = list(getattr(plan, "operations", []) or [])
+        resolved_paths, reconciliations = _reconcile_paths(
+            plan_files, repo, plan_operations
+        )
         _events.emit(
             "coder.preflight.reconciled",
             {
@@ -352,6 +383,8 @@ class Coder:
             },
             step_idx=step_idx_evt,
         )
+        # Only 'failed' reconciliations escalate. 'new-file' (write
+        # carve-out) and 'resolved' (basename match) are not failures.
         failed = [r for r in reconciliations if r["status"] == "failed"]
         if failed:
             detail_lines = [
