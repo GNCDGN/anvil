@@ -2,9 +2,12 @@
 
 Consumer of the event stream wired by Steps 1–3. Reads
 `<ANVIL_ROOT>/state/runs/<run_id>/events.jsonl`, ingests into the
-`events` table at `<ANVIL_ROOT>/state/v2-phase-1/calibration.duckdb`,
-exposes three views (operations / per_run_summary / per_task_comparison)
-and an openpyxl XLSX export.
+`events` table at the default DuckDB (v2 Phase 3 Step 1: now
+`<ANVIL_ROOT>/state/v2-phase-2/calibration.duckdb` — see `db_path()`;
+the pre-`mode` v1 DB is quarantined to `calibration-archived.duckdb`),
+exposes the views (operations / per_run_summary / per_task_comparison /
+validation_failure_episodes / cumulative_spend_by_task) and an openpyxl
+XLSX export. The DB is overridable per invocation via `--db-path`.
 
 The legacy `tools/exam_harness.py` is unchanged and stays around for
 backward-compat parsers of the `[planner]` log line. harness_v2.py
@@ -126,8 +129,17 @@ def _anvil_root() -> Path:
 
 
 def db_path() -> Path:
-    """Default DuckDB path under `<ANVIL_ROOT>/state/v2-phase-1/`."""
-    return _anvil_root() / "state" / "v2-phase-1" / "calibration.duckdb"
+    """Default DuckDB path under `<ANVIL_ROOT>/state/v2-phase-2/`.
+
+    v2 Phase 3 Step 1: re-pointed from v2-phase-1 → v2-phase-2. The v1 DB
+    predates the `mode` column and binder-errors under the composite-key
+    views (`LEFT JOIN run_metadata USING (run_id, mode)` — `mode` is
+    absent on v1's `events`), so the bare CLI defaulting to it always
+    failed. The v1 DB is quarantined to `calibration-archived.duckdb`;
+    the clean v2 Phase 2 baseline is the new default. Override per
+    invocation with the CLI `--db-path` flag.
+    """
+    return _anvil_root() / "state" / "v2-phase-2" / "calibration.duckdb"
 
 
 def open_db(path: Path | None = None) -> duckdb.DuckDBPyConnection:
@@ -176,12 +188,38 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    # v2 Phase 3 Step 1: spend_ledger — append-only spend history
+    # (Candidate A). Every ingest of a (run_id, mode) appends a row
+    # capturing that ingest's total cost; the prior non-superseded row
+    # for the key is flipped to superseded=TRUE (see `ingest()`). The
+    # events/run_metadata composite-key DELETE-then-INSERT overwrite is
+    # UNCHANGED — the ledger is purely additive, so the V2P2-2
+    # (run_id, mode) invariant holds and none of the four existing views
+    # are rewritten. ledger_id auto-increments via a sequence (DuckDB has
+    # no SERIAL/AUTOINCREMENT). CREATE ... IF NOT EXISTS migrates the
+    # existing v2-phase-2 DB on next open without touching its data.
+    con.execute("CREATE SEQUENCE IF NOT EXISTS spend_ledger_seq START 1")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spend_ledger (
+            ledger_id      INTEGER PRIMARY KEY DEFAULT nextval('spend_ledger_seq'),
+            run_id         VARCHAR NOT NULL,
+            mode           VARCHAR NOT NULL,
+            ingest_ts      TIMESTAMP NOT NULL,
+            total_cost_usd DOUBLE NOT NULL,
+            superseded     BOOLEAN NOT NULL DEFAULT FALSE
+        )
+        """
+    )
     con.execute(_OPERATIONS_VIEW_SQL)
     con.execute(_PER_RUN_SUMMARY_VIEW_SQL)
     con.execute(_PER_TASK_COMPARISON_VIEW_SQL)
     # v2 Phase 2 Step 2: registered last because it SELECTs from
     # `operations` (cost_usd source) and `run_metadata` (task_id).
     con.execute(_VALIDATION_FAILURE_EPISODES_VIEW_SQL)
+    # v2 Phase 3 Step 1: cumulative_spend_by_task SELECTs from
+    # spend_ledger (above) and run_metadata (task_id).
+    con.execute(_CUMULATIVE_SPEND_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +545,45 @@ _VALIDATION_FAILURE_EPISODES_COLUMNS: tuple[str, ...] = (
 )
 
 
+# v2 Phase 3 Step 1: cumulative_spend_by_task — actual-spend
+# reconciliation surface (Candidate A).
+#
+# One row per (task_id, run_id, mode). `n_ingests` is the spend_ledger
+# history depth for the key; `cumulative_cost_usd` sums every ingest —
+# the ACTUAL spend, including superseded re-ingests; `latest_cost_usd`
+# is the single non-superseded snapshot (equals
+# per_run_summary.total_cost_usd for the key). The gap between
+# cumulative and latest is the previously-invisible re-run spend — the
+# v2 Phase 2 $0.29 T6-overwrite defect class, now reconcilable.
+#
+# spend_ledger has N rows per (run_id, mode); run_metadata has exactly
+# one (overwrite semantics preserved), so the LEFT JOIN is 1:1 from the
+# ledger side — no fan-out. GROUP BY collapses to one row per key.
+#
+# Reconciliation arithmetic (runnable as single queries):
+#   actual_real_spend = SUM(total_cost_usd) FROM spend_ledger WHERE mode='real'
+#   recorded_latest   = SUM(total_cost_usd) FROM per_run_summary WHERE mode='real'
+#   actual - recorded = SUM of superseded ledger rows (the invisible re-run spend)
+_CUMULATIVE_SPEND_VIEW_SQL = """
+CREATE OR REPLACE VIEW cumulative_spend_by_task AS
+SELECT
+    rm.task_id,
+    sl.run_id,
+    sl.mode,
+    COUNT(*) AS n_ingests,
+    SUM(sl.total_cost_usd) AS cumulative_cost_usd,
+    MAX(sl.total_cost_usd) FILTER (WHERE sl.superseded = FALSE) AS latest_cost_usd
+FROM spend_ledger sl
+LEFT JOIN run_metadata rm USING (run_id, mode)
+GROUP BY rm.task_id, sl.run_id, sl.mode
+"""
+
+_CUMULATIVE_SPEND_COLUMNS: tuple[str, ...] = (
+    "task_id", "run_id", "mode",
+    "n_ingests", "cumulative_cost_usd", "latest_cost_usd",
+)
+
+
 # ---------------------------------------------------------------------------
 # Ingest
 # ---------------------------------------------------------------------------
@@ -619,6 +696,36 @@ def ingest(con: duckdb.DuckDBPyConnection, run_dir: Path) -> dict:
                     int(ev.get("elapsed_ms") or 0),
                 ],
             )
+        # v2 Phase 3 Step 1: append to spend_ledger inside the SAME
+        # transaction as the events overwrite. Three steps, atomic:
+        #   1. supersede the prior non-superseded row for (run_id, mode)
+        #      (zero rows on a first ingest);
+        #   2. snapshot this ingest's total cost from the operations view
+        #      — the run_id-only filter mirrors per_run_summary's
+        #      total_cost_usd subquery byte-for-byte (run_id is
+        #      mode-suffixed in calibration, so it equals the
+        #      per-(run_id, mode) sum);
+        #   3. append the new current row (superseded=FALSE).
+        # A crash before COMMIT rolls back all of it, so the ledger can
+        # never hold two non-superseded rows for one key. The cost is
+        # computed AFTER the events insert so the operations view sees
+        # this ingest's freshly-inserted rows (same-connection MVCC).
+        con.execute(
+            "UPDATE spend_ledger SET superseded = TRUE "
+            "WHERE run_id = ? AND mode = ? AND superseded = FALSE",
+            [run_id, mode],
+        )
+        cost_row = con.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM operations WHERE run_id = ?",
+            [run_id],
+        ).fetchone()
+        total_cost_usd = float(cost_row[0] or 0.0)
+        con.execute(
+            "INSERT INTO spend_ledger "
+            "(run_id, mode, ingest_ts, total_cost_usd, superseded) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP, ?, FALSE)",
+            [run_id, mode, total_cost_usd],
+        )
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -707,6 +814,25 @@ def query_validation_failure_episodes(
         f"SELECT {', '.join(_VALIDATION_FAILURE_EPISODES_COLUMNS)} "
         "FROM validation_failure_episodes "
         "ORDER BY run_id, step_idx"
+    ).fetchall()
+
+
+def query_cumulative_spend(
+    con: duckdb.DuckDBPyConnection, mode: str | None = None,
+) -> list[tuple]:
+    """v2 Phase 3 Step 1: cumulative_spend_by_task rows, optionally
+    filtered to one mode (`real`/`mock`). Ordered by run_id for stable
+    output. See `_CUMULATIVE_SPEND_VIEW_SQL` for the columns and the
+    reconciliation arithmetic."""
+    cols = ", ".join(_CUMULATIVE_SPEND_COLUMNS)
+    if mode:
+        return con.execute(
+            f"SELECT {cols} FROM cumulative_spend_by_task "
+            "WHERE mode = ? ORDER BY run_id",
+            [mode],
+        ).fetchall()
+    return con.execute(
+        f"SELECT {cols} FROM cumulative_spend_by_task ORDER BY run_id"
     ).fetchall()
 
 
@@ -809,7 +935,8 @@ def self_check() -> int:
     """Run the harness end-to-end against the two bundled fixtures.
 
     Returns 0 on PASS, 1 on FAIL. Uses a tmp DuckDB file so the live
-    `state/v2-phase-1/calibration.duckdb` is untouched.
+    default DB (`state/v2-phase-2/calibration.duckdb`) is untouched.
+    `--self-check` is exempt from `--db-path`: it is always hermetic.
     """
     fixture_root = Path(__file__).resolve().parent / "fixtures" / "v2-phase-1"
     try:
@@ -948,6 +1075,16 @@ def _print_rows(columns: tuple[str, ...], rows: Iterable[tuple]) -> None:
         sys.stdout.write("\t".join("" if v is None else str(v) for v in r) + "\n")
 
 
+def _resolve_db_path(cli_db_path: str | None) -> Path:
+    """v2 Phase 3 Step 1: resolve the CLI DuckDB path. An explicit
+    `--db-path` wins (expanded, but not forced-absolute so relative
+    paths still resolve from cwd); otherwise the `db_path()` default
+    (v2-phase-2)."""
+    if cli_db_path:
+        return Path(cli_db_path).expanduser()
+    return db_path()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="harness_v2",
@@ -955,6 +1092,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--self-check", action="store_true",
                         help="Run against bundled fixtures; print PASS/FAIL.")
+    # v2 Phase 3 Step 1: top-level --db-path mirrors calibration_runner's
+    # flag (Finding 1). Threaded into the single open_db() below, so every
+    # DB-touching subcommand honours it. Must precede the subcommand on the
+    # command line (top-level arg under argparse subparsers). Default
+    # resolves to db_path() (v2-phase-2 — the clean baseline). --self-check
+    # is exempt: it stays hermetic against its own tmp DB.
+    parser.add_argument(
+        "--db-path", type=str, default=None,
+        help=(
+            "DuckDB path for all query/ingest subcommands. "
+            "Default: <ANVIL_ROOT>/state/v2-phase-2/calibration.duckdb"
+        ),
+    )
     sub = parser.add_subparsers(dest="command")
 
     p_ing = sub.add_parser("ingest", help="Ingest one run-dir.")
@@ -967,7 +1117,12 @@ def main(argv: list[str] | None = None) -> int:
     p_ops.add_argument("--run-id", type=str, default=None)
 
     p_runs = sub.add_parser("per-run-summary", help="Print per_run_summary view.")
-    p_runs.add_argument("--run-id", type=str, default=None)
+    # v2 Phase 3 Step 1: run_id is a positional (optional) so the brief's
+    # smoke command shape works: `per-run-summary T1-doc-edit-real`.
+    # Omit for all runs. (Replaces the prior --run-id flag on this
+    # subcommand; no code/test consumed the flag form.)
+    p_runs.add_argument("run_id", nargs="?", default=None,
+                        help="optional run_id; omit for all runs")
 
     sub.add_parser("per-task-comparison", help="Print per_task_comparison view.")
 
@@ -985,6 +1140,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_xlsx.add_argument("out_path", type=Path)
 
+    # v2 Phase 3 Step 1: cumulative-spend prints cumulative_spend_by_task
+    # (actual-spend reconciliation). Optional --mode filter (real/mock).
+    p_cum = sub.add_parser(
+        "cumulative-spend",
+        help="Print cumulative_spend_by_task view (actual-spend reconciliation).",
+    )
+    p_cum.add_argument("--mode", type=str, default=None,
+                       choices=["real", "mock", "unknown"],
+                       help="optional mode filter")
+
     args = parser.parse_args(argv)
 
     if args.self_check:
@@ -994,7 +1159,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
-    con = open_db()
+    con = open_db(_resolve_db_path(args.db_path))
     try:
         if args.command == "ingest":
             summary = ingest(con, args.run_dir)
@@ -1022,6 +1187,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "export-xlsx":
             export_xlsx(con, args.out_path)
             print(f"wrote {args.out_path}")
+            return 0
+        if args.command == "cumulative-spend":
+            _print_rows(
+                _CUMULATIVE_SPEND_COLUMNS,
+                query_cumulative_spend(con, args.mode),
+            )
             return 0
     finally:
         con.close()

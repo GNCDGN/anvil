@@ -438,5 +438,207 @@ class TestSelfCheck(unittest.TestCase):
         self.assertEqual(rc, 0)
 
 
+# ---------------------------------------------------------------------------
+# v2 Phase 3 Step 1 — spend_ledger (Candidate A) + cumulative_spend_by_task
+# ---------------------------------------------------------------------------
+
+class TestSpendLedger(_HarnessTestBase):
+    """Candidate A: every ingest appends a ledger row; the prior
+    non-superseded row for the (run_id, mode) is flipped to
+    superseded=TRUE. History accumulates; the overwrite on
+    events/run_metadata is unchanged."""
+
+    def test_spend_ledger_initial_ingest_appends_one_row(self) -> None:
+        harness_v2.ingest(self.con, _CLEAN_DIR)
+        rows = self.con.execute(
+            "SELECT run_id, mode, total_cost_usd, superseded FROM spend_ledger"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "T1-doc-edit-mock")
+        self.assertEqual(rows[0][1], "mock")
+        self.assertGreater(rows[0][2], 0.0)  # non-zero cost snapshot
+        self.assertFalse(rows[0][3])          # current (not superseded)
+
+    def test_spend_ledger_second_ingest_supersedes_first(self) -> None:
+        harness_v2.ingest(self.con, _CLEAN_DIR)
+        harness_v2.ingest(self.con, _CLEAN_DIR)
+        rows = self.con.execute(
+            "SELECT ledger_id, total_cost_usd, superseded, ingest_ts "
+            "FROM spend_ledger WHERE run_id='T1-doc-edit-mock' AND mode='mock' "
+            "ORDER BY ledger_id"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        # Lower ledger_id (the original) is superseded; higher is current.
+        self.assertTrue(rows[0][2])
+        self.assertFalse(rows[1][2])
+        # ingest_ts is non-decreasing (≤ tolerates same-microsecond ties;
+        # the superseded flag, not the ts, is the authoritative order).
+        self.assertLessEqual(rows[0][3], rows[1][3])
+        # cumulative_spend_by_task: n_ingests=2, cumulative=sum, latest=current.
+        cum = self.con.execute(
+            "SELECT n_ingests, cumulative_cost_usd, latest_cost_usd "
+            "FROM cumulative_spend_by_task WHERE run_id='T1-doc-edit-mock'"
+        ).fetchone()
+        self.assertEqual(cum[0], 2)
+        self.assertAlmostEqual(cum[1], rows[0][1] + rows[1][1], places=9)
+        self.assertAlmostEqual(cum[2], rows[1][1], places=9)
+
+    def test_spend_ledger_third_ingest_history_accumulates(self) -> None:
+        for _ in range(3):
+            harness_v2.ingest(self.con, _CLEAN_DIR)
+        flags = [
+            r[0] for r in self.con.execute(
+                "SELECT superseded FROM spend_ledger "
+                "WHERE run_id='T1-doc-edit-mock' ORDER BY ledger_id"
+            ).fetchall()
+        ]
+        self.assertEqual(len(flags), 3)            # not capped at two
+        self.assertEqual(flags.count(True), 2)     # two superseded
+        self.assertEqual(flags.count(False), 1)    # one current
+        self.assertFalse(flags[-1])                # current is the latest
+        n = self.con.execute(
+            "SELECT n_ingests FROM cumulative_spend_by_task "
+            "WHERE run_id='T1-doc-edit-mock'"
+        ).fetchone()[0]
+        self.assertEqual(n, 3)
+
+    def test_spend_ledger_transaction_atomicity(self) -> None:
+        # First ingest commits one current row.
+        harness_v2.ingest(self.con, _CLEAN_DIR)
+        before = self.con.execute(
+            "SELECT ledger_id, superseded FROM spend_ledger ORDER BY ledger_id"
+        ).fetchall()
+        self.assertEqual(len(before), 1)
+        self.assertFalse(before[0][1])
+
+        # Second ingest: inject a failure on the ledger INSERT (after the
+        # superseded UPDATE). The whole transaction must roll back — the
+        # UPDATE that flipped superseded=TRUE must not persist, and no row
+        # is appended. Atomicity proof: the ledger is byte-identical to
+        # `before`, never left with two non-superseded rows.
+        #
+        # DuckDBPyConnection.execute is a read-only C attribute, so it
+        # can't be mock.patch'd. A thin proxy that delegates to the real
+        # connection (same underlying transaction) but raises on the
+        # ledger INSERT does the injection.
+        class _FailOnLedgerInsert:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *a, **kw):
+                if sql.strip().startswith("INSERT INTO spend_ledger"):
+                    raise RuntimeError("injected failure mid-ledger-write")
+                return self._real.execute(sql, *a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        with self.assertRaises(RuntimeError):
+            harness_v2.ingest(_FailOnLedgerInsert(self.con), _CLEAN_DIR)
+
+        after = self.con.execute(
+            "SELECT ledger_id, superseded FROM spend_ledger ORDER BY ledger_id"
+        ).fetchall()
+        self.assertEqual(after, before)  # rollback restored exact prior state
+
+    def test_cumulative_spend_view_reconciliation(self) -> None:
+        # Two ingests of T1-real (a re-run) + one of T2-real.
+        harness_v2.ingest(self.con, _CLEAN_DIR_REAL)
+        harness_v2.ingest(self.con, _CLEAN_DIR_REAL)
+        harness_v2.ingest(self.con, _RETRY_ESC_DIR)
+        # actual_real_spend = SUM over all real ledger rows (3 ingests).
+        actual = self.con.execute(
+            "SELECT SUM(total_cost_usd) FROM spend_ledger WHERE mode='real'"
+        ).fetchone()[0]
+        all_rows = self.con.execute(
+            "SELECT total_cost_usd FROM spend_ledger WHERE mode='real'"
+        ).fetchall()
+        self.assertEqual(len(all_rows), 3)
+        self.assertAlmostEqual(actual, sum(r[0] for r in all_rows), places=9)
+        self.assertGreater(actual, 0.0)
+        # recorded_latest = SUM per_run_summary real (latest only, 2 tasks).
+        recorded = self.con.execute(
+            "SELECT SUM(total_cost_usd) FROM per_run_summary WHERE mode='real'"
+        ).fetchone()[0]
+        # actual - recorded == the one superseded T1-real ingest.
+        superseded_sum = self.con.execute(
+            "SELECT COALESCE(SUM(total_cost_usd), 0.0) FROM spend_ledger "
+            "WHERE mode='real' AND superseded = TRUE"
+        ).fetchone()[0]
+        self.assertAlmostEqual(actual - recorded, superseded_sum, places=9)
+
+
+class TestHarnessCLI(_HarnessTestBase):
+    """v2 Phase 3 Step 1 CLI surface: --db-path threading + the new
+    cumulative-spend subcommand. All invocations pass --db-path to a tmp
+    DB so the live v2-phase-2 default is never touched."""
+
+    def test_harness_cli_db_path_flag(self) -> None:
+        from contextlib import redirect_stdout
+        import io
+        # Regression: the bare-CLI default no longer points at the
+        # pre-`mode` v1 DB (the binder-error root cause).
+        self.assertIn("v2-phase-2", str(harness_v2.db_path()))
+        self.assertNotIn("v2-phase-1", str(harness_v2.db_path()))
+        # --db-path threads end-to-end into ingest + query.
+        db = self.tmp_path / "cli.duckdb"
+        with redirect_stdout(io.StringIO()):
+            rc = harness_v2.main(["--db-path", str(db), "ingest", str(_CLEAN_DIR)])
+        self.assertEqual(rc, 0)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = harness_v2.main(
+                ["--db-path", str(db), "per-run-summary", "T1-doc-edit-mock"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("T1-doc-edit-mock", buf.getvalue())
+
+    def test_harness_cli_cumulative_spend_subcommand(self) -> None:
+        from contextlib import redirect_stdout
+        import io
+        db = self.tmp_path / "cli.duckdb"
+        con = harness_v2.open_db(db)
+        harness_v2.ingest(con, _CLEAN_DIR)
+        harness_v2.ingest(con, _CLEAN_DIR)  # re-run → n_ingests=2
+        con.close()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = harness_v2.main(["--db-path", str(db), "cumulative-spend"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        for col in harness_v2._CUMULATIVE_SPEND_COLUMNS:
+            self.assertIn(col, out)
+        self.assertIn("T1-doc-edit-mock", out)
+        # --mode filter: a real filter excludes the mock-only fixture row.
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            rc2 = harness_v2.main(
+                ["--db-path", str(db), "cumulative-spend", "--mode", "real"]
+            )
+        self.assertEqual(rc2, 0)
+        self.assertNotIn("T1-doc-edit-mock", buf2.getvalue())
+
+
+class TestV1Quarantine(unittest.TestCase):
+    """v2 Phase 3 Step 1: the v1 DB is renamed to calibration-archived.duckdb
+    so the (re-pointed) default CLI can't reach it. `state/` is gitignored,
+    so a fresh checkout / CI carries neither file — skip there."""
+
+    def test_v1_db_quarantine(self) -> None:
+        anvil_root = Path(harness_v2.__file__).resolve().parent.parent
+        original = anvil_root / "state" / "v2-phase-1" / "calibration.duckdb"
+        archived = anvil_root / "state" / "v2-phase-1" / "calibration-archived.duckdb"
+        if not original.exists() and not archived.exists():
+            self.skipTest(
+                "v1 DB absent in this environment (state/ is gitignored); "
+                "quarantine verified manually at deployment"
+            )
+        self.assertFalse(
+            original.exists(),
+            "v1 calibration.duckdb still at original path — quarantine incomplete",
+        )
+        self.assertTrue(archived.exists(), "archived v1 DB missing")
+
+
 if __name__ == "__main__":
     unittest.main()
