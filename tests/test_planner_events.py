@@ -365,5 +365,102 @@ class TestStageCArtefacts(_PlannerEventsBase):
         self.assertEqual(stage_c[0]["data"]["input_tokens"], 5000)
 
 
+def _make_fake_client(*, input_tokens, output_tokens, cache_creation,
+                      cache_read, text="ok"):
+    """v2 Phase 4 Step 1: a fake Anthropic client that exercises the REAL
+    `_call_anthropic` (not mocked at the method level). Captures the
+    kwargs passed to `messages.stream` (so the cache_control request shape
+    can be asserted) and returns a streaming context manager whose
+    `get_final_message()` carries a `usage` namespace with the cache
+    columns. Returns (client, capture_dict)."""
+    capture: dict = {}
+    usage = SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation,
+        cache_read_input_tokens=cache_read,
+    )
+    final = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=text)],
+        usage=usage,
+    )
+    stream_obj = mock.MagicMock()
+    stream_obj.get_final_message.return_value = final
+    cm = mock.MagicMock()
+    cm.__enter__.return_value = stream_obj
+    cm.__exit__.return_value = False
+
+    def _stream(**kwargs):
+        capture.update(kwargs)
+        return cm
+
+    client = mock.MagicMock()
+    client.with_options.return_value = client  # .with_options(timeout=…) → self
+    client.messages.stream.side_effect = _stream
+    return client, capture
+
+
+class TestCacheControl(_PlannerEventsBase):
+    """v2 Phase 4 Step 1: cache_control on the shared system prompt +
+    cache-column recording under the new (list-of-content-blocks) request
+    shape. These exercise the real `_call_anthropic` against a fake
+    streaming client."""
+
+    def test_call_anthropic_passes_cache_control_on_system_prompt(self) -> None:
+        client, capture = _make_fake_client(
+            input_tokens=500, output_tokens=50,
+            cache_creation=2603, cache_read=0,
+        )
+        self.planner._client = client
+        out = self.planner._call_anthropic(
+            system="SYSTEM-PROMPT-TEXT", user="u", timeout=30, step=1, stage="B",
+        )
+        self.assertEqual(out, "ok")
+        # system is now a list of content blocks, with cache_control on the
+        # (single, whole-file) system block.
+        sysparam = capture["system"]
+        self.assertIsInstance(sysparam, list)
+        self.assertEqual(len(sysparam), 1)
+        block = sysparam[0]
+        self.assertEqual(block["type"], "text")
+        self.assertEqual(block["text"], "SYSTEM-PROMPT-TEXT")
+        self.assertEqual(block["cache_control"], {"type": "ephemeral"})
+        # The user prompt is NOT cached (varies per call).
+        self.assertEqual(capture["messages"], [{"role": "user", "content": "u"}])
+
+    def test_call_anthropic_cache_creation_recorded(self) -> None:
+        client, _ = _make_fake_client(
+            input_tokens=500, output_tokens=50,
+            cache_creation=2603, cache_read=0,
+        )
+        self.planner._client = client
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=1, stage="B",
+        )
+        ends = [e for e in self._events_for()
+                if e["kind"] == "planner.stage_b.api_end"]
+        self.assertEqual(len(ends), 1)
+        data = ends[0]["data"]
+        self.assertEqual(data["cache_creation_input_tokens"], 2603)
+        self.assertEqual(data["cache_read_input_tokens"], 0)
+        self.assertEqual(data["input_tokens"], 500)
+
+    def test_call_anthropic_cache_read_recorded(self) -> None:
+        client, _ = _make_fake_client(
+            input_tokens=500, output_tokens=50,
+            cache_creation=0, cache_read=2603,
+        )
+        self.planner._client = client
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=1, stage="B",
+        )
+        ends = [e for e in self._events_for()
+                if e["kind"] == "planner.stage_b.api_end"]
+        self.assertEqual(len(ends), 1)
+        data = ends[0]["data"]
+        self.assertEqual(data["cache_creation_input_tokens"], 0)
+        self.assertEqual(data["cache_read_input_tokens"], 2603)
+
+
 if __name__ == "__main__":
     unittest.main()

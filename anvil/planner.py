@@ -203,10 +203,28 @@ class Planner:
         def _attempt() -> str:
             client = self._client.with_options(timeout=timeout)
             t0 = time.monotonic()
+            # v2 Phase 4 Step 1: wrap the system prompt as a single cached
+            # content block (cache_control: ephemeral). The whole
+            # planner-system.md is the cache prefix (Step 0 Finding 4); one
+            # marker covers both Stage A and Stage B because they pass the
+            # same self._system_prompt (Finding 6). An empty/falsy system
+            # passes through unchanged — an empty text block with
+            # cache_control is API-rejected, and the 1024-token minimum
+            # means caching only ever applies to the real (~2,603-token)
+            # prompt anyway.
+            system_param = (
+                [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+                if system
+                else system
+            )
             with client.messages.stream(
                 model=self.model,
                 max_tokens=8192,
-                system=system,
+                system=system_param,
                 messages=[{"role": "user", "content": user}],
             ) as stream:
                 final = stream.get_final_message()
