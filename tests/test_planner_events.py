@@ -520,5 +520,74 @@ class TestRoutingObservability(_PlannerEventsBase):
         self.assertEqual(fs["context_paths_count"], 2)
 
 
+class TestShadowDecisionPairing(_PlannerEventsBase):
+    """v3 Phase 0 Step 2 (V3P0-3): every Planner stage call emits a
+    shadow.decision immediately after its planner.stage_X.api_end, reusing
+    that emit's features_seen + route_actual. Exercises the real
+    _call_anthropic against a fake streaming client."""
+
+    def test_shadow_decision_follows_api_end(self) -> None:
+        client, _ = _make_fake_client(
+            input_tokens=620, output_tokens=40, cache_creation=0, cache_read=2603,
+        )
+        self.planner._client = client
+        self.planner._current_step_idx = 1
+        self.planner._current_context_paths_count = 5
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=2, stage="B",
+        )
+        evs = self._events_for()
+        kinds = [e["kind"] for e in evs]
+        # shadow.decision is emitted, immediately after the api_end.
+        self.assertIn("shadow.decision", kinds)
+        i_api = kinds.index("planner.stage_b.api_end")
+        i_shadow = kinds.index("shadow.decision")
+        self.assertEqual(i_shadow, i_api + 1)
+        sd = evs[i_shadow]["data"]
+        self.assertEqual(sd["stage"], "B")
+        self.assertEqual(sd["shadow_route_candidate"], "claude-opus-4-7")
+        self.assertEqual(sd["actual_route_taken"], "claude-opus-4-7-test")
+        # agreement: candidate (opus-4-7) vs actual (the test model string)
+        # — they differ here only because the test planner uses a sentinel
+        # model; the logic is exercised either way.
+        self.assertEqual(
+            sd["agreement"],
+            sd["shadow_route_candidate"] == sd["actual_route_taken"],
+        )
+        # basis is the same features_seen dict the api_end carried.
+        self.assertEqual(sd["shadow_decision_basis"],
+                         evs[i_api]["data"]["features_seen"])
+
+    def test_one_shadow_per_planner_stage_in_full_plan_step(self) -> None:
+        # A full plan_step (Stage A + Stage B) → 2 api_end → 2 shadow rows.
+        side = _make_fake({"A": [_STAGE_A_VALID], "B": [_STAGE_B_VALID]})
+
+        def _side_with_shadow(self, system, user, timeout, *, step, stage):
+            # The fake _call_anthropic must also emit the paired shadow,
+            # mirroring the production wrapper (which the method-level mock
+            # bypasses). Reuse the production helper for fidelity.
+            text = side(self, system, user, timeout, step=step, stage=stage)
+            events.emit_shadow_decision(
+                stage=stage,
+                step_idx=getattr(self, "_current_step_idx", None),
+                features_seen=events._compute_features_seen(
+                    stage, getattr(self, "_current_step_idx", None), 100,
+                    getattr(self, "_current_context_paths_count", None),
+                ),
+                actual_route_taken=self.model,
+            )
+            return text
+
+        with mock.patch.object(
+            Planner, "_call_anthropic", autospec=True,
+            side_effect=_side_with_shadow,
+        ):
+            self.planner.plan_step(self.brief, self.state, 0)
+        shadow = [e for e in self._events_for()
+                  if e["kind"] == "shadow.decision"]
+        self.assertEqual(len(shadow), 2)
+        self.assertEqual({s["data"]["stage"] for s in shadow}, {"A", "B"})
+
+
 if __name__ == "__main__":
     unittest.main()

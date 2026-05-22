@@ -149,6 +149,21 @@ class MockedPlanner(Planner):
         # view filters on model).
         stage_key = stage.lower()
         observed_input_tokens = int(usage.get("input_tokens", 0))
+        # v3 Phase 0 Step 1 (V3P0-1): routing observability, same shape as
+        # the production wrapper. route_actual is self.model (the inherited
+        # plan_step / Stage-C path stashes _current_context_paths_count
+        # before this override runs, since MockedPlanner overrides only
+        # _call_anthropic). Built once so the paired Step 2 shadow.decision
+        # reuses features_seen + route_actual.
+        routing = _events.routing_observability(
+            stage=stage,
+            step_idx=step_idx,
+            observed_prompt_token_count=observed_input_tokens,
+            context_paths_count=getattr(
+                self, "_current_context_paths_count", None
+            ),
+            route_actual=self.model,
+        )
         _events.emit(
             f"planner.stage_{stage_key}.api_end",
             {
@@ -160,23 +175,18 @@ class MockedPlanner(Planner):
                 "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0)),
                 "duration_ms": jitter_ms,
                 "ok": True,
-                # v3 Phase 0 Step 1 (V3P0-1): routing observability,
-                # same shape as the production wrapper. route_actual is
-                # self.model (the inherited plan_step / Stage-C path
-                # stashes _current_context_paths_count before this
-                # override runs, since MockedPlanner overrides only
-                # _call_anthropic).
-                **_events.routing_observability(
-                    stage=stage,
-                    step_idx=step_idx,
-                    observed_prompt_token_count=observed_input_tokens,
-                    context_paths_count=getattr(
-                        self, "_current_context_paths_count", None
-                    ),
-                    route_actual=self.model,
-                ),
+                **routing,
             },
             step_idx=step_idx,
+        )
+        # v3 Phase 0 Step 2 (V3P0-3): paired shadow.decision after the
+        # synthesised api_end, so mock-mode Planner events get a shadow
+        # row too (criterion 1: every Planner stage event in a sweep).
+        _events.emit_shadow_decision(
+            stage=stage,
+            step_idx=step_idx,
+            features_seen=routing["features_seen"],
+            actual_route_taken=routing["route_actual"],
         )
 
         return text

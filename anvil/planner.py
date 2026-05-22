@@ -255,6 +255,19 @@ class Planner:
             # keyed on the `stage` kwarg. Stage A/B/C all flow through
             # here; the [planner] log line above stays unchanged for
             # backward-compat with tools/exam_harness.py.
+            # v3 Phase 0 Step 1 (V3P0-1): routing observability. Passive —
+            # route_actual is self.model (Opus); observed prompt size is the
+            # API's reported input_tokens. Built once so the paired Step 2
+            # shadow.decision can reuse features_seen + route_actual.
+            routing = _events.routing_observability(
+                stage=stage,
+                step_idx=getattr(self, "_current_step_idx", None),
+                observed_prompt_token_count=u.input_tokens,
+                context_paths_count=getattr(
+                    self, "_current_context_paths_count", None
+                ),
+                route_actual=self.model,
+            )
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
                 {
@@ -268,20 +281,18 @@ class Planner:
                         u.cache_read_input_tokens or 0,
                     "duration_ms": int(duration * 1000),
                     "ok": True,
-                    # v3 Phase 0 Step 1 (V3P0-1): routing observability.
-                    # Passive — route_actual is self.model (Opus); the
-                    # observed prompt size is the API's reported input_tokens.
-                    **_events.routing_observability(
-                        stage=stage,
-                        step_idx=getattr(self, "_current_step_idx", None),
-                        observed_prompt_token_count=u.input_tokens,
-                        context_paths_count=getattr(
-                            self, "_current_context_paths_count", None
-                        ),
-                        route_actual=self.model,
-                    ),
+                    **routing,
                 },
                 step_idx=getattr(self, "_current_step_idx", None),
+            )
+            # v3 Phase 0 Step 2 (V3P0-3): paired shadow.decision, fired
+            # immediately after the api_end. Phase 0 placeholder always
+            # agrees with the actual Opus route.
+            _events.emit_shadow_decision(
+                stage=stage,
+                step_idx=getattr(self, "_current_step_idx", None),
+                features_seen=routing["features_seen"],
+                actual_route_taken=routing["route_actual"],
             )
             return text
 
@@ -308,6 +319,18 @@ class Planner:
                         f"[planner] step={step} stage={stage} "
                         f"rate-limit/timeout twice ({e2}); returning empty"
                     )
+                    # v3 Phase 0 Step 1 (V3P0-1): error-path api_end still
+                    # carries the five fields; observed_prompt_token_count
+                    # is None (the call failed, no usage was returned).
+                    routing = _events.routing_observability(
+                        stage=stage,
+                        step_idx=getattr(self, "_current_step_idx", None),
+                        observed_prompt_token_count=None,
+                        context_paths_count=getattr(
+                            self, "_current_context_paths_count", None
+                        ),
+                        route_actual=self.model,
+                    )
                     _events.emit(
                         f"planner.stage_{stage.lower()}.api_end",
                         {
@@ -315,27 +338,35 @@ class Planner:
                             "model": self.model,
                             "ok": False,
                             "error": "rate-limit/timeout",
-                            # v3 Phase 0 Step 1 (V3P0-1): error-path
-                            # api_end still carries the five fields;
-                            # observed_prompt_token_count is None (the
-                            # call failed, no usage was returned).
-                            **_events.routing_observability(
-                                stage=stage,
-                                step_idx=getattr(self, "_current_step_idx", None),
-                                observed_prompt_token_count=None,
-                                context_paths_count=getattr(
-                                    self, "_current_context_paths_count", None
-                                ),
-                                route_actual=self.model,
-                            ),
+                            **routing,
                         },
                         step_idx=getattr(self, "_current_step_idx", None),
+                    )
+                    # v3 Phase 0 Step 2 (V3P0-3): paired shadow.decision on
+                    # the error path too, so the 1:1 invariant (one shadow
+                    # row per api_end) holds on every path.
+                    _events.emit_shadow_decision(
+                        stage=stage,
+                        step_idx=getattr(self, "_current_step_idx", None),
+                        features_seen=routing["features_seen"],
+                        actual_route_taken=routing["route_actual"],
                     )
                     return ""
         except Exception as e:  # noqa: BLE001 — never-raise contract
             log.error(
                 f"[planner] step={step} stage={stage} call failed "
                 f"({e}); returning empty"
+            )
+            # v3 Phase 0 Step 1 (V3P0-1): error-path api_end carries the
+            # five fields; no usage on this path.
+            routing = _events.routing_observability(
+                stage=stage,
+                step_idx=getattr(self, "_current_step_idx", None),
+                observed_prompt_token_count=None,
+                context_paths_count=getattr(
+                    self, "_current_context_paths_count", None
+                ),
+                route_actual=self.model,
             )
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
@@ -344,19 +375,16 @@ class Planner:
                     "model": self.model,
                     "ok": False,
                     "error": str(e)[:300],
-                    # v3 Phase 0 Step 1 (V3P0-1): error-path api_end
-                    # carries the five fields; no usage on this path.
-                    **_events.routing_observability(
-                        stage=stage,
-                        step_idx=getattr(self, "_current_step_idx", None),
-                        observed_prompt_token_count=None,
-                        context_paths_count=getattr(
-                            self, "_current_context_paths_count", None
-                        ),
-                        route_actual=self.model,
-                    ),
+                    **routing,
                 },
                 step_idx=getattr(self, "_current_step_idx", None),
+            )
+            # v3 Phase 0 Step 2 (V3P0-3): paired shadow.decision (1:1).
+            _events.emit_shadow_decision(
+                stage=stage,
+                step_idx=getattr(self, "_current_step_idx", None),
+                features_seen=routing["features_seen"],
+                actual_route_taken=routing["route_actual"],
             )
             return ""
 

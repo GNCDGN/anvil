@@ -163,6 +163,27 @@ class TestMockedPlannerCallAnthropic(_MockedTestBase):
         # observed_prompt_token_count mirrors input_tokens (T1-step0.usage.json).
         self.assertEqual(fs["observed_prompt_token_count"], d["input_tokens"])
 
+    def test_synthesised_emit_pairs_shadow_decision(self) -> None:
+        # v3 Phase 0 Step 2 (V3P0-3): the mock path emits a paired
+        # shadow.decision after its synthesised api_end (criterion 1).
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        p = MockedPlanner(model="claude-opus-4-7")
+        p._current_step_idx = 0
+        p._current_context_paths_count = 0
+        p._call_anthropic(system="(sys)", user="(usr)", timeout=30,
+                          step=1, stage="A")
+        evs = self._events()
+        kinds = [e["kind"] for e in evs]
+        self.assertIn("shadow.decision", kinds)
+        # Immediately after the api_end.
+        i_api = kinds.index("planner.stage_a.api_end")
+        self.assertEqual(kinds[i_api + 1], "shadow.decision")
+        sd = evs[i_api + 1]["data"]
+        self.assertEqual(sd["stage"], "A")
+        self.assertEqual(sd["shadow_route_candidate"], "claude-opus-4-7")
+        self.assertEqual(sd["actual_route_taken"], "claude-opus-4-7")
+        self.assertTrue(sd["agreement"])
+
     def test_missing_task_id_raises(self) -> None:
         os.environ["MOCKED_TASK_ID"] = ""
         p = MockedPlanner(model="claude-opus-4-7")

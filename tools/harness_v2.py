@@ -211,6 +211,31 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    # v3 Phase 0 Step 2 (V3P0-3): shadow_decisions — per Planner call,
+    # what a hypothetical shadow router WOULD have decided vs what the
+    # code actually did. Append-shaped per (run_id, mode) like events:
+    # ingest DELETE-then-INSERTs on the same composite key (V2P2-2). The
+    # `policy_version` column carries Step 1's literal placeholder by
+    # default so Phase 1's first real policy populates the existing
+    # column rather than triggering an ALTER TABLE migration. CREATE ...
+    # IF NOT EXISTS migrates an existing DB on next open without touching
+    # its data.
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shadow_decisions (
+            run_id                 VARCHAR NOT NULL,
+            mode                   VARCHAR NOT NULL,
+            step_idx               INTEGER,
+            stage                  VARCHAR,
+            ts                     TIMESTAMP,
+            shadow_route_candidate VARCHAR,
+            shadow_decision_basis  JSON,
+            actual_route_taken     VARCHAR,
+            agreement              BOOLEAN,
+            policy_version         VARCHAR NOT NULL DEFAULT 'v3-phase-0-passive'
+        )
+        """
+    )
     con.execute(_OPERATIONS_VIEW_SQL)
     con.execute(_PER_RUN_SUMMARY_VIEW_SQL)
     con.execute(_PER_TASK_COMPARISON_VIEW_SQL)
@@ -220,6 +245,9 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     # v2 Phase 3 Step 1: cumulative_spend_by_task SELECTs from
     # spend_ledger (above) and run_metadata (task_id).
     con.execute(_CUMULATIVE_SPEND_VIEW_SQL)
+    # v3 Phase 0 Step 2 (V3P0-3): champion_challenger_comparison SELECTs
+    # from shadow_decisions + operations + run_metadata; registered last.
+    con.execute(_CHAMPION_CHALLENGER_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +634,67 @@ _CUMULATIVE_SPEND_COLUMNS: tuple[str, ...] = (
 )
 
 
+# v3 Phase 0 Step 2 (V3P0-3): champion_challenger_comparison.
+#
+# Per (stage, policy_version, task_id): how often the shadow router
+# agreed with the actual route, disagreed, and how many fallbacks fired.
+# Phase 0's placeholder shadow rule always picks Opus and the actual
+# Planner route is always Opus, so agreement_count == total and
+# disagreement_count == 0 on every row; fallback_fired_count is always 0
+# (no fallback paths exist). Phase 1's first real Stage A rule produces
+# the first non-zero disagreement/fallback delta against this baseline.
+#
+# Built as two independently-aggregated CTEs joined on (stage, task_id)
+# rather than a row-level join, so a Stage B retry (two stage_b.api_end
+# rows + two paired shadow.decision rows at one step_idx) does NOT
+# fan-out the counts — each CTE aggregates its own table directly.
+# task_id is derived via the run_metadata JOIN (mirrors the operations
+# view's pattern) rather than an inline derive_task regex, so the regex
+# stays in one place. The view carries task_id so it is joinable to
+# per_task_comparison.
+#
+# ops_agg's stage comes from features_seen.stage (the same "A"/"B"/"C"
+# letters shadow_decisions.stage carries); the WHERE filters to Planner
+# api_end rows so Coder rows (stage="coder") don't enter the comparison.
+_CHAMPION_CHALLENGER_VIEW_SQL = """
+CREATE OR REPLACE VIEW champion_challenger_comparison AS
+WITH shadow_agg AS (
+    SELECT
+        sd.stage AS stage,
+        rm.task_id AS task_id,
+        COUNT(*) FILTER (WHERE sd.agreement = TRUE)  AS agreement_count,
+        COUNT(*) FILTER (WHERE sd.agreement = FALSE) AS disagreement_count
+    FROM shadow_decisions sd
+    LEFT JOIN run_metadata rm USING (run_id, mode)
+    GROUP BY sd.stage, rm.task_id
+),
+ops_agg AS (
+    SELECT
+        json_extract_string(features_seen, '$.stage') AS stage,
+        task_id,
+        ANY_VALUE(policy_version) AS policy_version,
+        COUNT(*) FILTER (WHERE route_fallback_fired = TRUE) AS fallback_fired_count
+    FROM operations
+    WHERE operation_kind LIKE 'planner.stage_%.api_end'
+    GROUP BY json_extract_string(features_seen, '$.stage'), task_id
+)
+SELECT
+    s.stage,
+    o.policy_version,
+    s.task_id,
+    s.agreement_count,
+    s.disagreement_count,
+    COALESCE(o.fallback_fired_count, 0) AS fallback_fired_count
+FROM shadow_agg s
+LEFT JOIN ops_agg o ON s.stage = o.stage AND s.task_id = o.task_id
+"""
+
+_CHAMPION_CHALLENGER_COLUMNS: tuple[str, ...] = (
+    "stage", "policy_version", "task_id",
+    "agreement_count", "disagreement_count", "fallback_fired_count",
+)
+
+
 # ---------------------------------------------------------------------------
 # Ingest
 # ---------------------------------------------------------------------------
@@ -697,6 +786,14 @@ def ingest(con: duckdb.DuckDBPyConnection, run_dir: Path) -> dict:
             "DELETE FROM run_metadata WHERE run_id = ? AND mode = ?",
             [run_id, mode],
         )
+        # v3 Phase 0 Step 2 (V3P0-3): shadow_decisions shares the events
+        # composite-key DELETE-then-INSERT idempotency (V2P2-2). Deleted
+        # here inside the same transaction; rows re-inserted from the
+        # shadow.decision events below.
+        con.execute(
+            "DELETE FROM shadow_decisions WHERE run_id = ? AND mode = ?",
+            [run_id, mode],
+        )
         con.execute(
             "INSERT INTO run_metadata (run_id, mode, task_id, task_label) "
             "VALUES (?, ?, ?, ?)",
@@ -716,6 +813,37 @@ def ingest(con: duckdb.DuckDBPyConnection, run_dir: Path) -> dict:
                     ev.get("kind"),
                     json.dumps(ev.get("data") or {}),
                     int(ev.get("elapsed_ms") or 0),
+                ],
+            )
+        # v3 Phase 0 Step 2 (V3P0-3): populate shadow_decisions from the
+        # shadow.decision events in the same JSONL. One table row per
+        # event; fields read from the event's `data` payload. step_idx
+        # comes from the event top-level (consistent with the events
+        # table); policy_version is omitted so the column DEFAULT
+        # ('v3-phase-0-passive') applies in Phase 0.
+        for ev in rows:
+            if ev.get("kind") != "shadow.decision":
+                continue
+            d = ev.get("data") or {}
+            con.execute(
+                """
+                INSERT INTO shadow_decisions
+                    (run_id, mode, step_idx, stage, ts,
+                     shadow_route_candidate, shadow_decision_basis,
+                     actual_route_taken, agreement)
+                VALUES (?, ?, ?, ?, CAST(? AS TIMESTAMP),
+                        ?, CAST(? AS JSON), ?, ?)
+                """,
+                [
+                    ev.get("run_id") or run_id,
+                    mode,
+                    ev.get("step_idx"),
+                    d.get("stage"),
+                    ev.get("ts"),
+                    d.get("shadow_route_candidate"),
+                    json.dumps(d.get("shadow_decision_basis") or {}),
+                    d.get("actual_route_taken"),
+                    d.get("agreement"),
                 ],
             )
         # v2 Phase 3 Step 1: append to spend_ledger inside the SAME
@@ -1048,6 +1176,55 @@ def self_check() -> int:
                 )
                 return 1
 
+            # v3 Phase 0 Step 2 (V3P0-3): shadow-decision recorder. The
+            # T1 mock+real fixtures each carry 2 paired shadow.decision
+            # events (one per planner stage api_end) → 4 shadow rows. The
+            # T2/T3 fixtures predate Step 2 and carry no shadow events, so
+            # the 1:1 invariant is checked scoped to T1 here; the global
+            # "every planner call emits a paired shadow" invariant is
+            # verified by the mock-only smoke (fresh full-instrumentation
+            # run). policy_version on champion_challenger is NULL in this
+            # self-check because the pre-Step-1 golden fixtures' api_end
+            # rows lack features_seen — the column populates in the smoke.
+            shadow_rows = con.execute(
+                "SELECT stage, agreement FROM shadow_decisions"
+            ).fetchall()
+            t1_planner_api_ends = con.execute(
+                "SELECT COUNT(*) FROM events "
+                "WHERE kind LIKE 'planner.stage_%.api_end' "
+                "  AND run_id IN ('T1-doc-edit-mock', 'T1-doc-edit-real')"
+            ).fetchone()[0]
+            if len(shadow_rows) != t1_planner_api_ends:
+                print(
+                    "self-check: FAIL — shadow_decisions rows "
+                    f"({len(shadow_rows)}) != T1 planner stage api_end "
+                    f"events ({t1_planner_api_ends})"
+                )
+                return 1
+            if not shadow_rows:
+                print("self-check: FAIL — no shadow_decisions rows ingested")
+                return 1
+            # agreement = TRUE on 100% of rows (Phase 0 placeholder always
+            # picks Opus, matching the actual Opus route).
+            disagreements = [r for r in shadow_rows if r[1] is not True]
+            if disagreements:
+                print(
+                    "self-check: FAIL — shadow agreement not 100% "
+                    f"({len(disagreements)} of {len(shadow_rows)} disagree)"
+                )
+                return 1
+            # champion_challenger_comparison returns rows (one per
+            # stage × task; T1 contributes stage A and B).
+            cc_rows = con.execute(
+                "SELECT * FROM champion_challenger_comparison"
+            ).fetchall()
+            if len(cc_rows) < 1:
+                print(
+                    "self-check: FAIL — champion_challenger_comparison "
+                    "returned 0 rows"
+                )
+                return 1
+
             xlsx_path = tmp_path / "self-check.xlsx"
             export_xlsx(con, xlsx_path)
             if not xlsx_path.is_file():
@@ -1077,7 +1254,8 @@ def self_check() -> int:
             con.close()
         print(
             f"self-check: PASS ({len(ops)} ops, {len(runs)} runs, "
-            f"{len(tasks)} tasks, {len(episodes)} episodes)"
+            f"{len(tasks)} tasks, {len(episodes)} episodes, "
+            f"{len(shadow_rows)} shadow)"
         )
         return 0
     except Exception as e:  # noqa: BLE001

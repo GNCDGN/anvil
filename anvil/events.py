@@ -84,7 +84,7 @@ def _real_append(path: Path, text: str) -> None:
 log = logging.getLogger("anvil.events")
 
 # ---------------------------------------------------------------------------
-# Event-kind catalogue (45 kinds)
+# Event-kind catalogue (46 kinds)
 # ---------------------------------------------------------------------------
 
 VALID_KINDS: frozenset[str] = frozenset({
@@ -136,8 +136,10 @@ VALID_KINDS: frozenset[str] = frozenset({
     "state.write",
     # Escalation (2)
     "escalation.raised", "escalation.resolved",
+    # v3 Phase 0 Step 2 (V3P0-3): shadow-decision recorder (1)
+    "shadow.decision",
 })
-assert len(VALID_KINDS) == 45, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
+assert len(VALID_KINDS) == 46, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
 
 # ---------------------------------------------------------------------------
 # v3 Phase 0 Step 1 — routing observability (V3P0-1)
@@ -201,6 +203,62 @@ def routing_observability(
             stage, step_idx, observed_prompt_token_count, context_paths_count
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# v3 Phase 0 Step 2 — shadow-decision recorder (V3P0-3)
+#
+# Per Planner call, record what a hypothetical shadow router WOULD have
+# decided alongside what the code actually did. Phase 0 ships exactly one
+# placeholder rule: the shadow always picks Opus, so it always agrees with
+# reality — the point is to prove the recording mechanism works, not to
+# make a real decision. Phase 1 lands the first real Stage A rule inside
+# `_compute_shadow_decision`. The emit fires immediately after each
+# `planner.stage_X.api_end`, sharing that event's `features_seen` dict as
+# the decision basis and its `route_actual` as the actual route taken.
+# ---------------------------------------------------------------------------
+
+SHADOW_ROUTE_PHASE_0 = "claude-opus-4-7"
+
+
+def _compute_shadow_decision(features_seen: dict[str, Any]) -> str:
+    """Phase 0 placeholder shadow rule: unconditionally Opus.
+
+    `features_seen` is accepted but ignored in Phase 0 — Phase 1's first
+    real Stage A rule reads it (prompt token count, context_paths_count,
+    stage) to decide whether a cheaper route would have sufficed. Keeping
+    the signature feature-aware now means Phase 1 changes only this body.
+    """
+    return SHADOW_ROUTE_PHASE_0
+
+
+def emit_shadow_decision(
+    *,
+    stage: str,
+    step_idx: int | None,
+    features_seen: dict[str, Any],
+    actual_route_taken: str | None,
+) -> bool:
+    """Emit one `shadow.decision` event pairing the shadow router's
+    candidate against the actual route taken.
+
+    `agreement` is `shadow_route_candidate == actual_route_taken`. In
+    Phase 0 the candidate is always Opus and the actual Planner route is
+    always Opus, so agreement is always True — the recorder proves the
+    mechanism end-to-end. Never raises (delegates to `emit`).
+    """
+    candidate = _compute_shadow_decision(features_seen)
+    return emit(
+        "shadow.decision",
+        {
+            "stage": stage,
+            "shadow_route_candidate": candidate,
+            "shadow_decision_basis": features_seen,
+            "actual_route_taken": actual_route_taken,
+            "agreement": candidate == actual_route_taken,
+        },
+        step_idx=step_idx,
+    )
 
 
 # ---------------------------------------------------------------------------

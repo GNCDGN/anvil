@@ -91,12 +91,13 @@ class TestEventSchema(_EventsTestBase):
             )
 
     def test_valid_kinds_catalogue_size(self) -> None:
-        # Pinned at 45 by the module's assert; this test surfaces drift
-        # at the test-suite level too.
-        self.assertEqual(len(events.VALID_KINDS), 45)
+        # Pinned at 46 by the module's assert; this test surfaces drift
+        # at the test-suite level too. (45 → 46: v3 Phase 0 Step 2 added
+        # "shadow.decision".)
+        self.assertEqual(len(events.VALID_KINDS), 46)
         # A few canonical kinds present:
         for k in ("run.start", "planner.stage_b.api_end",
-                  "ssh.stage.end", "telegram.poll.reply"):
+                  "ssh.stage.end", "telegram.poll.reply", "shadow.decision"):
             self.assertIn(k, events.VALID_KINDS)
 
 
@@ -375,6 +376,67 @@ class TestRoutingObservability(_EventsTestBase):
         self.assertEqual(data["features_seen"]["observed_prompt_token_count"], 777)
         self.assertEqual(data["features_seen"]["stage"], "B")
         self.assertEqual(data["features_seen"]["context_paths_count"], 3)
+
+
+class TestShadowDecision(_EventsTestBase):
+    """v3 Phase 0 Step 2 (V3P0-3): the shadow.decision kind validates and
+    emit_shadow_decision produces the right shape + agreement logic."""
+
+    def test_shadow_decision_kind_validates(self) -> None:
+        self.assertIn("shadow.decision", events.VALID_KINDS)
+        e = events.Event(
+            ts="2026-05-20T10:15:42.000+00:00",
+            run_id="r1",
+            kind="shadow.decision",
+            data={},
+        )
+        self.assertEqual(e.kind, "shadow.decision")
+
+    def test_compute_shadow_decision_is_opus_phase_0(self) -> None:
+        # Phase 0 placeholder: unconditionally Opus, ignoring features.
+        self.assertEqual(
+            events._compute_shadow_decision({"stage": "A"}),
+            "claude-opus-4-7",
+        )
+        self.assertEqual(events.SHADOW_ROUTE_PHASE_0, "claude-opus-4-7")
+
+    def test_emit_shadow_decision_agrees_when_actual_is_opus(self) -> None:
+        events.begin_run("r1")
+        basis = {"observed_prompt_token_count": 500, "step_idx": 0,
+                 "stage": "B", "context_paths_count": 4}
+        ok = events.emit_shadow_decision(
+            stage="B", step_idx=0, features_seen=basis,
+            actual_route_taken="claude-opus-4-7",
+        )
+        self.assertTrue(ok)
+        events.end_run()
+        rows = [r for r in self._read_events("r1")
+                if r["kind"] == "shadow.decision"]
+        self.assertEqual(len(rows), 1)
+        d = rows[0]["data"]
+        self.assertEqual(d["stage"], "B")
+        self.assertEqual(d["shadow_route_candidate"], "claude-opus-4-7")
+        self.assertEqual(d["actual_route_taken"], "claude-opus-4-7")
+        self.assertTrue(d["agreement"])
+        # The basis is the features_seen dict, preserved verbatim.
+        self.assertEqual(d["shadow_decision_basis"], basis)
+        self.assertEqual(rows[0]["step_idx"], 0)
+
+    def test_emit_shadow_decision_disagrees_when_actual_differs(self) -> None:
+        # Agreement is computed, not hardcoded: a non-Opus actual route
+        # (cannot happen in Phase 0, but the logic must be correct for
+        # Phase 1) yields agreement=False.
+        events.begin_run("r1")
+        events.emit_shadow_decision(
+            stage="A", step_idx=2, features_seen={"stage": "A"},
+            actual_route_taken="claude-haiku-4-5",
+        )
+        events.end_run()
+        row = next(r for r in self._read_events("r1")
+                   if r["kind"] == "shadow.decision")
+        self.assertEqual(row["data"]["shadow_route_candidate"], "claude-opus-4-7")
+        self.assertEqual(row["data"]["actual_route_taken"], "claude-haiku-4-5")
+        self.assertFalse(row["data"]["agreement"])
 
 
 if __name__ == "__main__":

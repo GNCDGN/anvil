@@ -796,5 +796,144 @@ class TestCoderCostFromReported(_HarnessTestBase):
         self.assertEqual(row[2], 10315)
 
 
+class TestShadowDecisions(_HarnessTestBase):
+    """v3 Phase 0 Step 2 (V3P0-3): shadow_decisions ingest + idempotency,
+    and the champion_challenger_comparison view aggregation."""
+
+    def _routing(self, stage, *, fallback=False):
+        return {
+            "route_candidate": "claude-opus-4-7",
+            "route_actual": "claude-opus-4-7",
+            "route_fallback_fired": fallback,
+            "policy_version": "v3-phase-0-passive",
+            "features_seen": {
+                "observed_prompt_token_count": 500, "step_idx": 0,
+                "stage": stage, "context_paths_count": 2,
+            },
+        }
+
+    def _shadow_data(self, stage, *, agreement=True, actual="claude-opus-4-7"):
+        return {
+            "stage": stage,
+            "shadow_route_candidate": "claude-opus-4-7",
+            "shadow_decision_basis": {
+                "observed_prompt_token_count": 500, "step_idx": 0,
+                "stage": stage, "context_paths_count": 2,
+            },
+            "actual_route_taken": actual,
+            "agreement": agreement,
+        }
+
+    def _ingest_shadow_run(self, run_id="T9-shadow", *, fallback=False,
+                           b_agreement=True, b_actual="claude-opus-4-7"):
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 500,
+                        "output_tokens": 50, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0, "duration_ms": 900,
+                        "ok": True, **self._routing("A")},
+                       run_id=run_id, step_idx=0),
+            _event_row(11, "shadow.decision", self._shadow_data("A"),
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "planner.stage_b.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 500,
+                        "output_tokens": 50, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0, "duration_ms": 900,
+                        "ok": True, **self._routing("B", fallback=fallback)},
+                       run_id=run_id, step_idx=0),
+            _event_row(21, "shadow.decision",
+                       self._shadow_data("B", agreement=b_agreement,
+                                         actual=b_actual),
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        return harness_v2.ingest(self.con, run_dir)
+
+    def test_shadow_decisions_ingest(self) -> None:
+        self._ingest_shadow_run()
+        rows = self.con.execute(
+            "SELECT stage, shadow_route_candidate, actual_route_taken, "
+            "       agreement, policy_version, "
+            "       json_extract_string(shadow_decision_basis, '$.stage') "
+            "FROM shadow_decisions WHERE run_id = 'T9-shadow' ORDER BY stage"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        for r, stage in zip(rows, ("A", "B")):
+            self.assertEqual(r[0], stage)
+            self.assertEqual(r[1], "claude-opus-4-7")
+            self.assertEqual(r[2], "claude-opus-4-7")
+            self.assertIs(r[3], True)
+            # policy_version column default applied at ingest (Phase 0).
+            self.assertEqual(r[4], "v3-phase-0-passive")
+            # shadow_decision_basis stored as JSON, reachable in-place.
+            self.assertEqual(r[5], stage)
+
+    def test_shadow_decisions_idempotent_reingest(self) -> None:
+        # V2P2-2 (run_id, mode) composite-key invariant: re-ingest is
+        # DELETE-then-INSERT, no duplicate rows.
+        self._ingest_shadow_run()
+        first = self.con.execute(
+            "SELECT COUNT(*) FROM shadow_decisions WHERE run_id='T9-shadow'"
+        ).fetchone()[0]
+        self._ingest_shadow_run()
+        second = self.con.execute(
+            "SELECT COUNT(*) FROM shadow_decisions WHERE run_id='T9-shadow'"
+        ).fetchone()[0]
+        self.assertEqual(first, 2)
+        self.assertEqual(second, 2)
+
+    def test_champion_challenger_all_agree(self) -> None:
+        self._ingest_shadow_run()
+        rows = self.con.execute(
+            "SELECT stage, policy_version, task_id, agreement_count, "
+            "       disagreement_count, fallback_fired_count "
+            "FROM champion_challenger_comparison "
+            "WHERE task_id = 'T9' ORDER BY stage"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)  # stage A, B
+        for r, stage in zip(rows, ("A", "B")):
+            self.assertEqual(r[0], stage)
+            # policy_version populates from the operations join (the
+            # synthetic api_end rows carry features_seen + policy_version).
+            self.assertEqual(r[1], "v3-phase-0-passive")
+            self.assertEqual(r[2], "T9")
+            self.assertEqual(r[3], 1)   # agreement_count
+            self.assertEqual(r[4], 0)   # disagreement_count
+            self.assertEqual(r[5], 0)   # fallback_fired_count
+
+    def test_champion_challenger_counts_disagreement_and_fallback(self) -> None:
+        # Phase 0 never produces these, but the view's FILTER logic must
+        # compute them correctly for Phase 1's first real shadow rule.
+        self._ingest_shadow_run(fallback=True, b_agreement=False,
+                                b_actual="claude-haiku-4-5")
+        row_b = self.con.execute(
+            "SELECT agreement_count, disagreement_count, fallback_fired_count "
+            "FROM champion_challenger_comparison "
+            "WHERE task_id = 'T9' AND stage = 'B'"
+        ).fetchone()
+        self.assertEqual(row_b[0], 0)   # no agreement (actual was haiku)
+        self.assertEqual(row_b[1], 1)   # one disagreement
+        self.assertEqual(row_b[2], 1)   # one fallback fired (on stage B api_end)
+
+    def test_champion_challenger_joinable_to_per_task_comparison(self) -> None:
+        # task_id is carried so the view joins to per_task_comparison.
+        self._ingest_shadow_run()
+        joined = self.con.execute(
+            "SELECT cc.stage, cc.agreement_count "
+            "FROM champion_challenger_comparison cc "
+            "JOIN per_task_comparison ptc USING (task_id) "
+            "WHERE cc.task_id = 'T9'"
+        ).fetchall()
+        # per_task_comparison has a T9 row (mock half present), so the
+        # join returns the shadow aggregation rows.
+        self.assertEqual(len(joined), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
