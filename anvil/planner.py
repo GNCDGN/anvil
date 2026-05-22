@@ -101,6 +101,26 @@ class Planner:
         self._artefacts_prompt = artefacts_path.read_text(encoding="utf-8").replace(
             "{VOICE_SPEC}", voice_spec
         )
+        # v3 Phase 0 Step 4 (V3P0-6): cache-family diagnostics state.
+        # Instance attributes (NOT module-global): one Planner per build
+        # (orchestrator.py:120), so these are naturally build-scoped and
+        # reset on construction. Instance scope also avoids the events.py
+        # backwards-coupling a module-global reset would need, and removes
+        # a real test-isolation hazard — a module-global keyed on run_id
+        # would leak a stale cached index between tests that reuse the
+        # same run_id (e.g. "planner-events-test"), whereas a fresh Planner
+        # per test starts clean.
+        #
+        # _vault_index_cache: run_id -> built vault_index. Real
+        # memoisation (build + reuse across steps); output-neutral because
+        # the index is build-stable. _last_cache_creation_monotonic:
+        # run_id -> time.monotonic() of the most recent cache_creation>0
+        # call, for seconds_since_cache_creation. Keyed on run_id, which is
+        # mode-suffixed in calibration and unique per build, so it is the
+        # effective (run_id, mode) key — the Planner has no mode attribute
+        # at plan time.
+        self._vault_index_cache: dict[str, dict] = {}
+        self._last_cache_creation_monotonic: dict[str, float] = {}
 
     def plan_step(self, brief, state, step_idx: int):
         """Stage A -> Stage B (with retry). Returns a validated Plan, or an
@@ -109,9 +129,23 @@ class Planner:
         files; Stage B still sees the brief and state (design Part 2)."""
         # v2 Phase 1 Step 2: emit Stage A sub-events. Every emit is
         # never-raise; if events.py is misconfigured, planning still works.
-        vault_index = _build_vault_index(
-            [str(p) for p in brief.context_paths], self.vault_root
-        )
+        # v3 Phase 0 Step 4 (V3P0-6): in-process vault-index memoisation.
+        # Build the index once per build (keyed on run_id) and reuse it on
+        # subsequent steps' Stage A calls. vault_index_hit records whether
+        # this call reused the cached index (true on the 2nd+ Stage A call
+        # within a build) or built it fresh (false on the first). Reuse is
+        # output-neutral — the index is build-stable (context_paths come
+        # from the brief, which does not change mid-build).
+        run_id = _events.current_run_id()
+        if run_id in self._vault_index_cache:
+            vault_index = self._vault_index_cache[run_id]
+            self._current_vault_index_hit = True
+        else:
+            vault_index = _build_vault_index(
+                [str(p) for p in brief.context_paths], self.vault_root
+            )
+            self._vault_index_cache[run_id] = vault_index
+            self._current_vault_index_hit = False
         _events.emit(
             "planner.stage_a.start",
             {"step_idx": step_idx, "vault_index_size": len(vault_index)},
@@ -120,6 +154,20 @@ class Planner:
         stage_a_prompt = _assemble_stage_a_prompt(
             brief, state, step_idx, vault_index
         )
+        # v3 Phase 0 Step 4 (V3P0-6): candidate block sizes for Stage A,
+        # stashed for the wrapper's cache_diagnostics emit. Stage A's
+        # vault block is the frontmatter index (mapped to "vault_files");
+        # it has no prior-step block. Re-derives brief_md/state_json/index
+        # yaml (trivial I/O) rather than threading them out of the
+        # assembly function — keeps that function's signature stable.
+        self._current_block_sizes = _events.estimate_user_block_sizes({
+            "brief": _read_brief_md(state),
+            "state": state.model_dump_json(indent=2),
+            "vault_files": yaml.safe_dump(
+                vault_index, default_flow_style=False, sort_keys=True
+            ),
+            "prior_step": "",
+        })
         _events.emit(
             "planner.stage_a.prompt_assembled",
             {
@@ -198,6 +246,38 @@ class Planner:
             )
             return result
         return Plan(**result)
+
+    def _cache_diag_fields(self, stage: str, cache_creation_tokens: int) -> dict:
+        """v3 Phase 0 Step 4 (V3P0-6): build the three cache-family fields
+        for a Planner stage emit.
+
+        - vault_index_hit: the stashed Stage-A hit/miss; None on Stage
+          B/C (the question doesn't apply — Q(c)).
+        - candidate_user_block_sizes: the stashed per-block decomposition.
+        - seconds_since_cache_creation: from the per-run TTL state — null
+          on a cache_creation call (this IS the creation, and we record
+          its timestamp for later reads), else now − last_creation (or
+          null if no creation has been seen this run).
+        """
+        run_id = _events.current_run_id()
+        now = time.monotonic()
+        if cache_creation_tokens and cache_creation_tokens > 0:
+            self._last_cache_creation_monotonic[run_id] = now
+            seconds_since = None
+        else:
+            last = self._last_cache_creation_monotonic.get(run_id)
+            seconds_since = None if last is None else (now - last)
+        vault_index_hit = (
+            getattr(self, "_current_vault_index_hit", None)
+            if stage == "A" else None
+        )
+        return _events.cache_diagnostics(
+            vault_index_hit=vault_index_hit,
+            candidate_user_block_sizes=(
+                getattr(self, "_current_block_sizes", {}) or {}
+            ),
+            seconds_since_cache_creation=seconds_since,
+        )
 
     # -----------------------------------------------------------------------
     # Phase 1 Step 5 — Anthropic call wrapper + Stage B retry loop
@@ -298,6 +378,10 @@ class Planner:
                     "duration_ms": int(duration * 1000),
                     "ok": True,
                     **routing,
+                    # v3 Phase 0 Step 4 (V3P0-6): cache-family diagnostics.
+                    **self._cache_diag_fields(
+                        stage, u.cache_creation_input_tokens or 0
+                    ),
                 },
                 step_idx=getattr(self, "_current_step_idx", None),
             )
@@ -355,6 +439,9 @@ class Planner:
                             "ok": False,
                             "error": "rate-limit/timeout",
                             **routing,
+                            # v3 Phase 0 Step 4 (V3P0-6): no usage on the
+                            # error path → cache_creation treated as 0.
+                            **self._cache_diag_fields(stage, 0),
                         },
                         step_idx=getattr(self, "_current_step_idx", None),
                     )
@@ -392,6 +479,9 @@ class Planner:
                     "ok": False,
                     "error": str(e)[:300],
                     **routing,
+                    # v3 Phase 0 Step 4 (V3P0-6): no usage on the error
+                    # path → cache_creation treated as 0.
+                    **self._cache_diag_fields(stage, 0),
                 },
                 step_idx=getattr(self, "_current_step_idx", None),
             )
@@ -431,6 +521,17 @@ class Planner:
             step_idx=step_idx,
         )
         user_prompt = _assemble_stage_b_prompt(brief, state, step_idx, files)
+        # v3 Phase 0 Step 4 (V3P0-6): candidate block sizes for Stage B —
+        # the canonical four blocks. vault_files is the loaded file
+        # contents (the bulk of Stage B's prompt); prior_step is the
+        # prior-step handoff block. Stashed for the wrapper's cache_
+        # diagnostics emit; reused on the retry call (same prompt body).
+        self._current_block_sizes = _events.estimate_user_block_sizes({
+            "brief": _read_brief_md(state),
+            "state": state.model_dump_json(indent=2),
+            "vault_files": "".join(files.values()),
+            "prior_step": _prior_step_block(state, step_idx),
+        })
         _events.emit(
             "planner.stage_b.prompt_assembled",
             {
@@ -627,6 +728,17 @@ class Planner:
         self._current_context_paths_count = len(
             getattr(brief, "context_paths", []) or []
         )
+        # v3 Phase 0 Step 4 (V3P0-6): Stage C candidate block sizes.
+        # Stage C assembles brief + state (+ a small deploy block folded
+        # into none of the canonical four); it has no vault_files or
+        # prior_step block, so those are 0. The decomposition is honest
+        # for the blocks Stage C actually has.
+        self._current_block_sizes = _events.estimate_user_block_sizes({
+            "brief": _read_brief_md(state),
+            "state": state.model_dump_json(indent=2),
+            "vault_files": "",
+            "prior_step": "",
+        })
 
         response = self._call_anthropic(
             system=system, user=user_prompt, timeout=self.timeout or 120,
@@ -849,6 +961,18 @@ def _build_vault_index(
                     continue
                 index[str(f)] = _parse_frontmatter(f)
     return index
+
+
+def _read_brief_md(state) -> str:
+    """Read the brief markdown from state.brief_path; "" if unreadable.
+
+    v3 Phase 0 Step 4 (V3P0-6): extracted so the candidate-block-size
+    computation and the prompt assemblers share one never-raise read.
+    """
+    try:
+        return Path(state.brief_path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def _assemble_stage_a_prompt(

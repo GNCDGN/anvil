@@ -251,6 +251,9 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     # v3 Phase 0 Step 3 (V3P0-4): silent_miss_episodes reads the events
     # table + run_metadata; empty-set by construction in Phase 0.
     con.execute(_SILENT_MISS_EPISODES_VIEW_SQL)
+    # v3 Phase 0 Step 4 (V3P0-6): cache_diagnostics reads the events
+    # table + run_metadata; the three cache-family lines per Planner stage.
+    con.execute(_CACHE_DIAGNOSTICS_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +733,57 @@ WHERE e.kind = 'stage_a.shadow_compare.end'
 _SILENT_MISS_EPISODES_COLUMNS: tuple[str, ...] = (
     "run_id", "task_id", "mode", "step_idx", "ts",
     "silent_miss_count", "hallucination_count", "jaccard_similarity",
+)
+
+
+# v3 Phase 0 Step 4 (V3P0-6): cache_diagnostics.
+#
+# The three cache-family telemetry lines per Planner stage event, exposed
+# per-stage and per-mode. Reads the events table directly (the three
+# fields live in the planner.stage_*.api_end data JSON; no operations-view
+# column needed). vault_index_hit is BOOLEAN (null on Stage B/C by
+# construction — Q(c)); candidate_user_block_sizes stays as DuckDB JSON;
+# seconds_since_cache_creation is DOUBLE (null on cache_creation calls and
+# before any creation). candidate_block_sizes_sum sums the four canonical
+# blocks for the criterion-3 sum-check (≈ input_tokens − system prompt in
+# real mode). task_id via the run_metadata join (operations-view pattern).
+_CACHE_DIAGNOSTICS_VIEW_SQL = """
+CREATE OR REPLACE VIEW cache_diagnostics AS
+SELECT
+    e.run_id,
+    rm.task_id,
+    e.mode,
+    e.step_idx,
+    CASE e.kind
+        WHEN 'planner.stage_a.api_end' THEN 'A'
+        WHEN 'planner.stage_b.api_end' THEN 'B'
+        WHEN 'planner.stage_c.api_end' THEN 'C'
+    END AS stage,
+    CAST(json_extract(e.data, '$.vault_index_hit') AS BOOLEAN) AS vault_index_hit,
+    json_extract(e.data, '$.candidate_user_block_sizes') AS candidate_user_block_sizes,
+    CAST(json_extract(e.data, '$.seconds_since_cache_creation') AS DOUBLE)
+        AS seconds_since_cache_creation,
+    (
+        COALESCE(CAST(json_extract(e.data, '$.candidate_user_block_sizes.brief') AS BIGINT), 0)
+      + COALESCE(CAST(json_extract(e.data, '$.candidate_user_block_sizes.state') AS BIGINT), 0)
+      + COALESCE(CAST(json_extract(e.data, '$.candidate_user_block_sizes.vault_files') AS BIGINT), 0)
+      + COALESCE(CAST(json_extract(e.data, '$.candidate_user_block_sizes.prior_step') AS BIGINT), 0)
+    ) AS candidate_block_sizes_sum,
+    CAST(json_extract(e.data, '$.input_tokens') AS BIGINT) AS input_tokens
+FROM events e
+LEFT JOIN run_metadata rm USING (run_id, mode)
+WHERE e.kind IN (
+    'planner.stage_a.api_end',
+    'planner.stage_b.api_end',
+    'planner.stage_c.api_end'
+)
+"""
+
+_CACHE_DIAGNOSTICS_COLUMNS: tuple[str, ...] = (
+    "run_id", "task_id", "mode", "step_idx", "stage",
+    "vault_index_hit", "candidate_user_block_sizes",
+    "seconds_since_cache_creation", "candidate_block_sizes_sum",
+    "input_tokens",
 )
 
 
@@ -1302,6 +1356,44 @@ def self_check() -> int:
                 print("self-check: FAIL — no stage_a.parser_drop events")
                 return 1
 
+            # v3 Phase 0 Step 4 (V3P0-6): cache-family diagnostics. The T1
+            # fixtures carry the three new fields on their planner stage
+            # events; the cache_diagnostics view exposes them per-stage.
+            cache_rows = con.execute(
+                "SELECT COUNT(*) FROM cache_diagnostics"
+            ).fetchone()[0]
+            if cache_rows < 1:
+                print("self-check: FAIL — cache_diagnostics returned 0 rows")
+                return 1
+            # Stage A on the T1 mock fixture: vault_index_hit populated
+            # (bool, not null — the question applies to Stage A) and the
+            # candidate block decomposition sums to a positive estimate.
+            stage_a = con.execute(
+                "SELECT vault_index_hit, candidate_block_sizes_sum "
+                "FROM cache_diagnostics "
+                "WHERE run_id = 'T1-doc-edit-mock' AND stage = 'A'"
+            ).fetchone()
+            if stage_a is None:
+                print("self-check: FAIL — no Stage A cache_diagnostics row for T1")
+                return 1
+            if stage_a[0] is None:
+                print("self-check: FAIL — Stage A vault_index_hit is null "
+                      "(should be a bool — the field applies to Stage A)")
+                return 1
+            if (stage_a[1] or 0) <= 0:
+                print("self-check: FAIL — Stage A candidate_block_sizes_sum "
+                      f"non-positive ({stage_a[1]})")
+                return 1
+            # Stage B vault_index_hit is null by construction (Q(c)).
+            stage_b = con.execute(
+                "SELECT vault_index_hit FROM cache_diagnostics "
+                "WHERE run_id = 'T1-doc-edit-mock' AND stage = 'B'"
+            ).fetchone()
+            if stage_b is not None and stage_b[0] is not None:
+                print("self-check: FAIL — Stage B vault_index_hit should be "
+                      f"null (n/a), got {stage_b[0]}")
+                return 1
+
             xlsx_path = tmp_path / "self-check.xlsx"
             export_xlsx(con, xlsx_path)
             if not xlsx_path.is_file():
@@ -1333,7 +1425,7 @@ def self_check() -> int:
             f"self-check: PASS ({len(ops)} ops, {len(runs)} runs, "
             f"{len(tasks)} tasks, {len(episodes)} episodes, "
             f"{len(shadow_rows)} shadow, {len(compare_ends)} compare, "
-            f"{drops} parser_drop)"
+            f"{drops} parser_drop, {cache_rows} cache_diag)"
         )
         return 0
     except Exception as e:  # noqa: BLE001

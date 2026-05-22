@@ -1003,5 +1003,79 @@ class TestSilentMissEpisodes(_HarnessTestBase):
         self.assertEqual(len(row), len(harness_v2._SILENT_MISS_EPISODES_COLUMNS))
 
 
+class TestCacheDiagnosticsView(_HarnessTestBase):
+    """v3 Phase 0 Step 4 (V3P0-6): cache_diagnostics exposes the three
+    cache-family lines per Planner stage, with vault_index_hit null on
+    Stage B/C and a summed block-size convenience column."""
+
+    def _ingest_cache_run(self, run_id="T9-cache"):
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        a_blocks = {"brief": 820, "state": 130, "vault_files": 45, "prior_step": 0}
+        b_blocks = {"brief": 820, "state": 160, "vault_files": 9200, "prior_step": 60}
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 1040,
+                        "vault_index_hit": False,
+                        "candidate_user_block_sizes": a_blocks,
+                        "seconds_since_cache_creation": None, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "planner.stage_b.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 13719,
+                        "vault_index_hit": None,
+                        "candidate_user_block_sizes": b_blocks,
+                        "seconds_since_cache_creation": 2.5, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        return harness_v2.ingest(self.con, run_dir)
+
+    def test_stage_a_row(self) -> None:
+        self._ingest_cache_run()
+        row = self.con.execute(
+            "SELECT task_id, mode, vault_index_hit, "
+            "       json_extract_string(candidate_user_block_sizes, '$.vault_files'), "
+            "       seconds_since_cache_creation, candidate_block_sizes_sum, input_tokens "
+            "FROM cache_diagnostics WHERE run_id='T9-cache' AND stage='A'"
+        ).fetchone()
+        self.assertEqual(row[0], "T9")          # task_id via run_metadata join
+        self.assertEqual(row[1], "mock")
+        self.assertIs(row[2], False)            # vault_index_hit (Stage A)
+        self.assertEqual(row[3], "45")          # block sizes queryable as JSON
+        self.assertIsNone(row[4])               # seconds null (creation call)
+        self.assertEqual(row[5], 820 + 130 + 45 + 0)   # sum
+        self.assertEqual(row[6], 1040)
+
+    def test_stage_b_vault_index_hit_null(self) -> None:
+        self._ingest_cache_run()
+        row = self.con.execute(
+            "SELECT vault_index_hit, seconds_since_cache_creation, "
+            "       candidate_block_sizes_sum "
+            "FROM cache_diagnostics WHERE run_id='T9-cache' AND stage='B'"
+        ).fetchone()
+        self.assertIsNone(row[0])               # null on Stage B (Q(c))
+        self.assertEqual(row[1], 2.5)           # read within window
+        self.assertEqual(row[2], 820 + 160 + 9200 + 60)
+
+    def test_columns_match_declared_tuple(self) -> None:
+        self._ingest_cache_run()
+        row = self.con.execute(
+            "SELECT * FROM cache_diagnostics WHERE run_id='T9-cache' AND stage='A'"
+        ).fetchone()
+        self.assertEqual(len(row), len(harness_v2._CACHE_DIAGNOSTICS_COLUMNS))
+
+    def test_view_per_stage_and_mode(self) -> None:
+        self._ingest_cache_run()
+        rows = self.con.execute(
+            "SELECT stage FROM cache_diagnostics WHERE run_id='T9-cache' "
+            "ORDER BY stage"
+        ).fetchall()
+        self.assertEqual([r[0] for r in rows], ["A", "B"])
+
+
 if __name__ == "__main__":
     unittest.main()

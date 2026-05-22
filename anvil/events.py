@@ -357,6 +357,72 @@ def emit_stage_a_shadow_compare(
 
 
 # ---------------------------------------------------------------------------
+# v3 Phase 0 Step 4 — cache-family diagnostics (V3P0-6)
+#
+# Three telemetry lines on every Planner stage event, separating what v2
+# blended into one "caching" line:
+#   (a) vault_index_hit — did Stage A reuse the in-process memoised vault
+#       index (true on 2nd+ Stage A call within a build) or build it fresh
+#       (false on the first)? Null on Stage B/C — the question doesn't
+#       apply (they don't use the vault index). [Q(c): null, not false.]
+#   (b) candidate_user_block_sizes — token-count estimate per user-prompt
+#       block (brief / state / vault_files / prior_step) that COULD be
+#       cache-controlled if v3 extended caching beyond the system prompt.
+#       Phase 0 measures, never acts. Real-mode invariant: the sum ≈
+#       observed input_tokens − the 3,479-token system prompt.
+#   (c) seconds_since_cache_creation — wall-clock seconds since the most
+#       recent cache_creation event on the same (run_id, mode); null for
+#       cache_creation calls themselves and before any creation is seen.
+# ---------------------------------------------------------------------------
+
+# v2 Phase 4 measured the Planner system prompt at 3,479 tokens via
+# cache_creation_input_tokens. The candidate-block sum-check (criterion 3)
+# compares sum(block sizes) against (input_tokens − this) in real mode.
+PLANNER_SYSTEM_PROMPT_TOKENS = 3479
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars/token (the standard heuristic).
+
+    Used for candidate block sizing — an estimate, not a tokenizer call.
+    The real tokenizer count lives in the API's input_tokens; this gives
+    a per-block decomposition that sums to ≈ that figure in real mode.
+    """
+    return (len(text or "") + 3) // 4
+
+
+def estimate_user_block_sizes(blocks: dict[str, str]) -> dict[str, int]:
+    """Map {block_name: block_text} → {block_name: token_estimate}.
+
+    Each call site passes the user-prompt blocks it actually assembled
+    (a stage with no prior-step block passes "" for it → 0). The sum is
+    a candidate-caching decomposition of the user prompt.
+    """
+    return {name: _estimate_tokens(text) for name, text in blocks.items()}
+
+
+def cache_diagnostics(
+    *,
+    vault_index_hit: bool | None,
+    candidate_user_block_sizes: dict[str, int],
+    seconds_since_cache_creation: float | None,
+) -> dict[str, Any]:
+    """Package the three cache-family fields for an event's data payload.
+
+    Thin by design: each field is computed at the call site where its
+    inputs live (vault_index_hit + block sizes via the self-stash
+    pattern; seconds_since_cache_creation from the Planner's TTL state),
+    then handed here so the three lines land together on every Planner
+    stage event.
+    """
+    return {
+        "vault_index_hit": vault_index_hit,
+        "candidate_user_block_sizes": candidate_user_block_sizes,
+        "seconds_since_cache_creation": seconds_since_cache_creation,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Module-global run state
 # ---------------------------------------------------------------------------
 

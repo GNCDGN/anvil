@@ -149,6 +149,7 @@ class MockedPlanner(Planner):
         # view filters on model).
         stage_key = stage.lower()
         observed_input_tokens = int(usage.get("input_tokens", 0))
+        cache_creation = int(usage.get("cache_creation_input_tokens", 0))
         # v3 Phase 0 Step 1 (V3P0-1): routing observability, same shape as
         # the production wrapper. route_actual is self.model (the inherited
         # plan_step / Stage-C path stashes _current_context_paths_count
@@ -171,11 +172,19 @@ class MockedPlanner(Planner):
                 "model": self.model,
                 "input_tokens": observed_input_tokens,
                 "output_tokens": int(usage.get("output_tokens", 0)),
-                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0)),
+                "cache_creation_input_tokens": cache_creation,
                 "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0)),
                 "duration_ms": jitter_ms,
                 "ok": True,
                 **routing,
+                # v3 Phase 0 Step 4 (V3P0-6): cache-family diagnostics.
+                # Inherited _cache_diag_fields reads the stashes set by the
+                # inherited plan_step / _run_stage_b_with_retry and the
+                # per-run TTL state. vault_index_hit tracks naturally
+                # because the mock still runs the real _build_vault_index
+                # via inherited plan_step; seconds_since_cache_creation is
+                # null unless a usage sidecar reports cache_creation > 0.
+                **self._cache_diag_fields(stage, cache_creation),
             },
             step_idx=step_idx,
         )

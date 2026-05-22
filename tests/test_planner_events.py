@@ -630,5 +630,74 @@ class TestStageAComparatorInPlanStep(_PlannerEventsBase):
                          [e["kind"] for e in evs])
 
 
+class TestCacheFamilyDiagnostics(_PlannerEventsBase):
+    """v3 Phase 0 Step 4 (V3P0-6): vault_index_hit memoisation, null on
+    Stage B, candidate block sizes, and the TTL field logic."""
+
+    def test_vault_index_hit_false_first_call_true_second(self) -> None:
+        # Two plan_step calls on the SAME Planner + run_id: the first
+        # builds the index (hit=false), the second reuses it (hit=true).
+        # Drive the real _call_anthropic via a fake streaming client so
+        # the wrapper's cache_diag emit runs. Stage B fails to parse
+        # text="ok" and escalates — irrelevant; the Stage A api_end fires.
+        client, _ = _make_fake_client(
+            input_tokens=620, output_tokens=40, cache_creation=2603, cache_read=0,
+        )
+        self.planner._client = client
+        self.planner.plan_step(self.brief, self.state, 0)
+        self.planner.plan_step(self.brief, self.state, 0)
+        stage_a = [e for e in self._events_for()
+                   if e["kind"] == "planner.stage_a.api_end"]
+        self.assertEqual(len(stage_a), 2)
+        self.assertIs(stage_a[0]["data"]["vault_index_hit"], False)
+        self.assertIs(stage_a[1]["data"]["vault_index_hit"], True)
+        # Block sizes populated and sum positive on both.
+        for e in stage_a:
+            bs = e["data"]["candidate_user_block_sizes"]
+            self.assertEqual(set(bs),
+                             {"brief", "state", "vault_files", "prior_step"})
+            self.assertGreater(sum(bs.values()), 0)
+
+    def test_stage_b_vault_index_hit_is_null(self) -> None:
+        client, _ = _make_fake_client(
+            input_tokens=620, output_tokens=40, cache_creation=0, cache_read=2603,
+        )
+        self.planner._client = client
+        self.planner.plan_step(self.brief, self.state, 0)
+        stage_b = [e for e in self._events_for()
+                   if e["kind"] == "planner.stage_b.api_end"]
+        self.assertTrue(stage_b)
+        for e in stage_b:
+            # Q(c): null on Stage B — the question doesn't apply.
+            self.assertIsNone(e["data"]["vault_index_hit"])
+            # The other two fields still populate.
+            self.assertIn("candidate_user_block_sizes", e["data"])
+            self.assertIn("seconds_since_cache_creation", e["data"])
+
+    def test_ttl_null_on_creation_positive_on_read(self) -> None:
+        # _cache_diag_fields TTL logic: a cache_creation call → null +
+        # records the timestamp; a subsequent read call → positive delta.
+        p = Planner(model="claude-opus-4-7")
+        first = p._cache_diag_fields("A", cache_creation_tokens=2603)
+        self.assertIsNone(first["seconds_since_cache_creation"])
+        second = p._cache_diag_fields("B", cache_creation_tokens=0)
+        self.assertIsNotNone(second["seconds_since_cache_creation"])
+        self.assertGreaterEqual(second["seconds_since_cache_creation"], 0.0)
+        self.assertLess(second["seconds_since_cache_creation"], 300)
+
+    def test_ttl_null_before_any_creation(self) -> None:
+        # A read call before any creation has been seen → null.
+        p = Planner(model="claude-opus-4-7")
+        d = p._cache_diag_fields("B", cache_creation_tokens=0)
+        self.assertIsNone(d["seconds_since_cache_creation"])
+
+    def test_cache_diag_fields_vault_hit_null_on_b_and_c(self) -> None:
+        p = Planner(model="claude-opus-4-7")
+        p._current_vault_index_hit = True  # would apply only to Stage A
+        self.assertIs(p._cache_diag_fields("A", 0)["vault_index_hit"], True)
+        self.assertIsNone(p._cache_diag_fields("B", 0)["vault_index_hit"])
+        self.assertIsNone(p._cache_diag_fields("C", 0)["vault_index_hit"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -521,5 +521,58 @@ class TestStageAComparator(_EventsTestBase):
         self.assertEqual(detected[0]["data"]["baseline_only_paths"], ["b"])
 
 
+class TestCacheDiagnosticsHelpers(_EventsTestBase):
+    """v3 Phase 0 Step 4 (V3P0-6): the token estimator, block-size
+    decomposition, and cache_diagnostics packaging."""
+
+    def test_estimate_tokens_four_chars_per_token(self) -> None:
+        self.assertEqual(events._estimate_tokens(""), 0)
+        self.assertEqual(events._estimate_tokens("abcd"), 1)        # 4/4
+        self.assertEqual(events._estimate_tokens("abcdefgh"), 2)    # 8/4
+        self.assertEqual(events._estimate_tokens("a"), 1)           # ceil(1/4)
+        self.assertEqual(events._estimate_tokens(None), 0)          # never-raise
+
+    def test_estimate_user_block_sizes(self) -> None:
+        sizes = events.estimate_user_block_sizes({
+            "brief": "x" * 400, "state": "y" * 40,
+            "vault_files": "", "prior_step": "z" * 4,
+        })
+        self.assertEqual(sizes, {"brief": 100, "state": 10,
+                                 "vault_files": 0, "prior_step": 1})
+
+    def test_cache_diagnostics_packages_three_fields(self) -> None:
+        d = events.cache_diagnostics(
+            vault_index_hit=False,
+            candidate_user_block_sizes={"brief": 5},
+            seconds_since_cache_creation=None,
+        )
+        self.assertEqual(set(d), {
+            "vault_index_hit", "candidate_user_block_sizes",
+            "seconds_since_cache_creation",
+        })
+        self.assertIs(d["vault_index_hit"], False)
+        self.assertEqual(d["candidate_user_block_sizes"], {"brief": 5})
+        self.assertIsNone(d["seconds_since_cache_creation"])
+
+    def test_cache_diagnostics_round_trips_through_jsonl(self) -> None:
+        events.begin_run("r1")
+        events.emit(
+            "planner.stage_a.api_end",
+            {"model": "claude-opus-4-7", "ok": True, "input_tokens": 9000,
+             **events.cache_diagnostics(
+                 vault_index_hit=True,
+                 candidate_user_block_sizes={"brief": 800, "state": 100,
+                                             "vault_files": 40, "prior_step": 0},
+                 seconds_since_cache_creation=12.5)},
+            step_idx=0,
+        )
+        events.end_run()
+        d = next(r for r in self._read_events("r1")
+                 if r["kind"] == "planner.stage_a.api_end")["data"]
+        self.assertIs(d["vault_index_hit"], True)
+        self.assertEqual(d["candidate_user_block_sizes"]["vault_files"], 40)
+        self.assertEqual(d["seconds_since_cache_creation"], 12.5)
+
+
 if __name__ == "__main__":
     unittest.main()
