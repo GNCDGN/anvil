@@ -438,7 +438,8 @@ class T6CalibrationBriefTests(unittest.TestCase):
         from tools import calibration_runner
         self.assertTrue(_T6_BRIEF.is_file(), f"T6 brief missing: {_T6_BRIEF}")
         # v2 Phase 2 Step 4 follow-up: target_repo_path is the isolated
-        # throwaway state/v2-phase-1/targets/T6, which only exists after
+        # throwaway state/calibration/targets/T6 (renamed from
+        # v2-phase-1/targets/ in v2 Phase 5 Step 1b), which only exists after
         # bootstrap (matches T1-T5 — validate_or_reject rule 3 requires
         # the target to exist + be a git repo). Bootstrap first, exactly
         # as test_calibration_runner.test_all_six_briefs_parse does via

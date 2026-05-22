@@ -593,6 +593,32 @@ class TestHarnessCLI(_HarnessTestBase):
         self.assertEqual(rc, 0)
         self.assertIn("T1-doc-edit-mock", buf.getvalue())
 
+    def test_operations_cli_positional_run_id(self) -> None:
+        """v2 Phase 5 Step 1b: the `operations` subcommand takes a positional
+        run_id (mirroring per-run-summary), so `operations T1-doc-edit-mock`
+        works without a --run-id flag."""
+        from contextlib import redirect_stdout
+        import io
+        db = self.tmp_path / "ops.duckdb"
+        con = harness_v2.open_db(db)
+        harness_v2.ingest(con, _CLEAN_DIR)
+        con.close()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = harness_v2.main(
+                ["--db-path", str(db), "operations", "T1-doc-edit-mock"]
+            )
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("T1-doc-edit-mock", out)
+        # Bare `operations` (no run_id) prints all rows — the positional is
+        # optional, so the run_id-filtered and unfiltered shapes both work.
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            rc2 = harness_v2.main(["--db-path", str(db), "operations"])
+        self.assertEqual(rc2, 0)
+        self.assertIn("T1-doc-edit-mock", buf2.getvalue())
+
     def test_harness_cli_cumulative_spend_subcommand(self) -> None:
         from contextlib import redirect_stdout
         import io

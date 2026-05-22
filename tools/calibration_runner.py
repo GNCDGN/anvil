@@ -182,7 +182,12 @@ def brief_path_for(task: str) -> Path:
 
 
 def target_repo_path_for(task: str) -> Path:
-    return ANVIL_REPO / "state" / "v2-phase-1" / "targets" / task
+    # v2 Phase 5 Step 1b (Finding 6): renamed v2-phase-1/targets → calibration/targets.
+    # The throwaway target repos are phase-agnostic (T6 was added in v2 Phase 2);
+    # the v2-phase-1 prefix was misleading. bootstrap_target_repo recreates the
+    # dirs at the new path on the next sweep — the old state/v2-phase-1/targets/
+    # dirs are transient (untracked) and can be deleted at leisure.
+    return ANVIL_REPO / "state" / "calibration" / "targets" / task
 
 
 def run_id_for(task: str, mode: str) -> str:
@@ -207,7 +212,7 @@ def run_dir_for(task: str, mode: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def bootstrap_target_repo(task: str) -> Path:
-    """Wipe + re-seed `state/v2-phase-1/targets/<task>/` to the
+    """Wipe + re-seed `state/calibration/targets/<task>/` to the
     task-specific baseline. Idempotent in the sense that two calls
     yield the same baseline; NOT idempotent in the sense that local
     changes are preserved — the target repo is calibration-owned, so

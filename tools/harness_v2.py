@@ -16,7 +16,7 @@ reads JSONL only — no log-line parsing.
 CLI surface:
     python tools/harness_v2.py ingest <run-dir>
     python tools/harness_v2.py ingest-all [--state-root <path>]
-    python tools/harness_v2.py operations [--run-id <id>]
+    python tools/harness_v2.py operations [<run-id>]
     python tools/harness_v2.py per-run-summary [--run-id <id>]
     python tools/harness_v2.py per-task-comparison
     python tools/harness_v2.py validation-failure-episodes
@@ -1123,7 +1123,12 @@ def main(argv: list[str] | None = None) -> int:
     p_ingall.add_argument("--state-root", type=Path, default=None)
 
     p_ops = sub.add_parser("operations", help="Print operations view.")
-    p_ops.add_argument("--run-id", type=str, default=None)
+    # v2 Phase 5 Step 1b: positional run_id, mirroring per-run-summary
+    # (Finding 4 — Tier 4 CLI consistency). `operations T1-doc-edit-real`
+    # now works like `per-run-summary T1-doc-edit-real`. Replaces the prior
+    # --run-id flag (consumed by no code/test — only the module docstring).
+    p_ops.add_argument("run_id", nargs="?", default=None,
+                       help="optional run_id; omit for all runs")
 
     p_runs = sub.add_parser("per-run-summary", help="Print per_run_summary view.")
     # v2 Phase 3 Step 1: run_id is a positional (optional) so the brief's
