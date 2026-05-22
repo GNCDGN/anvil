@@ -468,5 +468,89 @@ class T6CalibrationBriefTests(unittest.TestCase):
         self.assertEqual(plan.confidence, "high")
 
 
+class CoderInstrumentationTests(unittest.TestCase):
+    """v2 Phase 5 Step 1a: --output-format json envelope parse + Coder cost
+    instrumentation. The model text (`result`) is extracted back into the
+    `stdout` the result dict exposes (downstream contract preserved); usage
+    + total_cost_usd ride the coder.subprocess.end event. Non-JSON output
+    (mock mode / errors) falls back to raw text with no cost."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="anvil-test-coder-instr-"))
+        self.repo = self._tmp / "repo"
+        _init_repo(self.repo, {"a.py": "# original\n"})
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _run_with_stdout(self, subprocess_stdout: str):
+        """Run execute_step with the claude subprocess returning the given
+        stdout; capture the result dict + the coder.subprocess.end event
+        payload (via a patched events.emit)."""
+        emitted: list[tuple] = []
+
+        def fake_run(cmd, **kw):
+            if cmd[0:2] == ["git", "-C"]:
+                return _real_run(cmd, **kw)
+            (self.repo / "a.py").write_text("# edited\n", encoding="utf-8")
+            return _proc_result(0, subprocess_stdout, "")
+
+        def fake_emit(kind, data, **kw):
+            emitted.append((kind, data))
+
+        plan = _make_plan(files_to_touch=["a.py"], operations=["write"])
+        brief = _make_brief(self.repo)
+        with mock.patch.object(coder.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(coder._events, "emit", side_effect=fake_emit):
+            result = _make_coder().execute_step(plan, brief)
+        end = next(d for k, d in emitted if k == "coder.subprocess.end")
+        return result, end
+
+    def test_coder_subprocess_json_envelope_parsed(self):
+        envelope = json.dumps({
+            "result": "Done.\n[anvil-coder] edited a.py",
+            "usage": {"input_tokens": 2152, "output_tokens": 4,
+                      "cache_creation_input_tokens": 5283,
+                      "cache_read_input_tokens": 10315},
+            "total_cost_usd": 0.04953225,
+        })
+        result, end = self._run_with_stdout(envelope)
+        # `result` field extracted as stdout (downstream contract preserved).
+        self.assertEqual(result["stdout"], "Done.\n[anvil-coder] edited a.py")
+        # usage + reported cost captured on the event.
+        self.assertEqual(end["total_cost_usd"], 0.04953225)
+        self.assertEqual(end["input_tokens"], 2152)
+        self.assertEqual(end["output_tokens"], 4)
+        self.assertEqual(end["cache_read_input_tokens"], 10315)
+        self.assertIsInstance(end["usage"], dict)
+
+    def test_coder_subprocess_text_fallback(self):
+        # Non-JSON stdout (mock mode / a binary without JSON support / an
+        # error) → fall back to raw text; no cost recorded.
+        result, end = self._run_with_stdout("Done. Plain text, not JSON.")
+        self.assertEqual(result["stdout"], "Done. Plain text, not JSON.")
+        self.assertIsNone(end["usage"])
+        self.assertIsNone(end["total_cost_usd"])
+        self.assertIsNone(end["input_tokens"])
+
+    def test_coder_subprocess_end_emits_cost_fields(self):
+        # The cost-field keys are always present on the event (None on
+        # fallback), so the harness can rely on the shape.
+        _, end = self._run_with_stdout("plain text")
+        for field in ("usage", "total_cost_usd", "input_tokens",
+                      "output_tokens", "cache_creation_input_tokens",
+                      "cache_read_input_tokens"):
+            self.assertIn(field, end)
+
+    def test_mock_mode_text_stdout_records_no_cost(self):
+        # MockedCoder returns plain text (no real API call); the fallback
+        # path must leave Coder cost unrecorded so mock-mode sweeps show $0
+        # Coder cost. (The full MockedCoder integration is covered by
+        # test_mocked.py; this pins the cost-fallback contract directly.)
+        result, end = self._run_with_stdout("MockedCoder effect applied.")
+        self.assertEqual(result["stdout"], "MockedCoder effect applied.")
+        self.assertIsNone(end["total_cost_usd"])
+
+
 if __name__ == "__main__":
     unittest.main()

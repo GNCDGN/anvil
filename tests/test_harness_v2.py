@@ -640,5 +640,50 @@ class TestV1Quarantine(unittest.TestCase):
         self.assertTrue(archived.exists(), "archived v1 DB missing")
 
 
+class TestCoderCostFromReported(_HarnessTestBase):
+    """v2 Phase 5 Step 1a: the operations view sources Coder cost from the
+    CLI's *reported* total_cost_usd (the Coder runs a cheaper model than the
+    Planner's Opus), NOT the Opus token-weighted formula — which would
+    ~3x-over-cost it."""
+
+    def test_operations_view_coder_cost_from_reported(self) -> None:
+        run_dir = self.tmp_path / "T9-coder-cost"
+        run_dir.mkdir()
+        events = [
+            _event_row(0, "run.start", {}, run_id="T9-coder-cost"),
+            # Coder subprocess.end with v2 Phase 5 cost fields. The token
+            # counts would, under the Opus formula, compute ~$0.147; the
+            # reported figure is $0.04953 — the view must use the latter.
+            _event_row(
+                10, "coder.subprocess.end",
+                {"exit_code": 0, "duration_ms": 1299, "stdout_chars": 30,
+                 "stderr_chars": 0, "total_cost_usd": 0.04953225,
+                 "input_tokens": 2152, "output_tokens": 4,
+                 "cache_creation_input_tokens": 5283,
+                 "cache_read_input_tokens": 10315},
+                run_id="T9-coder-cost", step_idx=0,
+            ),
+            _event_row(20, "run.end", {}, run_id="T9-coder-cost"),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8",
+        )
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+        row = self.con.execute(
+            "SELECT cost_usd, input_tokens, cache_read_tokens FROM operations "
+            "WHERE run_id='T9-coder-cost' AND operation_kind='coder.subprocess.end'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        # cost_usd = the reported figure, NOT the ~$0.147 Opus formula value.
+        self.assertAlmostEqual(row[0], 0.04953225, places=8)
+        formula = (2152 * 15.0 + 4 * 75.0 + 5283 * 18.75 + 10315 * 1.50) / 1e6
+        self.assertNotAlmostEqual(row[0], formula, places=3)  # ~0.147, rejected
+        # token columns populated for observability (cost still reported).
+        self.assertEqual(row[1], 2152)
+        self.assertEqual(row[2], 10315)
+
+
 if __name__ == "__main__":
     unittest.main()

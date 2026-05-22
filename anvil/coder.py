@@ -41,6 +41,7 @@ non-zero exit through the existing smoke-fail-adjacent path.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -422,6 +423,13 @@ class Coder:
         cmd: list[str] = [
             str(self.claude_binary),
             "--print",
+            # v2 Phase 5 Step 1a: JSON output exposes the subprocess's token
+            # usage + total_cost_usd so the Coder can be cost-instrumented
+            # (previously off-the-books). The model text moves to the
+            # envelope's `result` field; `execute_step` extracts it back into
+            # `stdout` so every downstream consumer is unchanged. Defensive:
+            # mock mode + error paths produce non-JSON stdout → fall back.
+            "--output-format", "json",
             "--permission-mode", "dontAsk",
         ]
         if allow_list:
@@ -457,11 +465,31 @@ class Coder:
         stdout = ""
         stderr = ""
         exit_code = -1
+        # v2 Phase 5 Step 1a: Coder cost instrumentation. Populated from the
+        # `--output-format json` envelope when present; stays None on the
+        # fallback paths (mock mode, error cases, a claude binary without
+        # JSON support) so mock-mode runs correctly record no Coder cost.
+        coder_usage = None
+        coder_total_cost_usd = None
         try:
             proc = self._real_run(cmd, prompt, str(repo))
-            stdout = proc.stdout or ""
+            raw_stdout = proc.stdout or ""
             stderr = proc.stderr or ""
             exit_code = proc.returncode
+            # Defensive parse: extract the model text from the JSON envelope's
+            # `result` field (so downstream stdout-consumers see the model text
+            # exactly as before) plus the usage + reported cost. Any non-JSON
+            # output (MockedCoder text, error output) falls back to raw text.
+            try:
+                env = json.loads(raw_stdout)
+            except (json.JSONDecodeError, TypeError):
+                env = None
+            if isinstance(env, dict) and "result" in env:
+                stdout = env.get("result") or ""
+                coder_usage = env.get("usage")
+                coder_total_cost_usd = env.get("total_cost_usd")
+            else:
+                stdout = raw_stdout
         except subprocess.TimeoutExpired as e:
             stdout = (
                 e.stdout.decode("utf-8", "replace")
@@ -497,6 +525,23 @@ class Coder:
                 "duration_ms": int(duration_s * 1000),
                 "stdout_chars": len(stdout),
                 "stderr_chars": len(stderr),
+                # v2 Phase 5 Step 1a: Coder cost instrumentation. None on the
+                # fallback paths (mock mode / errors). total_cost_usd is the
+                # CLI's reported figure (the Coder runs a cheaper model than
+                # the Planner's Opus, so the operations view sources Coder
+                # cost from this, NOT its Opus token formula — Step 0 Q2).
+                # The token fields are surfaced at top level (the operations
+                # view's input/output/cache columns + cache_hit_rate read them
+                # there) so Coder rows get full token observability; the cost
+                # still comes from total_cost_usd via the view's coder CASE.
+                "usage": coder_usage,
+                "total_cost_usd": coder_total_cost_usd,
+                "input_tokens": (coder_usage or {}).get("input_tokens"),
+                "output_tokens": (coder_usage or {}).get("output_tokens"),
+                "cache_creation_input_tokens":
+                    (coder_usage or {}).get("cache_creation_input_tokens"),
+                "cache_read_input_tokens":
+                    (coder_usage or {}).get("cache_read_input_tokens"),
             },
             step_idx=step_idx_evt,
         )

@@ -281,6 +281,15 @@ SELECT
             )
     END AS cache_hit_rate,
     CASE
+        -- v2 Phase 5 Step 1a: Coder cost is the CLI's *reported* total_cost_usd
+        -- (`claude --output-format json`), NOT the token-weighted formula
+        -- below. The Coder runs a cheaper model than the Planner's Opus, so
+        -- applying the Opus rates to its tokens would ~3x-over-cost it (Step 0
+        -- follow-up Q2). This branch precedes the input_tokens check because
+        -- coder.subprocess.end now carries input/output_tokens too. Mock /
+        -- fallback rows have a null total_cost_usd → 0.0.
+        WHEN e.kind LIKE 'coder.%' THEN
+            COALESCE(CAST(json_extract(e.data, '$.total_cost_usd') AS DOUBLE), 0.0)
         WHEN CAST(json_extract(e.data, '$.input_tokens') AS BIGINT) IS NULL THEN 0.0
         ELSE (
             COALESCE(CAST(json_extract(e.data, '$.input_tokens') AS BIGINT), 0) * 15.0 +
