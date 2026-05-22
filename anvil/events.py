@@ -84,7 +84,7 @@ def _real_append(path: Path, text: str) -> None:
 log = logging.getLogger("anvil.events")
 
 # ---------------------------------------------------------------------------
-# Event-kind catalogue (46 kinds)
+# Event-kind catalogue (50 kinds)
 # ---------------------------------------------------------------------------
 
 VALID_KINDS: frozenset[str] = frozenset({
@@ -138,8 +138,14 @@ VALID_KINDS: frozenset[str] = frozenset({
     "escalation.raised", "escalation.resolved",
     # v3 Phase 0 Step 2 (V3P0-3): shadow-decision recorder (1)
     "shadow.decision",
+    # v3 Phase 0 Step 3 (V3P0-4 / V3P0-5): silent-miss comparator
+    # scaffolding + Stage A parser-drop telemetry (4)
+    "stage_a.shadow_compare.begin",
+    "stage_a.shadow_compare.end",
+    "stage_a.silent_miss.detected",
+    "stage_a.parser_drop",
 })
-assert len(VALID_KINDS) == 46, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
+assert len(VALID_KINDS) == 50, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
 
 # ---------------------------------------------------------------------------
 # v3 Phase 0 Step 1 — routing observability (V3P0-1)
@@ -259,6 +265,95 @@ def emit_shadow_decision(
         },
         step_idx=step_idx,
     )
+
+
+# ---------------------------------------------------------------------------
+# v3 Phase 0 Step 3 — silent-miss comparator scaffolding (V3P0-4)
+#
+# A comparator Phase 1 will use to detect silent under-contexting in
+# cheap-routed Stage A: it compares the paths a (possibly cheap) route
+# selected against a hypothetical baseline (Opus) selection. Phase 0
+# wires the path but feeds it the same selection on both sides (routed ==
+# baseline), so silent_miss_count is always 0 and jaccard is always 1.0
+# by construction. `stage_a.silent_miss.detected` never fires in Phase 0
+# (the path exists, guarded by silent_miss_count > 0). Phase 1 lands the
+# first real cheap-vs-Opus comparison by feeding distinct selections.
+# ---------------------------------------------------------------------------
+
+
+def compare_stage_a_selections(
+    routed_paths: list[str], baseline_paths: list[str]
+) -> dict[str, Any]:
+    """Compare a routed Stage A selection against a baseline selection.
+
+    Returns:
+      silent_miss_count    — paths in baseline but NOT routed (the danger:
+                             context the cheap route silently dropped)
+      hallucination_count  — paths in routed but NOT baseline
+      jaccard_similarity   — |intersection| / |union|; 1.0 for two empty
+                             selections (identical → perfect agreement)
+      baseline_only_paths  — sorted list behind silent_miss_count
+      routed_only_paths    — sorted list behind hallucination_count
+
+    Pure function: no emit, no I/O. Order-independent (set semantics);
+    duplicates within a side collapse.
+    """
+    routed = set(routed_paths or [])
+    baseline = set(baseline_paths or [])
+    baseline_only = sorted(baseline - routed)
+    routed_only = sorted(routed - baseline)
+    union = routed | baseline
+    jaccard = 1.0 if not union else len(routed & baseline) / len(union)
+    return {
+        "silent_miss_count": len(baseline_only),
+        "hallucination_count": len(routed_only),
+        "jaccard_similarity": jaccard,
+        "baseline_only_paths": baseline_only,
+        "routed_only_paths": routed_only,
+    }
+
+
+def emit_stage_a_shadow_compare(
+    *,
+    step_idx: int | None,
+    routed_paths: list[str],
+    baseline_paths: list[str],
+) -> dict[str, Any]:
+    """Emit the begin/end pair around a Stage A selection comparison.
+
+    `shadow_compare.begin` carries only the inputs; `shadow_compare.end`
+    carries all four comparator outputs (Q(a) decision). When the
+    comparator finds a silent miss (silent_miss_count > 0), also emit
+    `stage_a.silent_miss.detected` — by construction this never fires in
+    Phase 0 (routed == baseline), but the path is live for Phase 1.
+    Returns the comparator result dict. Never raises (delegates to emit).
+    """
+    emit(
+        "stage_a.shadow_compare.begin",
+        {
+            "step_idx": step_idx,
+            "routed_paths": list(routed_paths or []),
+            "baseline_paths": list(baseline_paths or []),
+        },
+        step_idx=step_idx,
+    )
+    result = compare_stage_a_selections(routed_paths, baseline_paths)
+    emit(
+        "stage_a.shadow_compare.end",
+        {"step_idx": step_idx, **result},
+        step_idx=step_idx,
+    )
+    if result["silent_miss_count"] > 0:
+        emit(
+            "stage_a.silent_miss.detected",
+            {
+                "step_idx": step_idx,
+                "silent_miss_count": result["silent_miss_count"],
+                "baseline_only_paths": result["baseline_only_paths"],
+            },
+            step_idx=step_idx,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------

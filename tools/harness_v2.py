@@ -248,6 +248,9 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     # v3 Phase 0 Step 2 (V3P0-3): champion_challenger_comparison SELECTs
     # from shadow_decisions + operations + run_metadata; registered last.
     con.execute(_CHAMPION_CHALLENGER_VIEW_SQL)
+    # v3 Phase 0 Step 3 (V3P0-4): silent_miss_episodes reads the events
+    # table + run_metadata; empty-set by construction in Phase 0.
+    con.execute(_SILENT_MISS_EPISODES_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +695,41 @@ LEFT JOIN ops_agg o ON s.stage = o.stage AND s.task_id = o.task_id
 _CHAMPION_CHALLENGER_COLUMNS: tuple[str, ...] = (
     "stage", "policy_version", "task_id",
     "agreement_count", "disagreement_count", "fallback_fired_count",
+)
+
+
+# v3 Phase 0 Step 3 (V3P0-4): silent_miss_episodes.
+#
+# Per-(run_id, mode, step_idx) episode for each stage_a.shadow_compare.end
+# that recorded a non-zero silent_miss_count — i.e. a Stage A call where
+# the routed selection dropped context the baseline kept. The
+# `WHERE silent_miss_count > 0` filter makes this an EMPTY-SET query in
+# Phase 0 by construction (routed == baseline → silent_miss_count always
+# 0), and it materializes the moment Phase 1 feeds a real cheap-vs-Opus
+# baseline. Reads the events table directly (no new table); events are
+# already (run_id, mode) composite-keyed, so V2P2-2 holds without an
+# ingest change. task_id via the run_metadata join (operations-view
+# pattern; no inline derive_task regex).
+_SILENT_MISS_EPISODES_VIEW_SQL = """
+CREATE OR REPLACE VIEW silent_miss_episodes AS
+SELECT
+    e.run_id,
+    rm.task_id,
+    e.mode,
+    e.step_idx,
+    e.ts,
+    CAST(json_extract(e.data, '$.silent_miss_count') AS BIGINT) AS silent_miss_count,
+    CAST(json_extract(e.data, '$.hallucination_count') AS BIGINT) AS hallucination_count,
+    CAST(json_extract(e.data, '$.jaccard_similarity') AS DOUBLE) AS jaccard_similarity
+FROM events e
+LEFT JOIN run_metadata rm USING (run_id, mode)
+WHERE e.kind = 'stage_a.shadow_compare.end'
+  AND CAST(json_extract(e.data, '$.silent_miss_count') AS BIGINT) > 0
+"""
+
+_SILENT_MISS_EPISODES_COLUMNS: tuple[str, ...] = (
+    "run_id", "task_id", "mode", "step_idx", "ts",
+    "silent_miss_count", "hallucination_count", "jaccard_similarity",
 )
 
 
@@ -1225,6 +1263,45 @@ def self_check() -> int:
                 )
                 return 1
 
+            # v3 Phase 0 Step 3 (V3P0-4 / V3P0-5): silent-miss comparator
+            # + parser_drop. The T1 fixtures carry shadow_compare.begin/end
+            # pairs (one per Stage A api_end) and one synthetic parser_drop.
+            # (1) comparator events present and well-formed: every
+            #     shadow_compare.end has silent_miss_count=0 + jaccard=1.0
+            #     (routed == baseline by construction).
+            compare_ends = con.execute(
+                "SELECT json_extract(data, '$.silent_miss_count'), "
+                "       json_extract(data, '$.jaccard_similarity') "
+                "FROM events WHERE kind = 'stage_a.shadow_compare.end'"
+            ).fetchall()
+            if not compare_ends:
+                print("self-check: FAIL — no stage_a.shadow_compare.end events")
+                return 1
+            for sm, jac in compare_ends:
+                if int(sm) != 0 or float(jac) != 1.0:
+                    print(
+                        "self-check: FAIL — shadow_compare.end not identity "
+                        f"(silent_miss={sm}, jaccard={jac})"
+                    )
+                    return 1
+            # (2) silent_miss_episodes view queryable + empty in Phase 0.
+            episodes_sm = con.execute(
+                "SELECT COUNT(*) FROM silent_miss_episodes"
+            ).fetchone()[0]
+            if episodes_sm != 0:
+                print(
+                    "self-check: FAIL — silent_miss_episodes expected 0 rows "
+                    f"in Phase 0, got {episodes_sm}"
+                )
+                return 1
+            # (3) parser_drop event present (the fixture's synthetic drop).
+            drops = con.execute(
+                "SELECT COUNT(*) FROM events WHERE kind = 'stage_a.parser_drop'"
+            ).fetchone()[0]
+            if drops < 1:
+                print("self-check: FAIL — no stage_a.parser_drop events")
+                return 1
+
             xlsx_path = tmp_path / "self-check.xlsx"
             export_xlsx(con, xlsx_path)
             if not xlsx_path.is_file():
@@ -1255,7 +1332,8 @@ def self_check() -> int:
         print(
             f"self-check: PASS ({len(ops)} ops, {len(runs)} runs, "
             f"{len(tasks)} tasks, {len(episodes)} episodes, "
-            f"{len(shadow_rows)} shadow)"
+            f"{len(shadow_rows)} shadow, {len(compare_ends)} compare, "
+            f"{drops} parser_drop)"
         )
         return 0
     except Exception as e:  # noqa: BLE001

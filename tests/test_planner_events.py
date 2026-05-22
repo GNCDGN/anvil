@@ -589,5 +589,46 @@ class TestShadowDecisionPairing(_PlannerEventsBase):
         self.assertEqual({s["data"]["stage"] for s in shadow}, {"A", "B"})
 
 
+class TestStageAComparatorInPlanStep(_PlannerEventsBase):
+    """v3 Phase 0 Step 3 (V3P0-4): plan_step fires the comparator after
+    _parse_stage_a_response — a shadow_compare.begin/end pair per Stage A
+    call, in the same step (not literal adjacency to api_end)."""
+
+    def test_comparator_pair_fires_per_stage_a_call(self) -> None:
+        side = _make_fake({"A": [_STAGE_A_VALID], "B": [_STAGE_B_VALID]})
+        with mock.patch.object(
+            Planner, "_call_anthropic", autospec=True, side_effect=side,
+        ):
+            self.planner.plan_step(self.brief, self.state, 0)
+        kinds = [e["kind"] for e in self._events_for()]
+        # Exactly one begin + one end for the single Stage A call.
+        self.assertEqual(kinds.count("stage_a.shadow_compare.begin"), 1)
+        self.assertEqual(kinds.count("stage_a.shadow_compare.end"), 1)
+        # Same-step pairing: shadow_compare follows stage_a.parsed (not
+        # immediately after api_end — parser/parsed sit between).
+        i_parsed = kinds.index("planner.stage_a.parsed")
+        i_begin = kinds.index("stage_a.shadow_compare.begin")
+        i_end = kinds.index("stage_a.shadow_compare.end")
+        self.assertLess(i_parsed, i_begin)
+        self.assertLess(i_begin, i_end)
+
+    def test_comparator_identity_silent_miss_zero(self) -> None:
+        # routed == baseline (Phase 0) → silent_miss 0, jaccard 1.0, and
+        # silent_miss.detected never fires.
+        side = _make_fake({"A": [_STAGE_A_VALID], "B": [_STAGE_B_VALID]})
+        with mock.patch.object(
+            Planner, "_call_anthropic", autospec=True, side_effect=side,
+        ):
+            self.planner.plan_step(self.brief, self.state, 0)
+        evs = self._events_for()
+        end = next(e for e in evs
+                   if e["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(end["silent_miss_count"], 0)
+        self.assertEqual(end["hallucination_count"], 0)
+        self.assertEqual(end["jaccard_similarity"], 1.0)
+        self.assertNotIn("stage_a.silent_miss.detected",
+                         [e["kind"] for e in evs])
+
+
 if __name__ == "__main__":
     unittest.main()

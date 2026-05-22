@@ -152,7 +152,11 @@ class Planner:
             system=self._system_prompt, user=stage_a_prompt,
             timeout=_STAGE_A_TIMEOUT, step=step_idx + 1, stage="A",
         )
-        selected = _parse_stage_a_response(stage_a_resp, vault_index)
+        # v3 Phase 0 Step 3 (V3P0-5): pass step_idx so _parse_stage_a_response
+        # can attribute each stage_a.parser_drop event to this step.
+        selected = _parse_stage_a_response(
+            stage_a_resp, vault_index, step_idx=step_idx
+        )
         # paths_dropped_as_hallucinated = paths the model returned that
         # weren't in the vault_index. The parser already filters them
         # via `_parse_stage_a_response`; count via the difference.
@@ -168,6 +172,18 @@ class Planner:
                 "paths_dropped_as_hallucinated": dropped,
             },
             step_idx=step_idx,
+        )
+        # v3 Phase 0 Step 3 (V3P0-4): silent-miss comparator. Phase 0 feeds
+        # the same parsed selection on both sides (routed == baseline), so
+        # silent_miss_count is always 0 and jaccard always 1.0 — the path
+        # is wired and tested before Phase 1 supplies a real cheap-vs-Opus
+        # baseline. Lives here (not in _call_anthropic) because `selected`
+        # — the parsed Stage A response — only exists after the parse; the
+        # mock path inherits this via plan_step (no mocked.py wire needed).
+        _events.emit_stage_a_shadow_compare(
+            step_idx=step_idx,
+            routed_paths=selected,
+            baseline_paths=selected,
         )
         result = self._run_stage_b_with_retry(brief, state, step_idx, selected)
         if result.get("escalate"):
@@ -918,19 +934,36 @@ def _assemble_stage_a_prompt(
 
 
 def _parse_stage_a_response(
-    text: str, vault_index: dict[str, dict]
+    text: str, vault_index: dict[str, dict], step_idx: int | None = None
 ) -> list[str]:
     """Newline-split, strip, drop empties, filter to paths in vault_index
     (hallucination guard), then dedupe preserving first occurrence.
 
     The filter runs before the dedupe so the dedupe target is the
     surviving in-index set, not the raw response.
+
+    v3 Phase 0 Step 3 (V3P0-5): a non-empty line that is not in
+    vault_index is dropped (a hallucinated / out-of-index path); this was
+    silent before. Each such drop now emits one `stage_a.parser_drop`
+    event carrying the dropped path + step_idx, making the existing
+    behaviour observable. The emit is gated on `step_idx is not None`:
+    plan_step always supplies it, but the bare-function unit tests call
+    without a step (and without an active events run), so gating keeps
+    them from writing to the unknown-run sentinel.
     """
     seen: set[str] = set()
     out: list[str] = []
     for line in text.split("\n"):
         p = line.strip()
-        if not p or p not in vault_index:
+        if not p:
+            continue
+        if p not in vault_index:
+            if step_idx is not None:
+                _events.emit(
+                    "stage_a.parser_drop",
+                    {"step_idx": step_idx, "dropped_path": p},
+                    step_idx=step_idx,
+                )
             continue
         if p in seen:
             continue

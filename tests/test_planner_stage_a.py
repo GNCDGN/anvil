@@ -9,10 +9,14 @@ introduces _call_anthropic.
 """
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from anvil import events
 from anvil import planner
 from anvil.brief import parse_brief
 from anvil.state import init_state
@@ -145,6 +149,65 @@ class ParseStageAResponseTests(unittest.TestCase):
             planner._parse_stage_a_response("a\nb\na\nc\n", index),
             ["a", "b", "c"],
         )
+
+
+class ParserDropTelemetryTests(unittest.TestCase):
+    """v3 Phase 0 Step 3 (V3P0-5): _parse_stage_a_response emits one
+    stage_a.parser_drop per non-index path, gated on step_idx is not None."""
+
+    def setUp(self) -> None:
+        events._run_id = None
+        events._anchor_monotonic = None
+        events._drop_count = 0
+        events._logged_unknown_kinds = set()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+        self._env = mock.patch.dict(os.environ, {"ANVIL_ROOT": str(self.tmp_path)})
+        self._env.start()
+        events.begin_run("parser-drop-test")
+
+    def tearDown(self) -> None:
+        events.end_run()
+        self._env.stop()
+        self._tmp.cleanup()
+
+    def _events(self) -> list[dict]:
+        path = self.tmp_path / "state" / "runs" / "parser-drop-test" / "events.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
+                if l.strip()]
+
+    def test_parser_drop_fires_for_non_index_path(self) -> None:
+        # "a" and "c" are in index; "ghost" and "phantom" are not → 2 drops.
+        index = {"a": {}, "c": {}}
+        out = planner._parse_stage_a_response(
+            "a\nghost\nc\nphantom\n", index, step_idx=0
+        )
+        self.assertEqual(out, ["a", "c"])  # selection unchanged
+        drops = [e for e in self._events() if e["kind"] == "stage_a.parser_drop"]
+        self.assertEqual(len(drops), 2)
+        self.assertEqual({d["data"]["dropped_path"] for d in drops},
+                         {"ghost", "phantom"})
+        for d in drops:
+            self.assertEqual(d["data"]["step_idx"], 0)
+            self.assertEqual(d["step_idx"], 0)
+
+    def test_no_drop_event_when_step_idx_none(self) -> None:
+        # The safety gate: bare-function callers (no step context) emit
+        # nothing, so they can't write to the unknown-run sentinel.
+        index = {"a": {}}
+        out = planner._parse_stage_a_response("a\nghost\n", index)  # step_idx defaults None
+        self.assertEqual(out, ["a"])
+        drops = [e for e in self._events() if e["kind"] == "stage_a.parser_drop"]
+        self.assertEqual(len(drops), 0)
+
+    def test_duplicate_in_index_path_is_not_a_drop(self) -> None:
+        # A repeated in-index path is a dedup, not a parser_drop.
+        index = {"a": {}, "b": {}}
+        planner._parse_stage_a_response("a\nb\na\n", index, step_idx=2)
+        drops = [e for e in self._events() if e["kind"] == "stage_a.parser_drop"]
+        self.assertEqual(len(drops), 0)
 
 
 if __name__ == "__main__":

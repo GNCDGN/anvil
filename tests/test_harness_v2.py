@@ -935,5 +935,73 @@ class TestShadowDecisions(_HarnessTestBase):
         self.assertEqual(len(joined), 2)
 
 
+class TestSilentMissEpisodes(_HarnessTestBase):
+    """v3 Phase 0 Step 3 (V3P0-4): silent_miss_episodes is empty by
+    construction in Phase 0 (silent_miss_count = 0) and materializes the
+    moment a shadow_compare.end records a non-zero miss (Phase 1 shape)."""
+
+    def _ingest_compare_run(self, run_id, silent_miss, *, hallucination=0,
+                            jaccard=1.0):
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 500,
+                        "output_tokens": 50, "duration_ms": 900, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(11, "stage_a.shadow_compare.begin",
+                       {"step_idx": 0, "routed_paths": [], "baseline_paths": []},
+                       run_id=run_id, step_idx=0),
+            _event_row(12, "stage_a.shadow_compare.end",
+                       {"step_idx": 0, "silent_miss_count": silent_miss,
+                        "hallucination_count": hallucination,
+                        "jaccard_similarity": jaccard,
+                        "baseline_only_paths": [], "routed_only_paths": []},
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        return harness_v2.ingest(self.con, run_dir)
+
+    def test_view_queryable_and_empty_in_phase_0(self) -> None:
+        # Phase 0: silent_miss_count = 0 → the WHERE > 0 filter yields no
+        # rows, but the view is queryable.
+        self._ingest_compare_run("T9-nomiss", silent_miss=0)
+        rows = self.con.execute(
+            "SELECT * FROM silent_miss_episodes"
+        ).fetchall()
+        self.assertEqual(len(rows), 0)
+
+    def test_view_materializes_on_nonzero_miss(self) -> None:
+        # Phase 1 shape: a non-zero silent_miss surfaces one episode row,
+        # joined to run_metadata for task_id.
+        self._ingest_compare_run("T9-miss", silent_miss=3, hallucination=1,
+                                 jaccard=0.5)
+        rows = self.con.execute(
+            "SELECT run_id, task_id, mode, step_idx, silent_miss_count, "
+            "       hallucination_count, jaccard_similarity "
+            "FROM silent_miss_episodes WHERE run_id = 'T9-miss'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r[0], "T9-miss")
+        self.assertEqual(r[1], "T9")          # task_id via run_metadata join
+        self.assertEqual(r[2], "mock")
+        self.assertEqual(r[3], 0)
+        self.assertEqual(r[4], 3)             # silent_miss_count
+        self.assertEqual(r[5], 1)             # hallucination_count
+        self.assertEqual(r[6], 0.5)           # jaccard_similarity
+
+    def test_columns_match_declared_tuple(self) -> None:
+        self._ingest_compare_run("T9-miss2", silent_miss=1)
+        row = self.con.execute(
+            "SELECT * FROM silent_miss_episodes WHERE run_id='T9-miss2'"
+        ).fetchone()
+        self.assertEqual(len(row), len(harness_v2._SILENT_MISS_EPISODES_COLUMNS))
+
+
 if __name__ == "__main__":
     unittest.main()

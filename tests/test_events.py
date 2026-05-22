@@ -91,13 +91,15 @@ class TestEventSchema(_EventsTestBase):
             )
 
     def test_valid_kinds_catalogue_size(self) -> None:
-        # Pinned at 46 by the module's assert; this test surfaces drift
+        # Pinned at 50 by the module's assert; this test surfaces drift
         # at the test-suite level too. (45 → 46: v3 Phase 0 Step 2 added
-        # "shadow.decision".)
-        self.assertEqual(len(events.VALID_KINDS), 46)
+        # "shadow.decision". 46 → 50: v3 Phase 0 Step 3 added the four
+        # silent-miss / parser-drop kinds.)
+        self.assertEqual(len(events.VALID_KINDS), 50)
         # A few canonical kinds present:
         for k in ("run.start", "planner.stage_b.api_end",
-                  "ssh.stage.end", "telegram.poll.reply", "shadow.decision"):
+                  "ssh.stage.end", "telegram.poll.reply", "shadow.decision",
+                  "stage_a.shadow_compare.end", "stage_a.parser_drop"):
             self.assertIn(k, events.VALID_KINDS)
 
 
@@ -437,6 +439,86 @@ class TestShadowDecision(_EventsTestBase):
         self.assertEqual(row["data"]["shadow_route_candidate"], "claude-opus-4-7")
         self.assertEqual(row["data"]["actual_route_taken"], "claude-haiku-4-5")
         self.assertFalse(row["data"]["agreement"])
+
+
+class TestStageAComparator(_EventsTestBase):
+    """v3 Phase 0 Step 3 (V3P0-4): the comparator helper + the
+    shadow_compare emit pair, plus the four new kind validations."""
+
+    def test_new_kinds_validate(self) -> None:
+        for k in ("stage_a.shadow_compare.begin", "stage_a.shadow_compare.end",
+                  "stage_a.silent_miss.detected", "stage_a.parser_drop"):
+            self.assertIn(k, events.VALID_KINDS)
+            e = events.Event(ts="2026-05-20T10:15:42.000+00:00",
+                             run_id="r1", kind=k, data={})
+            self.assertEqual(e.kind, k)
+
+    def test_compare_identity_inputs(self) -> None:
+        # Phase 0 shape: routed == baseline → no miss, no hallucination,
+        # perfect similarity.
+        r = events.compare_stage_a_selections(["a", "b"], ["a", "b"])
+        self.assertEqual(r["silent_miss_count"], 0)
+        self.assertEqual(r["hallucination_count"], 0)
+        self.assertEqual(r["jaccard_similarity"], 1.0)
+        self.assertEqual(r["baseline_only_paths"], [])
+        self.assertEqual(r["routed_only_paths"], [])
+
+    def test_compare_empty_both_is_jaccard_one(self) -> None:
+        # Two empty selections are identical → jaccard 1.0 (not a div-by-0).
+        r = events.compare_stage_a_selections([], [])
+        self.assertEqual(r["silent_miss_count"], 0)
+        self.assertEqual(r["jaccard_similarity"], 1.0)
+
+    def test_compare_silent_miss_and_hallucination(self) -> None:
+        # baseline kept {a,b,c}; routed kept {a,x} → b,c silently missed,
+        # x hallucinated. jaccard = |{a}| / |{a,b,c,x}| = 1/4.
+        r = events.compare_stage_a_selections(["a", "x"], ["a", "b", "c"])
+        self.assertEqual(r["silent_miss_count"], 2)
+        self.assertEqual(r["baseline_only_paths"], ["b", "c"])
+        self.assertEqual(r["hallucination_count"], 1)
+        self.assertEqual(r["routed_only_paths"], ["x"])
+        self.assertAlmostEqual(r["jaccard_similarity"], 0.25)
+
+    def test_emit_pair_identity_no_silent_miss_detected(self) -> None:
+        events.begin_run("r1")
+        result = events.emit_stage_a_shadow_compare(
+            step_idx=0, routed_paths=["a", "b"], baseline_paths=["a", "b"],
+        )
+        events.end_run()
+        self.assertEqual(result["silent_miss_count"], 0)
+        rows = self._read_events("r1")
+        kinds = [r["kind"] for r in rows]
+        self.assertIn("stage_a.shadow_compare.begin", kinds)
+        self.assertIn("stage_a.shadow_compare.end", kinds)
+        # silent_miss.detected does NOT fire on identity inputs.
+        self.assertNotIn("stage_a.silent_miss.detected", kinds)
+        # begin carries only the inputs; end carries the four outputs.
+        begin = next(r for r in rows
+                     if r["kind"] == "stage_a.shadow_compare.begin")["data"]
+        self.assertEqual(set(begin) - {"step_idx"},
+                         {"routed_paths", "baseline_paths"})
+        end = next(r for r in rows
+                   if r["kind"] == "stage_a.shadow_compare.end")["data"]
+        for f in ("silent_miss_count", "hallucination_count",
+                  "jaccard_similarity", "baseline_only_paths",
+                  "routed_only_paths"):
+            self.assertIn(f, end)
+        self.assertEqual(end["jaccard_similarity"], 1.0)
+
+    def test_emit_pair_silent_miss_fires_detected(self) -> None:
+        # Cannot happen in Phase 0 (routed always == baseline), but the
+        # path must exist and fire for Phase 1.
+        events.begin_run("r1")
+        events.emit_stage_a_shadow_compare(
+            step_idx=1, routed_paths=["a"], baseline_paths=["a", "b"],
+        )
+        events.end_run()
+        rows = self._read_events("r1")
+        detected = [r for r in rows
+                    if r["kind"] == "stage_a.silent_miss.detected"]
+        self.assertEqual(len(detected), 1)
+        self.assertEqual(detected[0]["data"]["silent_miss_count"], 1)
+        self.assertEqual(detected[0]["data"]["baseline_only_paths"], ["b"])
 
 
 if __name__ == "__main__":
