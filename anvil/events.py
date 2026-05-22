@@ -140,6 +140,70 @@ VALID_KINDS: frozenset[str] = frozenset({
 assert len(VALID_KINDS) == 45, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
 
 # ---------------------------------------------------------------------------
+# v3 Phase 0 Step 1 — routing observability (V3P0-1)
+#
+# Five additive fields recorded on the four model-call event kinds
+# (planner.stage_{a,b,c}.api_end, coder.subprocess.end) so Phase 1's
+# active routing can be graded candidate-vs-actual. Phase 0 ships NO
+# routing logic: route_candidate always equals route_actual, no fallback
+# ever fires, and policy_version is the literal passive placeholder. The
+# fields are recorded, never acted on. `routing_observability()` is the
+# single shared producer — planner.py, mocked.py, and coder.py all import
+# events, so the shape lives here once rather than duplicated per site.
+# ---------------------------------------------------------------------------
+
+POLICY_VERSION_PHASE_0 = "v3-phase-0-passive"
+
+
+def _compute_features_seen(
+    stage: str,
+    step_idx: int | None,
+    observed_prompt_token_count: int | None,
+    context_paths_count: int | None,
+) -> dict[str, Any]:
+    """The feature inputs a Phase 1 policy engine would consume.
+
+    Phase 0 records them; nothing reads them yet. All four keys are
+    always present (None/0 fallbacks where a value is unavailable, e.g.
+    a Planner error path with no usage), so the structural "contains at
+    minimum the four named features" check holds on every row.
+    """
+    return {
+        "observed_prompt_token_count": observed_prompt_token_count,
+        "step_idx": step_idx,
+        "stage": stage,
+        "context_paths_count": context_paths_count,
+    }
+
+
+def routing_observability(
+    *,
+    stage: str,
+    step_idx: int | None,
+    observed_prompt_token_count: int | None,
+    context_paths_count: int | None,
+    route_actual: str | None,
+) -> dict[str, Any]:
+    """Return the five v3 Phase 0 routing-observability fields, ready to
+    merge into an event's `data` payload.
+
+    Phase 0 is passive: `route_candidate` mirrors `route_actual` (no
+    policy engine selects an alternative), `route_fallback_fired` is
+    always False (no fallback paths exist), and `policy_version` is the
+    literal placeholder. Wire Phase 1's policy engine here when it lands.
+    """
+    return {
+        "route_candidate": route_actual,
+        "route_actual": route_actual,
+        "route_fallback_fired": False,
+        "policy_version": POLICY_VERSION_PHASE_0,
+        "features_seen": _compute_features_seen(
+            stage, step_idx, observed_prompt_token_count, context_paths_count
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Module-global run state
 # ---------------------------------------------------------------------------
 

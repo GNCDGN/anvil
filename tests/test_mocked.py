@@ -140,6 +140,29 @@ class TestMockedPlannerCallAnthropic(_MockedTestBase):
         kinds = [e["kind"] for e in self._events()]
         self.assertIn("planner.stage_b.api_end", kinds)
 
+    def test_synthesised_api_end_carries_routing_fields(self) -> None:
+        # v3 Phase 0 Step 1 (V3P0-1): the MockedPlanner emit carries the
+        # five routing fields, same shape as the production wrapper.
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        p = MockedPlanner(model="claude-opus-4-7")
+        p._current_step_idx = 0
+        p._current_context_paths_count = 3
+        p._call_anthropic(system="(sys)", user="(usr)", timeout=30,
+                          step=1, stage="A")
+        end = next(e for e in self._events()
+                   if e["kind"] == "planner.stage_a.api_end")
+        d = end["data"]
+        self.assertEqual(d["route_actual"], "claude-opus-4-7")
+        self.assertEqual(d["route_candidate"], "claude-opus-4-7")
+        self.assertFalse(d["route_fallback_fired"])
+        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        fs = d["features_seen"]
+        self.assertEqual(fs["stage"], "A")
+        self.assertEqual(fs["step_idx"], 0)
+        self.assertEqual(fs["context_paths_count"], 3)
+        # observed_prompt_token_count mirrors input_tokens (T1-step0.usage.json).
+        self.assertEqual(fs["observed_prompt_token_count"], d["input_tokens"])
+
     def test_missing_task_id_raises(self) -> None:
         os.environ["MOCKED_TASK_ID"] = ""
         p = MockedPlanner(model="claude-opus-4-7")

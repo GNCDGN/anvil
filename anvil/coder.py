@@ -471,6 +471,11 @@ class Coder:
         # JSON support) so mock-mode runs correctly record no Coder cost.
         coder_usage = None
         coder_total_cost_usd = None
+        # v3 Phase 0 Step 1 (V3P0-1): the actual model the claude -p
+        # subprocess ran, read from the JSON envelope's `model` field.
+        # Stays None on the fallback paths (mock mode emits no JSON
+        # envelope, error cases) → the emit records "unknown" there.
+        coder_model = None
         try:
             proc = self._real_run(cmd, prompt, str(repo))
             raw_stdout = proc.stdout or ""
@@ -488,6 +493,7 @@ class Coder:
                 stdout = env.get("result") or ""
                 coder_usage = env.get("usage")
                 coder_total_cost_usd = env.get("total_cost_usd")
+                coder_model = env.get("model")
             else:
                 stdout = raw_stdout
         except subprocess.TimeoutExpired as e:
@@ -542,6 +548,23 @@ class Coder:
                     (coder_usage or {}).get("cache_creation_input_tokens"),
                 "cache_read_input_tokens":
                     (coder_usage or {}).get("cache_read_input_tokens"),
+                # v3 Phase 0 Step 1 (V3P0-1): routing observability for the
+                # Coder. route_actual is the subprocess's actual model from
+                # the envelope, or "unknown" when no envelope is present
+                # (every mock-mode row, by construction). observed prompt
+                # size is the sum of the three usage token lines; the
+                # context size is the count of plan paths the step targets.
+                **_events.routing_observability(
+                    stage="coder",
+                    step_idx=step_idx_evt,
+                    observed_prompt_token_count=(
+                        ((coder_usage or {}).get("input_tokens") or 0)
+                        + ((coder_usage or {}).get("cache_creation_input_tokens") or 0)
+                        + ((coder_usage or {}).get("cache_read_input_tokens") or 0)
+                    ),
+                    context_paths_count=len(plan_files),
+                    route_actual=(coder_model or "unknown"),
+                ),
             },
             step_idx=step_idx_evt,
         )

@@ -141,7 +141,13 @@ class Planner:
         )
         # _call_anthropic emits planner.stage_a.api_end from inside.
         # Stash step_idx on self so the wrapper picks it up.
+        # v3 Phase 0 Step 1 (V3P0-2): also stash context_paths_count so
+        # the wrapper's routing-observability emit can record it without
+        # widening _call_anthropic's brief-agnostic signature.
         self._current_step_idx = step_idx
+        self._current_context_paths_count = len(
+            getattr(brief, "context_paths", []) or []
+        )
         stage_a_resp = self._call_anthropic(
             system=self._system_prompt, user=stage_a_prompt,
             timeout=_STAGE_A_TIMEOUT, step=step_idx + 1, stage="A",
@@ -262,6 +268,18 @@ class Planner:
                         u.cache_read_input_tokens or 0,
                     "duration_ms": int(duration * 1000),
                     "ok": True,
+                    # v3 Phase 0 Step 1 (V3P0-1): routing observability.
+                    # Passive — route_actual is self.model (Opus); the
+                    # observed prompt size is the API's reported input_tokens.
+                    **_events.routing_observability(
+                        stage=stage,
+                        step_idx=getattr(self, "_current_step_idx", None),
+                        observed_prompt_token_count=u.input_tokens,
+                        context_paths_count=getattr(
+                            self, "_current_context_paths_count", None
+                        ),
+                        route_actual=self.model,
+                    ),
                 },
                 step_idx=getattr(self, "_current_step_idx", None),
             )
@@ -297,6 +315,19 @@ class Planner:
                             "model": self.model,
                             "ok": False,
                             "error": "rate-limit/timeout",
+                            # v3 Phase 0 Step 1 (V3P0-1): error-path
+                            # api_end still carries the five fields;
+                            # observed_prompt_token_count is None (the
+                            # call failed, no usage was returned).
+                            **_events.routing_observability(
+                                stage=stage,
+                                step_idx=getattr(self, "_current_step_idx", None),
+                                observed_prompt_token_count=None,
+                                context_paths_count=getattr(
+                                    self, "_current_context_paths_count", None
+                                ),
+                                route_actual=self.model,
+                            ),
                         },
                         step_idx=getattr(self, "_current_step_idx", None),
                     )
@@ -313,6 +344,17 @@ class Planner:
                     "model": self.model,
                     "ok": False,
                     "error": str(e)[:300],
+                    # v3 Phase 0 Step 1 (V3P0-1): error-path api_end
+                    # carries the five fields; no usage on this path.
+                    **_events.routing_observability(
+                        stage=stage,
+                        step_idx=getattr(self, "_current_step_idx", None),
+                        observed_prompt_token_count=None,
+                        context_paths_count=getattr(
+                            self, "_current_context_paths_count", None
+                        ),
+                        route_actual=self.model,
+                    ),
                 },
                 step_idx=getattr(self, "_current_step_idx", None),
             )
@@ -368,6 +410,11 @@ class Planner:
             step_idx=step_idx,
         )
         self._current_step_idx = step_idx
+        # v3 Phase 0 Step 1 (V3P0-2): stash context_paths_count alongside
+        # step_idx (the retry call below reuses the same stash).
+        self._current_context_paths_count = len(
+            getattr(brief, "context_paths", []) or []
+        )
         response = self._call_anthropic(
             system=system, user=user_prompt, timeout=self.timeout,
             step=step_no, stage="B",
@@ -523,6 +570,19 @@ class Planner:
         """
         system = getattr(self, "_artefacts_prompt", "")
         user_prompt = _assemble_artefacts_prompt(brief, state)
+
+        # v3 Phase 0 Step 1 (V3P0-2): close the V2P1-3 stash gap for
+        # Stage C. Pre-Step-1, draft_completion_artefacts set neither
+        # stash, so planner.stage_c.api_end carried a STALE
+        # _current_step_idx left over from whatever Stage B last ran.
+        # Stage C is post-build / run-level, so step_idx is None; the
+        # stash now reflects that intent rather than leaking Stage B's
+        # value. The historical stale artefact in v2 Stage C events is
+        # documented (notes.md V3P0-2) but not retroactively repaired.
+        self._current_step_idx = None
+        self._current_context_paths_count = len(
+            getattr(brief, "context_paths", []) or []
+        )
 
         response = self._call_anthropic(
             system=system, user=user_prompt, timeout=self.timeout or 120,

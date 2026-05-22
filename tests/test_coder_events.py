@@ -216,5 +216,73 @@ class TestCoderEvents(_CoderEventsBase):
                          len(captured["text"]))
 
 
+class TestCoderRoutingObservability(_CoderEventsBase):
+    """v3 Phase 0 Step 1 (V3P0-1): coder.subprocess.end carries the five
+    routing fields. route_actual is the envelope's model, or "unknown"
+    when the subprocess emits no JSON envelope (every mock-mode row)."""
+
+    def test_non_json_stdout_route_actual_unknown(self) -> None:
+        # Non-JSON stdout (the MockedCoder shape) → no envelope → "unknown".
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["git", "-C"]:
+                return _real_run(cmd, **kw)
+            (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            return _proc(0, "[anvil-coder] mocked execution\n", "")
+
+        with mock.patch.object(coder.subprocess, "run", side_effect=fake_run):
+            self.coder.execute_step(
+                _plan(files_to_touch=["a.py"]), _brief(self.repo)
+            )
+        end = next(e for e in self._events()
+                   if e["kind"] == "coder.subprocess.end")
+        d = end["data"]
+        self.assertEqual(d["route_actual"], "unknown")
+        self.assertEqual(d["route_candidate"], "unknown")
+        self.assertFalse(d["route_fallback_fired"])
+        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        fs = d["features_seen"]
+        self.assertEqual(fs["stage"], "coder")
+        # context_paths_count = len(plan.files_to_touch).
+        self.assertEqual(fs["context_paths_count"], 1)
+        # No usage envelope → token sum is 0 (not None — the Coder sums
+        # three usage lines, each coalesced to 0 when absent).
+        self.assertEqual(fs["observed_prompt_token_count"], 0)
+
+    def test_json_envelope_route_actual_is_model(self) -> None:
+        # A real-shaped JSON envelope carries model + usage → route_actual
+        # is that model, observed token count is the three-line sum.
+        envelope = json.dumps({
+            "result": "done",
+            "model": "claude-sonnet-4-6",
+            "total_cost_usd": 0.012,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 30,
+                "cache_read_input_tokens": 5,
+            },
+        })
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["git", "-C"]:
+                return _real_run(cmd, **kw)
+            (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            return _proc(0, envelope, "")
+
+        with mock.patch.object(coder.subprocess, "run", side_effect=fake_run):
+            self.coder.execute_step(
+                _plan(files_to_touch=["a.py"]), _brief(self.repo)
+            )
+        end = next(e for e in self._events()
+                   if e["kind"] == "coder.subprocess.end")
+        d = end["data"]
+        self.assertEqual(d["route_actual"], "claude-sonnet-4-6")
+        self.assertEqual(d["route_candidate"], "claude-sonnet-4-6")
+        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        # observed_prompt_token_count = 100 + 30 + 5 = 135.
+        self.assertEqual(d["features_seen"]["observed_prompt_token_count"], 135)
+        self.assertEqual(d["features_seen"]["stage"], "coder")
+
+
 if __name__ == "__main__":
     unittest.main()

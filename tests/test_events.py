@@ -310,5 +310,72 @@ class TestAppendModeHotPath(_EventsTestBase):
         self.assertEqual([r["data"]["i"] for r in step_rows], list(range(30)))
 
 
+class TestRoutingObservability(_EventsTestBase):
+    """v3 Phase 0 Step 1 (V3P0-1): the routing_observability helper shape
+    and its round-trip through the events.jsonl emit path."""
+
+    _FEATURE_KEYS = {
+        "observed_prompt_token_count", "step_idx", "stage",
+        "context_paths_count",
+    }
+
+    def test_helper_returns_five_passive_fields(self) -> None:
+        fields = events.routing_observability(
+            stage="B", step_idx=2, observed_prompt_token_count=500,
+            context_paths_count=4, route_actual="claude-opus-4-7",
+        )
+        self.assertEqual(set(fields), {
+            "route_candidate", "route_actual", "route_fallback_fired",
+            "policy_version", "features_seen",
+        })
+        # Passive: candidate mirrors actual, no fallback, literal stamp.
+        self.assertEqual(fields["route_candidate"], "claude-opus-4-7")
+        self.assertEqual(fields["route_actual"], "claude-opus-4-7")
+        self.assertFalse(fields["route_fallback_fired"])
+        self.assertEqual(fields["policy_version"], "v3-phase-0-passive")
+        self.assertEqual(fields["policy_version"], events.POLICY_VERSION_PHASE_0)
+
+    def test_features_seen_always_carries_four_keys(self) -> None:
+        # All four keys present even when values are None (error-path shape).
+        fields = events.routing_observability(
+            stage="A", step_idx=None, observed_prompt_token_count=None,
+            context_paths_count=None, route_actual="claude-opus-4-7",
+        )
+        fs = fields["features_seen"]
+        self.assertEqual(set(fs), self._FEATURE_KEYS)
+        self.assertEqual(fs["stage"], "A")
+        self.assertIsNone(fs["observed_prompt_token_count"])
+        self.assertIsNone(fs["step_idx"])
+        self.assertIsNone(fs["context_paths_count"])
+
+    def test_fields_round_trip_through_jsonl(self) -> None:
+        events.begin_run("r1")
+        events.emit(
+            "planner.stage_b.api_end",
+            {
+                "model": "claude-opus-4-7", "ok": True,
+                **events.routing_observability(
+                    stage="B", step_idx=0, observed_prompt_token_count=777,
+                    context_paths_count=3, route_actual="claude-opus-4-7",
+                ),
+            },
+            step_idx=0,
+        )
+        events.end_run()
+        rows = self._read_events("r1")
+        api_end = [r for r in rows if r["kind"] == "planner.stage_b.api_end"]
+        self.assertEqual(len(api_end), 1)
+        data = api_end[0]["data"]
+        self.assertEqual(data["route_candidate"], "claude-opus-4-7")
+        self.assertEqual(data["route_actual"], "claude-opus-4-7")
+        self.assertFalse(data["route_fallback_fired"])
+        self.assertEqual(data["policy_version"], "v3-phase-0-passive")
+        # features_seen survives as a nested object, all four keys intact.
+        self.assertEqual(set(data["features_seen"]), self._FEATURE_KEYS)
+        self.assertEqual(data["features_seen"]["observed_prompt_token_count"], 777)
+        self.assertEqual(data["features_seen"]["stage"], "B")
+        self.assertEqual(data["features_seen"]["context_paths_count"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

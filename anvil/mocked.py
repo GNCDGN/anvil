@@ -148,17 +148,33 @@ class MockedPlanner(Planner):
         # `self.model` (notes.md Step 4 outcome finding 2 — operations
         # view filters on model).
         stage_key = stage.lower()
+        observed_input_tokens = int(usage.get("input_tokens", 0))
         _events.emit(
             f"planner.stage_{stage_key}.api_end",
             {
                 "step_idx": step_idx,
                 "model": self.model,
-                "input_tokens": int(usage.get("input_tokens", 0)),
+                "input_tokens": observed_input_tokens,
                 "output_tokens": int(usage.get("output_tokens", 0)),
                 "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0)),
                 "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0)),
                 "duration_ms": jitter_ms,
                 "ok": True,
+                # v3 Phase 0 Step 1 (V3P0-1): routing observability,
+                # same shape as the production wrapper. route_actual is
+                # self.model (the inherited plan_step / Stage-C path
+                # stashes _current_context_paths_count before this
+                # override runs, since MockedPlanner overrides only
+                # _call_anthropic).
+                **_events.routing_observability(
+                    stage=stage,
+                    step_idx=step_idx,
+                    observed_prompt_token_count=observed_input_tokens,
+                    context_paths_count=getattr(
+                        self, "_current_context_paths_count", None
+                    ),
+                    route_actual=self.model,
+                ),
             },
             step_idx=step_idx,
         )

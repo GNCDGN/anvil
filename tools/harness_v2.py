@@ -323,7 +323,17 @@ SELECT
     CAST(json_extract(e.data, '$.latency_ms_user') AS BIGINT) AS escalation_user_latency_ms,
     CAST(json_extract(e.data, '$.retry_attempt') AS BIGINT) AS retry_attempt,
     CAST(json_extract(e.data, '$.out_of_scope_count') AS BIGINT) AS out_of_scope_count,
-    CAST(json_extract(e.data, '$.reply_text_chars') AS BIGINT) AS poll_reply_chars
+    CAST(json_extract(e.data, '$.reply_text_chars') AS BIGINT) AS poll_reply_chars,
+    -- v3 Phase 0 Step 1 (V3P0-1): routing observability columns. Populated
+    -- on the four model-call kinds (planner.stage_{a,b,c}.api_end,
+    -- coder.subprocess.end); NULL on the other operation kinds (additive,
+    -- back-compatible). features_seen is kept as DuckDB JSON via
+    -- json_extract (NOT json_extract_string — that would stringify it).
+    json_extract_string(e.data, '$.route_candidate') AS route_candidate,
+    json_extract_string(e.data, '$.route_actual') AS route_actual,
+    CAST(json_extract(e.data, '$.route_fallback_fired') AS BOOLEAN) AS route_fallback_fired,
+    json_extract_string(e.data, '$.policy_version') AS policy_version,
+    json_extract(e.data, '$.features_seen') AS features_seen
 FROM events e
 -- v2 Phase 2 Step 1: JOIN on the composite (run_id, mode) to match
 -- run_metadata's composite PK. With the same run_id potentially
@@ -362,6 +372,9 @@ _OPERATIONS_COLUMNS: tuple[str, ...] = (
     "exit_code", "ok", "validation_result",
     "escalation_reason", "escalation_user_latency_ms",
     "retry_attempt", "out_of_scope_count", "poll_reply_chars",
+    # v3 Phase 0 Step 1 (V3P0-1): routing observability columns.
+    "route_candidate", "route_actual", "route_fallback_fired",
+    "policy_version", "features_seen",
 )
 
 

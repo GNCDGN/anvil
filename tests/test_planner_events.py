@@ -462,5 +462,63 @@ class TestCacheControl(_PlannerEventsBase):
         self.assertEqual(data["cache_read_input_tokens"], 2603)
 
 
+class TestRoutingObservability(_PlannerEventsBase):
+    """v3 Phase 0 Step 1 (V3P0-1): the five routing fields fire from the
+    real `_call_anthropic` emit site (success + error paths). Exercises
+    the production wrapper against a fake streaming client."""
+
+    def test_success_path_carries_five_routing_fields(self) -> None:
+        client, _ = _make_fake_client(
+            input_tokens=620, output_tokens=40, cache_creation=0, cache_read=2603,
+        )
+        self.planner._client = client
+        # Mirror the stash plan_step / _run_stage_b_with_retry set.
+        self.planner._current_step_idx = 1
+        self.planner._current_context_paths_count = 5
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=2, stage="B",
+        )
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_b.api_end")
+        d = end["data"]
+        # route_actual is self.model (the test planner's model string).
+        self.assertEqual(d["route_actual"], "claude-opus-4-7-test")
+        self.assertEqual(d["route_candidate"], d["route_actual"])
+        self.assertFalse(d["route_fallback_fired"])
+        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        fs = d["features_seen"]
+        # observed_prompt_token_count is the API's input_tokens (620).
+        self.assertEqual(fs["observed_prompt_token_count"], 620)
+        self.assertEqual(fs["step_idx"], 1)
+        self.assertEqual(fs["stage"], "B")
+        self.assertEqual(fs["context_paths_count"], 5)
+
+    def test_error_path_carries_fields_with_null_token_count(self) -> None:
+        # A client whose stream() raises a non-retryable error → the
+        # broad-Exception emit path (ok=False) still carries the fields.
+        client = mock.MagicMock()
+        client.with_options.return_value = client
+        client.messages.stream.side_effect = RuntimeError("boom")
+        self.planner._client = client
+        self.planner._current_step_idx = 0
+        self.planner._current_context_paths_count = 2
+        out = self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=1, stage="A",
+        )
+        self.assertEqual(out, "")  # wrapper-level failure returns empty
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_a.api_end")
+        d = end["data"]
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["route_actual"], "claude-opus-4-7-test")
+        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        self.assertFalse(d["route_fallback_fired"])
+        fs = d["features_seen"]
+        # No usage on the error path → token count is None, keys still present.
+        self.assertIsNone(fs["observed_prompt_token_count"])
+        self.assertEqual(fs["stage"], "A")
+        self.assertEqual(fs["context_paths_count"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

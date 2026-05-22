@@ -105,6 +105,91 @@ class TestIngestRoundTrip(_HarnessTestBase):
         self.assertEqual(first_count, second_count)
 
 
+class TestRoutingObservabilityColumns(_HarnessTestBase):
+    """v3 Phase 0 Step 1 (V3P0-1): the operations view exposes the five
+    routing columns, correctly typed, with features_seen as queryable
+    JSON (not a stringified blob)."""
+
+    def _ingest_routing_run(self) -> None:
+        run_dir = self.tmp_path / "T9-routing"
+        run_dir.mkdir()
+        routing = {
+            "route_candidate": "claude-opus-4-7",
+            "route_actual": "claude-opus-4-7",
+            "route_fallback_fired": False,
+            "policy_version": "v3-phase-0-passive",
+            "features_seen": {
+                "observed_prompt_token_count": 620,
+                "step_idx": 0,
+                "stage": "B",
+                "context_paths_count": 4,
+            },
+        }
+        events = [
+            _event_row(0, "run.start", {}, run_id="T9-routing"),
+            _event_row(
+                10, "planner.stage_b.api_end",
+                {"model": "claude-opus-4-7", "input_tokens": 620,
+                 "output_tokens": 40, "cache_creation_input_tokens": 0,
+                 "cache_read_input_tokens": 0, "duration_ms": 900, "ok": True,
+                 **routing},
+                run_id="T9-routing", step_idx=0,
+            ),
+            _event_row(20, "run.end", {"drops": 0}, run_id="T9-routing"),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8",
+        )
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+    def test_five_columns_present_in_tuple(self) -> None:
+        for col in ("route_candidate", "route_actual", "route_fallback_fired",
+                    "policy_version", "features_seen"):
+            self.assertIn(col, harness_v2._OPERATIONS_COLUMNS)
+
+    def test_columns_queryable_and_typed(self) -> None:
+        self._ingest_routing_run()
+        row = self.con.execute(
+            "SELECT route_candidate, route_actual, route_fallback_fired, "
+            "       policy_version "
+            "FROM operations WHERE run_id = 'T9-routing' "
+            "  AND operation_kind = 'planner.stage_b.api_end'"
+        ).fetchone()
+        self.assertEqual(row[0], "claude-opus-4-7")
+        self.assertEqual(row[1], "claude-opus-4-7")
+        # route_fallback_fired comes back as a real BOOLEAN, not a string.
+        self.assertIs(row[2], False)
+        self.assertEqual(row[3], "v3-phase-0-passive")
+
+    def test_features_seen_is_json_not_stringified(self) -> None:
+        self._ingest_routing_run()
+        # If features_seen is stored as JSON, json_extract_string can reach
+        # into it directly from the view column. A stringified blob would
+        # require an extra parse step and this would return NULL.
+        row = self.con.execute(
+            "SELECT json_extract_string(features_seen, '$.stage'), "
+            "       CAST(json_extract(features_seen, '$.context_paths_count') AS BIGINT) "
+            "FROM operations WHERE run_id = 'T9-routing' "
+            "  AND operation_kind = 'planner.stage_b.api_end'"
+        ).fetchone()
+        self.assertEqual(row[0], "B")
+        self.assertEqual(row[1], 4)
+
+    def test_routing_columns_null_on_non_model_kinds(self) -> None:
+        # Additive + back-compatible: a non-model-call kind (run.end isn't
+        # in the operations view, so use a clean fixture's smoke.end row)
+        # has NULL routing columns. Ingest the clean fixture and check.
+        harness_v2.ingest(self.con, _CLEAN_DIR)
+        rows = self.con.execute(
+            "SELECT route_actual, policy_version FROM operations "
+            "WHERE run_id = 'T1-doc-edit-mock' AND operation_kind = 'smoke.end'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0][0])
+        self.assertIsNone(rows[0][1])
+
+
 class TestOperationsView(_HarnessTestBase):
 
     def test_clean_fixture_operations_count_and_columns(self) -> None:
