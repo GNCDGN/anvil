@@ -150,15 +150,23 @@ class PlannerPromptHardeningTests(unittest.TestCase):
         self.assertIn(reminder, self.system_text[-400:],
                       "reminder is not near the end of the prompt")
 
-    def test_stage_b_prompt_lists_every_required_field(self):
-        """The user-prompt instruction block carries the eleven-field
-        checklist too — defence in depth, since the user prompt is the
-        last thing the model reads before responding."""
-        for field in _REQUIRED_PLAN_FIELDS:
-            self.assertIn(
-                field, self.stage_b_text,
-                f"required field {field!r} not in planner-stage-b.md",
-            )
+    def test_stage_b_prompt_delegates_field_enumeration_to_cached_system_prompt(self):
+        """v2 Phase 4 Step 2 slim: the eleven-field parenthetical
+        enumeration was cut from planner-stage-b.md — it was redundant
+        with the cached planner-system.md hard-schema block (lines 23-33)
+        and verification reminder (line 79), both of which ship on every
+        call once the system prompt is cache_control'd. The Stage B user
+        prompt keeps the field-completeness NUDGE (asserted by
+        test_stage_b_prompt_carries_pre_output_checklist_phrase) but no
+        longer names the fields; the canonical enumeration lives only in
+        the system prompt (guarded by
+        test_system_prompt_lists_every_required_field), so the V2P2-4
+        signal is preserved — just relocated, not duplicated."""
+        # The redundant comma-separated enumeration is gone (this exact
+        # sequence only ever existed in the parenthetical).
+        self.assertNotIn("step_number, step_name", self.stage_b_text)
+        # The field-completeness nudge is retained.
+        self.assertIn("all eleven required fields", self.stage_b_text)
 
     def test_stage_b_prompt_carries_pre_output_checklist_phrase(self):
         """The Stage B user prompt frames the eleven-field check as a
