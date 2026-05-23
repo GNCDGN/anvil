@@ -347,6 +347,7 @@ def emit_stage_a_shadow_compare(
     step_idx: int | None,
     routed_paths: list[str],
     baseline_paths: list[str],
+    baseline_source: str = "identity",
 ) -> dict[str, Any]:
     """Emit the begin/end pair around a Stage A selection comparison.
 
@@ -356,6 +357,13 @@ def emit_stage_a_shadow_compare(
     `stage_a.silent_miss.detected` — by construction this never fires in
     Phase 0 (routed == baseline), but the path is live for Phase 1.
     Returns the comparator result dict. Never raises (delegates to emit).
+
+    v3 Phase 1c Step 3 (Step3C-F1): `baseline_source` records WHERE the
+    baseline selection came from — `"historical"` (option-(b) DB lookup hit),
+    `"parallel"` (option-(a) live parallel-Opus fallback on a lookup miss), or
+    `"identity"` (non-canary: baseline == routed). A data field on the existing
+    shadow_compare kinds (no new VALID_KINDS entry); lets Phase 2 distinguish
+    option-a/b episodes when grading rich-context silent_miss.
     """
     emit(
         "stage_a.shadow_compare.begin",
@@ -363,13 +371,14 @@ def emit_stage_a_shadow_compare(
             "step_idx": step_idx,
             "routed_paths": list(routed_paths or []),
             "baseline_paths": list(baseline_paths or []),
+            "baseline_source": baseline_source,
         },
         step_idx=step_idx,
     )
     result = compare_stage_a_selections(routed_paths, baseline_paths)
     emit(
         "stage_a.shadow_compare.end",
-        {"step_idx": step_idx, **result},
+        {"step_idx": step_idx, "baseline_source": baseline_source, **result},
         step_idx=step_idx,
     )
     if result["silent_miss_count"] > 0:

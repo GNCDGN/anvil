@@ -87,6 +87,7 @@ class Planner:
         stage_b_model: str | None = None,
         stage_c_model: str | None = None,
         policy=None,
+        historical_baseline=None,
     ) -> None:
         self.api_key = api_key
         # v3 Phase 1a Step 1: per-stage model plumbing replaces the single
@@ -157,6 +158,9 @@ class Planner:
         self._policy = policy if policy is not None else RoutingPolicy(
             PHASE_1A_PLACEHOLDER
         )
+        # v3 Phase 1c Step 3 (V3P1C-3): comparator option-(b). None → the canary
+        # always uses the live parallel-Opus baseline (Phase 1b-equivalent).
+        self._historical_baseline = historical_baseline
 
     def _model_for_stage(self, stage: str) -> str:
         """v3 Phase 1a Step 1: resolve the model for a Planner stage.
@@ -293,16 +297,33 @@ class Planner:
             and decision.route_actual != self._model_for_stage("A")
         )
         if canary_fired:
-            baseline_resp = self._stage_a_canary_baseline(stage_a_prompt, step_idx)
-            baseline_selected = _parse_stage_a_response(
-                baseline_resp, vault_index, step_idx=step_idx
-            )
+            # v3 Phase 1c Step 3 (V3P1C-3): comparator option-(b). Try the
+            # historical baseline first (a DB lookup, no API cost); fall back to
+            # the live parallel-Opus call (option-a) only on a lookup miss. A
+            # reconstructed ∅ (empty list) is a HIT (baseline_source=historical);
+            # None is a miss (Step3C-F1).
+            historical = None
+            if self._historical_baseline is not None:
+                task_id = _base_task_from_run_id(_events.current_run_id())
+                if task_id:
+                    historical = self._historical_baseline.lookup(task_id, step_idx)
+            if historical is not None:
+                baseline_selected = historical
+                baseline_source = "historical"
+            else:
+                baseline_resp = self._stage_a_canary_baseline(stage_a_prompt, step_idx)
+                baseline_selected = _parse_stage_a_response(
+                    baseline_resp, vault_index, step_idx=step_idx
+                )
+                baseline_source = "parallel"
         else:
             baseline_selected = selected
+            baseline_source = "identity"
         _events.emit_stage_a_shadow_compare(
             step_idx=step_idx,
             routed_paths=selected,
             baseline_paths=baseline_selected,
+            baseline_source=baseline_source,
         )
         result = self._run_stage_b_with_retry(brief, state, step_idx, selected)
         if result.get("escalate"):
@@ -1221,6 +1242,74 @@ def _split_user_for_brief_cache(user_text: str) -> "list[dict] | str":
         {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
+
+
+# v3 Phase 1c Step 3 (V3P1C-3): comparator option-(b) — the historical
+# baseline. The canary's silent-miss comparator needs a ground-truth Opus
+# Stage A selection; Phase 1b ran a live parallel Opus call per canary
+# (option-a, ~$0.083 each). Option-(b) looks that selection up from a prior
+# real sweep instead, dropping the parallel cost. The recorded
+# planner.stage_a.parsed carries paths_returned (a COUNT), not the path list
+# (Step3C-F1) — so the baseline is reconstructed: paths_returned == 0 → ∅
+# (the empty-context corpus, where Opus selects nothing); paths_returned > 0
+# → None (can't reconstruct the set → caller falls back to the parallel call,
+# Step3C-F3 marks recording selected_paths as the Phase 2 prerequisite).
+_BASELINE_MODE_SUFFIXES = ("-mock", "-real", "-unknown")
+
+
+def _base_task_from_run_id(run_id: "str | None") -> "str | None":
+    """Strip the mode suffix from a run_id → the mode-independent task label.
+
+    `"T1-doc-edit-mock"` → `"T1-doc-edit"`. The historical baseline is always
+    the `-real` run regardless of the current mode, so the caller appends
+    `-real` to look it up. Returns None for an empty run_id."""
+    if not run_id:
+        return None
+    for suf in _BASELINE_MODE_SUFFIXES:
+        if run_id.endswith(suf):
+            return run_id[: -len(suf)]
+    return run_id
+
+
+class HistoricalBaselineProvider:
+    """v3 Phase 1c Step 3 (V3P1C-3): comparator option-(b) baseline source.
+
+    Wraps a prior sweep's DuckDB (default the Phase 1b exit-sweep) and returns
+    the recorded Opus Stage A selection for a (task, step). Never raises —
+    a missing/broken DB, a missing row, or an unreconstructable selection all
+    return None so the caller falls back to the live parallel-Opus baseline."""
+
+    def __init__(self, db_path: "Path | str | None") -> None:
+        self._db_path = Path(db_path) if db_path else None
+
+    def lookup(self, task_id: str, step_idx: int) -> "list[str] | None":
+        """Return the reconstructed baseline selection for (task_id, step_idx),
+        or None if it can't be reconstructed (→ caller uses the parallel call).
+
+        Reconstruction (Step3C-F1): the recorded `planner.stage_a.parsed`
+        carries `paths_returned` only. 0 → [] (∅, exact for empty-context);
+        > 0 → None (the path list isn't recorded — Phase 2 must emit it)."""
+        if not self._db_path or not self._db_path.is_file():
+            return None
+        try:
+            import duckdb
+            con = duckdb.connect(str(self._db_path), read_only=True)
+            try:
+                row = con.execute(
+                    "SELECT CAST(json_extract(data, '$.paths_returned') AS BIGINT) "
+                    "FROM events WHERE kind = 'planner.stage_a.parsed' "
+                    "AND run_id = ? AND mode = 'real' AND step_idx = ? LIMIT 1",
+                    [f"{task_id}-real", step_idx],
+                ).fetchone()
+            finally:
+                con.close()
+            if row is None or row[0] is None:
+                return None
+            if row[0] == 0:
+                return []
+            return None  # paths_returned > 0: selection set not recorded
+        except Exception:  # noqa: BLE001 — never-raise contract
+            return None
 
 
 def _assemble_stage_a_prompt(

@@ -1034,6 +1034,133 @@ class TestPhase1bStageACanaryWiring(_PlannerEventsBase):
         self.assertEqual(ce["silent_miss_count"], 0)  # Haiku == Opus (both empty)
 
 
+class _FakeBaseline:
+    """Test double for HistoricalBaselineProvider: returns a fixed lookup
+    result (a list = hit, None = miss) regardless of (task_id, step_idx)."""
+
+    def __init__(self, result):
+        self._result = result
+
+    def lookup(self, task_id, step_idx):
+        return self._result
+
+
+class TestPhase1cHistoricalBaseline(_PlannerEventsBase):
+    """v3 Phase 1c Step 3 (V3P1C-3): comparator option-(b). The canary's
+    silent-miss baseline comes from a historical DB lookup (reconstruct-∅ from
+    paths_returned=0, Step3C-F1) instead of a live parallel-Opus call; the
+    parallel call is the fallback only on a lookup miss (Step3C-F1 / Q3a)."""
+
+    def _make_baseline_db(self, rows):
+        # rows: list of (run_id, step_idx, paths_returned)
+        import duckdb
+        path = Path(tempfile.mkdtemp()) / "baseline.duckdb"
+        con = duckdb.connect(str(path))
+        con.execute(
+            "CREATE TABLE events (run_id VARCHAR, mode VARCHAR, "
+            "step_idx BIGINT, kind VARCHAR, data JSON)")
+        for (run_id, step_idx, pr) in rows:
+            con.execute(
+                "INSERT INTO events VALUES (?, 'real', ?, "
+                "'planner.stage_a.parsed', ?)",
+                [run_id, step_idx,
+                 json.dumps({"step_idx": step_idx, "paths_returned": pr})])
+        con.close()
+        return path
+
+    def _canary_planner(self, historical=None):
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        return Planner(
+            model="claude-opus-4-7",
+            policy=RoutingPolicy(PHASE_1B_STAGE_A_CANARY, calibration=cal),
+            historical_baseline=historical,
+        )
+
+    # --- provider lookup (Step3C-F1 reconstruction) ---
+
+    def test_lookup_reconstructs_empty_from_zero(self) -> None:
+        # Q9.1: paths_returned=0 → [] (∅, exact for empty-context).
+        db = self._make_baseline_db([("T1-doc-edit-real", 0, 0)])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.lookup("T1-doc-edit", 0), [])
+
+    def test_lookup_missing_row_returns_none(self) -> None:
+        # Q9.2: no matching (run_id, step_idx) → None (miss → fallback).
+        db = self._make_baseline_db([("T1-doc-edit-real", 0, 0)])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertIsNone(prov.lookup("T9-absent", 0))
+        self.assertIsNone(prov.lookup("T1-doc-edit", 5))
+
+    def test_lookup_nonzero_returns_none(self) -> None:
+        # Q9.3: paths_returned>0 → None (the path list isn't recorded; can't
+        # reconstruct the set — Step3C-F3 Phase 2 prerequisite).
+        db = self._make_baseline_db([("T2-two-step-real", 0, 3)])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertIsNone(prov.lookup("T2-two-step", 0))
+
+    def test_provider_never_raises_on_bad_db(self) -> None:
+        # Q9.9: missing/None DB path → lookup returns None, never raises.
+        self.assertIsNone(
+            planner_mod.HistoricalBaselineProvider("/no/such/file.duckdb").lookup("X", 0))
+        self.assertIsNone(planner_mod.HistoricalBaselineProvider(None).lookup("X", 0))
+
+    # --- plan_step integration (baseline_source + parallel fallback) ---
+
+    def test_canary_historical_hit_no_parallel(self) -> None:
+        # Q9.5: a historical hit (∅) → no parallel call, no canary_baseline
+        # emit, baseline_source="historical", silent_miss=0.
+        client, _ = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0,
+            cache_read=2603, text="")
+        p = self._canary_planner(historical=_FakeBaseline([]))
+        p._client = client
+        p.plan_step(self.brief, self.state, 0)
+        evs = self._events_for()
+        baselines = [e for e in evs
+                     if e["kind"] == "planner.stage_a.canary_baseline.api_end"]
+        self.assertEqual(len(baselines), 0)  # historical hit → no parallel Opus
+        ce = next(e for e in evs
+                  if e["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(ce["baseline_source"], "historical")
+        self.assertEqual(ce["silent_miss_count"], 0)
+
+    def test_canary_historical_miss_falls_back_to_parallel(self) -> None:
+        # Q9.4: a miss (None) → the parallel-Opus baseline fires (option-a),
+        # baseline_source="parallel", one canary_baseline.api_end emitted.
+        client, _ = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0,
+            cache_read=2603, text="")
+        p = self._canary_planner(historical=_FakeBaseline(None))
+        p._client = client
+        p.plan_step(self.brief, self.state, 0)
+        evs = self._events_for()
+        baselines = [e for e in evs
+                     if e["kind"] == "planner.stage_a.canary_baseline.api_end"]
+        self.assertEqual(len(baselines), 1)  # miss → parallel fallback fired
+        ce = next(e for e in evs
+                  if e["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(ce["baseline_source"], "parallel")
+        self.assertEqual(ce["silent_miss_count"], 0)
+
+    def test_baseline_source_identity_on_non_canary(self) -> None:
+        # Q9.6: a non-canary (shadow) plan_step → baseline == routed →
+        # baseline_source="identity".
+        client, _ = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0,
+            cache_read=2603, text="")
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        p = Planner(
+            model="claude-opus-4-7",
+            policy=RoutingPolicy(PHASE_1B_STAGE_A_SHADOW, calibration=cal))
+        p._client = client
+        p.plan_step(self.brief, self.state, 0)
+        ce = next(e for e in self._events_for()
+                  if e["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(ce["baseline_source"], "identity")
+
+
 # v3 Phase 1c Step 1 (criterion-3 sum-check reframe). The affine relation is
 # validated against the ACTUAL Phase 1c Step 0 real-mode Opus Stage A/B
 # events, captured inline because state/ is gitignored so the transient

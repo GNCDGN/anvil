@@ -155,6 +155,7 @@ class Orchestrator:
         rule. The policy is passed to both the real and mocked Planner.
         """
         policy = self._build_routing_policy()
+        historical_baseline = self._build_historical_baseline()
         if getattr(self.config, "mocked_planner", False):
             from anvil.mocked import MockedPlanner
             return MockedPlanner(
@@ -163,6 +164,7 @@ class Orchestrator:
                 timeout=self.config.planner_timeout,
                 vault_root=self.config.vault_path,
                 policy=policy,
+                historical_baseline=historical_baseline,
             )
         return Planner(
             api_key=self.config.anthropic_api_key,
@@ -170,7 +172,21 @@ class Orchestrator:
             timeout=self.config.planner_timeout,
             vault_root=self.config.vault_path,
             policy=policy,
+            historical_baseline=historical_baseline,
         )
+
+    def _build_historical_baseline(self):
+        """v3 Phase 1c Step 3 (V3P1C-3): construct the comparator option-(b)
+        baseline provider from `ANVIL_HISTORICAL_BASELINE_DB` (opt-in). Unset →
+        None → the canary uses the live parallel-Opus baseline (Phase
+        1b-equivalent). The provider itself never-raises on a missing/broken
+        DB, so a bad path degrades to all-parallel rather than failing."""
+        import os
+        from anvil.planner import HistoricalBaselineProvider
+        db = os.environ.get("ANVIL_HISTORICAL_BASELINE_DB", "").strip()
+        if not db:
+            return None
+        return HistoricalBaselineProvider(db)
 
     def _build_routing_policy(self):
         """Select the routing policy from the opt-in calibration env vars.

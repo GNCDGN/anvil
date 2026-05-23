@@ -283,6 +283,49 @@ class TestOrchestrator(unittest.TestCase):
             policy = orch._build_routing_policy()
         self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_SHADOW)
 
+    def test_build_historical_baseline_from_env(self) -> None:
+        # v3 Phase 1c Step 3 (Q9.8): ANVIL_HISTORICAL_BASELINE_DB set → a
+        # HistoricalBaselineProvider; unset → None (all-parallel, Phase
+        # 1b-equivalent).
+        from anvil.planner import HistoricalBaselineProvider
+        orch = self._orch([])
+        with mock.patch.dict(os.environ, {
+            "ANVIL_HISTORICAL_BASELINE_DB": "/tmp/anvil-baseline-nonexistent.duckdb",
+        }):
+            prov = orch._build_historical_baseline()
+        self.assertIsInstance(prov, HistoricalBaselineProvider)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ANVIL_HISTORICAL_BASELINE_DB", None)
+            self.assertIsNone(orch._build_historical_baseline())
+
+    def test_build_historical_baseline_never_raises_on_bad_db(self) -> None:
+        # Q9.9: a provider built from a nonexistent DB path → lookup returns
+        # None (never raises) → the canary degrades to the parallel baseline.
+        orch = self._orch([])
+        with mock.patch.dict(os.environ, {
+            "ANVIL_HISTORICAL_BASELINE_DB": "/tmp/anvil-baseline-nonexistent.duckdb",
+        }):
+            prov = orch._build_historical_baseline()
+        self.assertIsNone(prov.lookup("T1-doc-edit", 0))
+
+    def test_broadened_canary_allowlist_selects_canary_per_member(self) -> None:
+        # v3 Phase 1c Step 3 (Q-NEW-B / Q9.10): broadening is env-var-only —
+        # the orchestrator canaries EACH member of a broadened ANVIL_CANARY_TASKS
+        # with no policy.py change.
+        from anvil.policy import PHASE_1B_STAGE_A_CANARY
+        orch = self._orch([])
+        broadened = ("T1-doc-edit,T2-two-step,T3-out-of-scope,"
+                     "T4-judgment-escalation,T5-deploy,T6-write-new")
+        for task in broadened.split(","):
+            with mock.patch.dict(os.environ, {
+                "ANVIL_CALIBRATION_DB": "/tmp/anvil-cal-nonexistent.duckdb",
+                "ANVIL_CANARY_TASKS": broadened,
+                "ANVIL_CURRENT_TASK": task,
+            }):
+                policy = orch._build_routing_policy()
+            self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_CANARY,
+                             f"{task} should be canaried under the broadened allowlist")
+
     def test_move_brief_updates_state_brief_path_for_resume(self) -> None:
         """Step 10 hotfix: after inbox→active move, state.brief_path must
         point at the active/ file (persisted), so resume() re-parses a path

@@ -496,8 +496,10 @@ class TestStageAComparator(_EventsTestBase):
         # begin carries only the inputs; end carries the four outputs.
         begin = next(r for r in rows
                      if r["kind"] == "stage_a.shadow_compare.begin")["data"]
+        # v3 Phase 1c Step 3: begin also carries baseline_source (Step3C-F1).
         self.assertEqual(set(begin) - {"step_idx"},
-                         {"routed_paths", "baseline_paths"})
+                         {"routed_paths", "baseline_paths", "baseline_source"})
+        self.assertEqual(begin["baseline_source"], "identity")  # default
         end = next(r for r in rows
                    if r["kind"] == "stage_a.shadow_compare.end")["data"]
         for f in ("silent_miss_count", "hallucination_count",
