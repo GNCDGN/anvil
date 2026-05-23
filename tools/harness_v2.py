@@ -750,8 +750,13 @@ _SILENT_MISS_EPISODES_COLUMNS: tuple[str, ...] = (
 # construction — Q(c)); candidate_user_block_sizes stays as DuckDB JSON;
 # seconds_since_cache_creation is DOUBLE (null on cache_creation calls and
 # before any creation). candidate_block_sizes_sum sums the four canonical
-# blocks for the criterion-3 sum-check (≈ input_tokens − system prompt in
-# real mode). task_id via the run_metadata join (operations-view pattern).
+# blocks. v3 Phase 1c Step 1 (Step1C-F1): the criterion-3 sum-check is the
+# AFFINE relation block_sum × BLOCK_TOKEN_INFLATION_FACTOR (1.64) +
+# PLANNER_USER_TEMPLATE_TOKENS (407) ≈ uncached_user_prompt_equiv, where the
+# equiv column (added here) is cache-invariant: input_tokens + cache_read +
+# cache_creation − 3479 (the system prompt, V2P4-4). 3479 is Opus-specific
+# (Step1C-F2) — the `model` column lets consumers grade Opus rows only.
+# task_id via the run_metadata join (operations-view pattern).
 _CACHE_DIAGNOSTICS_VIEW_SQL = """
 CREATE OR REPLACE VIEW cache_diagnostics AS
 SELECT
@@ -774,7 +779,23 @@ SELECT
       + COALESCE(CAST(json_extract(e.data, '$.candidate_user_block_sizes.vault_files') AS BIGINT), 0)
       + COALESCE(CAST(json_extract(e.data, '$.candidate_user_block_sizes.prior_step') AS BIGINT), 0)
     ) AS candidate_block_sizes_sum,
-    CAST(json_extract(e.data, '$.input_tokens') AS BIGINT) AS input_tokens
+    CAST(json_extract(e.data, '$.input_tokens') AS BIGINT) AS input_tokens,
+    json_extract_string(e.data, '$.model') AS model,
+    CAST(json_extract(e.data, '$.cache_read_input_tokens') AS BIGINT)
+        AS cache_read_input_tokens,
+    CAST(json_extract(e.data, '$.cache_creation_input_tokens') AS BIGINT)
+        AS cache_creation_input_tokens,
+    -- v3 Phase 1c Step 1 (Step1C-F1): cache-invariant uncached-user-prompt
+    -- token equivalent. PLANNER_SYSTEM_PROMPT_TOKENS=3479 (V2P4-4) moves
+    -- between input_tokens and cache_read/creation, so adding them back and
+    -- subtracting the system prompt isolates the user-prompt total. NOTE:
+    -- 3479 is Opus-specific (Step1C-F2) — interpret on Opus rows (model col).
+    (
+        CAST(json_extract(e.data, '$.input_tokens') AS BIGINT)
+      + COALESCE(CAST(json_extract(e.data, '$.cache_read_input_tokens') AS BIGINT), 0)
+      + COALESCE(CAST(json_extract(e.data, '$.cache_creation_input_tokens') AS BIGINT), 0)
+      - 3479
+    ) AS uncached_user_prompt_equiv
 FROM events e
 LEFT JOIN run_metadata rm USING (run_id, mode)
 WHERE e.kind IN (
@@ -788,7 +809,8 @@ _CACHE_DIAGNOSTICS_COLUMNS: tuple[str, ...] = (
     "run_id", "task_id", "mode", "step_idx", "stage",
     "vault_index_hit", "candidate_user_block_sizes",
     "seconds_since_cache_creation", "candidate_block_sizes_sum",
-    "input_tokens",
+    "input_tokens", "model", "cache_read_input_tokens",
+    "cache_creation_input_tokens", "uncached_user_prompt_equiv",
 )
 
 

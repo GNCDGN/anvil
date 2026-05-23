@@ -1034,5 +1034,120 @@ class TestPhase1bStageACanaryWiring(_PlannerEventsBase):
         self.assertEqual(ce["silent_miss_count"], 0)  # Haiku == Opus (both empty)
 
 
+# v3 Phase 1c Step 1 (criterion-3 sum-check reframe). The affine relation is
+# validated against the ACTUAL Phase 1c Step 0 real-mode Opus Stage A/B
+# events, captured inline because state/ is gitignored so the transient
+# Step 0 DB can't be a CI fixture (Step1C-F4). Each tuple:
+# (stage, model, block_sum, input_tokens, cache_read, cache_creation).
+_STEP0_REAL_STAGE_EVENTS = [
+    ("A", "haiku", 488, 3550, 0, 0),     # T1 canary — Haiku, NO cache (excluded)
+    ("A", "opus", 702, 1527, 3479, 0),
+    ("A", "opus", 723, 1637, 3479, 0),
+    ("A", "opus", 738, 1511, 3479, 0),
+    ("A", "opus", 818, 1717, 3479, 0),
+    ("A", "opus", 891, 1857, 3479, 0),
+    ("A", "opus", 1163, 2221, 3479, 0),
+    ("A", "opus", 1271, 2413, 3479, 0),
+    ("A", "opus", 1839, 3282, 3479, 0),
+    ("B", "opus", 495, 1277, 3479, 0),
+    ("B", "opus", 709, 1634, 3479, 0),
+    ("B", "opus", 730, 1744, 3479, 0),
+    ("B", "opus", 745, 1618, 3479, 0),
+    ("B", "opus", 825, 1824, 3479, 0),
+    ("B", "opus", 898, 1964, 3479, 0),
+    ("B", "opus", 1546, 2968, 3479, 0),
+    ("B", "opus", 1652, 3169, 3479, 0),
+    ("B", "opus", 2336, 4214, 3479, 0),
+]
+
+
+def _uncached_user_prompt_equiv(input_tokens, cache_read, cache_creation):
+    """Cache-invariant user-prompt token total (Step1C-F1): the system prompt
+    moves between input_tokens and cache_read/creation, so adding them back
+    and subtracting it isolates the user prompt."""
+    return (input_tokens + cache_read + cache_creation
+            - events.PLANNER_SYSTEM_PROMPT_TOKENS)
+
+
+def _affine_predict(block_sum):
+    return (events.PLANNER_USER_TEMPLATE_TOKENS
+            + block_sum * events.BLOCK_TOKEN_INFLATION_FACTOR)
+
+
+def _abs_pct_err(stage, model, bsum, inp, cr, cc):
+    equiv = _uncached_user_prompt_equiv(inp, cr, cc)
+    return abs(_affine_predict(bsum) - equiv) / equiv * 100.0
+
+
+class TestCriterion3SumCheckReframe(unittest.TestCase):
+    """v3 Phase 1c Step 1 — the criterion-3 sum-check reframed to the honest
+    AFFINE, cache-invariant relation (Step1C-F1):
+
+        uncached_user_prompt_equiv ≈ PLANNER_USER_TEMPLATE_TOKENS
+            + block_sum × BLOCK_TOKEN_INFLATION_FACTOR
+
+    Graded real-only on Opus rows (Step1C-F2). The brief's original
+    pure-multiplicative form is refuted by the Step 0 data (0/17 within ±5%
+    at factor 1.64); the affine form holds (R²≈0.991, 15/17 within ±5%)."""
+
+    OPUS = [r for r in _STEP0_REAL_STAGE_EVENTS if r[1] == "opus"]
+
+    def test_inflation_and_template_constants_present(self) -> None:
+        # Test 1 (Q8.1): both reframe constants present + documented values.
+        self.assertEqual(events.BLOCK_TOKEN_INFLATION_FACTOR, 1.64)
+        self.assertEqual(events.PLANNER_USER_TEMPLATE_TOKENS, 407)
+        self.assertEqual(events.PLANNER_SYSTEM_PROMPT_TOKENS, 3479)
+
+    def test_affine_relation_stage_a_opus(self) -> None:
+        # Test 2 (Q8.2): Stage A Opus rows hold the affine relation.
+        errs = [_abs_pct_err(*r) for r in self.OPUS if r[0] == "A"]
+        self.assertLessEqual(max(errs), 10.0)               # no row off by >10%
+        self.assertLessEqual(sum(errs) / len(errs), 5.0)     # mean within ±5%
+        self.assertGreaterEqual(sum(1 for e in errs if e <= 5.0), 7)  # ≥7/8
+
+    def test_affine_relation_stage_b_opus_and_overall(self) -> None:
+        # Test 3 (Q8.3 + Q-NEW binding grade): Stage B + overall R²/±5%.
+        errs = [_abs_pct_err(*r) for r in self.OPUS if r[0] == "B"]
+        self.assertLessEqual(max(errs), 10.0)
+        self.assertLessEqual(sum(errs) / len(errs), 5.0)
+        self.assertGreaterEqual(sum(1 for e in errs if e <= 5.0), 8)  # ≥8/9
+        # Binding grade: ≥15/17 within ±5% AND R² ≥ 0.99 over all Opus rows.
+        all_errs = [_abs_pct_err(*r) for r in self.OPUS]
+        self.assertGreaterEqual(sum(1 for e in all_errs if e <= 5.0), 15)
+        ys = [_uncached_user_prompt_equiv(i, cr, cc)
+              for (_, _, b, i, cr, cc) in self.OPUS]
+        ybar = sum(ys) / len(ys)
+        ss_tot = sum((y - ybar) ** 2 for y in ys)
+        ss_res = sum((_uncached_user_prompt_equiv(i, cr, cc) - _affine_predict(b)) ** 2
+                     for (_, _, b, i, cr, cc) in self.OPUS)
+        self.assertGreaterEqual(1 - ss_res / ss_tot, 0.99)
+
+    def test_cache_invariant_across_creation_and_read(self) -> None:
+        # Test 4 (Q8.4 / Q5 a-b): a creation-call, a read-call, and an
+        # uncached call with the SAME user prompt all yield the same equiv.
+        user = 900
+        sys = events.PLANNER_SYSTEM_PROMPT_TOKENS
+        creation = _uncached_user_prompt_equiv(user, 0, sys)     # first call
+        read = _uncached_user_prompt_equiv(user, sys, 0)         # later call
+        uncached = _uncached_user_prompt_equiv(user + sys, 0, 0)  # no caching
+        self.assertEqual(creation, user)
+        self.assertEqual(read, user)
+        self.assertEqual(uncached, user)
+
+    def test_non_opus_rows_excluded_from_sumcheck(self) -> None:
+        # Test 5 (Q8.5, Step1C-F2 — load-bearing for Phase 2): the Haiku
+        # canary row breaks the relation (different tokeniser; the 3479
+        # system count is Opus-specific), so the sum-check MUST filter Opus.
+        haiku = next(r for r in _STEP0_REAL_STAGE_EVENTS if r[1] == "haiku")
+        self.assertGreater(_abs_pct_err(*haiku), 100.0)    # wildly off (≈1600%)
+        with_haiku = [_abs_pct_err(*r) for r in _STEP0_REAL_STAGE_EVENTS]
+        opus_only = [_abs_pct_err(*r) for r in self.OPUS]
+        # Including the Haiku row drags the hit-rate below 90%; Opus-only ≥85%.
+        self.assertLess(
+            sum(1 for e in with_haiku if e <= 5.0) / len(with_haiku), 0.90)
+        self.assertGreaterEqual(
+            sum(1 for e in opus_only if e <= 5.0) / len(opus_only), 0.85)
+
+
 if __name__ == "__main__":
     unittest.main()

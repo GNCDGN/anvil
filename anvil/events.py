@@ -405,9 +405,48 @@ def emit_stage_a_shadow_compare(
 # ---------------------------------------------------------------------------
 
 # v2 Phase 4 measured the Planner system prompt at 3,479 tokens via
-# cache_creation_input_tokens. The candidate-block sum-check (criterion 3)
-# compares sum(block sizes) against (input_tokens − this) in real mode.
+# cache_creation_input_tokens (V2P4-4). The criterion-3 sum-check (V3P0-6)
+# subtracts this from the cache-invariant uncached-user-prompt-equivalent
+# (see below). NOTE: this count is Opus-specific — the Haiku canary (Phase
+# 1b) tokenises the same prompt differently, so the sum-check is graded on
+# Opus rows only (Step1C-F2).
 PLANNER_SYSTEM_PROMPT_TOKENS = 3479
+
+# v3 Phase 1c Step 1 (V3P0-6 reframe, Step1C-F1). The criterion-3 sum-check
+# is AFFINE, not pure-multiplicative. The four candidate_user_block_sizes
+# blocks (brief/state/vault_files/prior_step) are chars/4 estimates that
+# deliberately EXCLUDE the fixed user-prompt template scaffolding (V3P0-6),
+# so the honest, cache-invariant relation is:
+#
+#   uncached_user_prompt_equiv ≈ PLANNER_USER_TEMPLATE_TOKENS
+#       + block_sum × BLOCK_TOKEN_INFLATION_FACTOR
+#
+#   uncached_user_prompt_equiv = input_tokens + cache_read_input_tokens
+#       + cache_creation_input_tokens − PLANNER_SYSTEM_PROMPT_TOKENS
+#
+# Cache-invariant: the cached system prompt moves between input_tokens and
+# cache_read/creation, but the sum preserves the user-prompt total — so the
+# relation survives Phase 1c Step 2's user-block caching. The brief specified
+# pure-multiplicative (block_sum × factor ≈ input_tokens − 3479); the Phase
+# 1c Step 0 real-mode Opus data refuted it (0/17 within ±5% at factor 1.64),
+# and the affine form holds (R²=0.991, 15/17 within ±5%). The residual the
+# brief treated as multiplicative drift is the fixed template intercept.
+
+# chars/4 → real-token inflation. events._estimate_tokens assumes 4
+# chars/token; the real tokeniser runs ~2.44 chars/token on the Planner's
+# dense JSON-structured prompts (V3P0-6 observation), so a chars/4 estimate
+# undercounts true tokens by 4/2.44 ≈ 1.64. Matches the Step 0 affine slope
+# (1.588) within 0.05; the residual is the template intercept below, not
+# slope drift (so we use the principled 1.64, not the 1.95 that fitting a
+# pure-multiplicative form to affine data produces).
+BLOCK_TOKEN_INFLATION_FACTOR = 1.64
+
+# Fixed user-prompt template scaffolding (instructions / headers / schema
+# reminder / formatting) that wraps the four content blocks and is excluded
+# from candidate_user_block_sizes (V3P0-6) — the user-side analogue of
+# PLANNER_SYSTEM_PROMPT_TOKENS. Derived from the Phase 1c Step 0 affine fit
+# intercept (~407 tokens with slope fixed at 1.64; Step1C-F1).
+PLANNER_USER_TEMPLATE_TOKENS = 407
 
 
 def _estimate_tokens(text: str) -> int:

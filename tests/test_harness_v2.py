@@ -1061,6 +1061,42 @@ class TestCacheDiagnosticsView(_HarnessTestBase):
         self.assertEqual(row[1], 2.5)           # read within window
         self.assertEqual(row[2], 820 + 160 + 9200 + 60)
 
+    def test_uncached_user_prompt_equiv_columns(self) -> None:
+        # v3 Phase 1c Step 1 (Step1C-F1): the view exposes model,
+        # cache_read/creation, and the cache-invariant uncached_user_prompt_equiv.
+        run_id = "T10-equiv"
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        blocks = {"brief": 400, "state": 300, "vault_files": 0, "prior_step": 0}
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            # Cache-READ Opus call: the 3479-token system prompt is in
+            # cache_read; input_tokens holds only the user prompt.
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 1500,
+                        "cache_read_input_tokens": 3479,
+                        "cache_creation_input_tokens": 0,
+                        "vault_index_hit": False,
+                        "candidate_user_block_sizes": blocks,
+                        "seconds_since_cache_creation": 1.0, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+        row = self.con.execute(
+            "SELECT model, cache_read_input_tokens, cache_creation_input_tokens, "
+            "       uncached_user_prompt_equiv "
+            "FROM cache_diagnostics WHERE run_id='T10-equiv' AND stage='A'"
+        ).fetchone()
+        self.assertEqual(row[0], "claude-opus-4-7")
+        self.assertEqual(row[1], 3479)
+        self.assertEqual(row[2], 0)
+        # equiv = input_tokens + cache_read + cache_creation - 3479 = 1500
+        self.assertEqual(row[3], 1500)
+
     def test_columns_match_declared_tuple(self) -> None:
         self._ingest_cache_run()
         row = self.con.execute(
