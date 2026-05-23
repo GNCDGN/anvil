@@ -27,7 +27,11 @@ from anvil.brief import Brief, Step
 from anvil.calibration import CHEAP_STAGE_A_MODEL, RoutingCalibration
 from anvil.lint import LintResult
 from anvil.planner import Planner, DEFAULT_PLANNER_MODEL
-from anvil.policy import PHASE_1B_STAGE_A_SHADOW, RoutingPolicy
+from anvil.policy import (
+    PHASE_1B_STAGE_A_CANARY,
+    PHASE_1B_STAGE_A_SHADOW,
+    RoutingPolicy,
+)
 from anvil.state import init_state
 
 
@@ -562,9 +566,17 @@ class TestShadowDecisionPairing(_PlannerEventsBase):
             sd["agreement"],
             sd["shadow_route_candidate"] == sd["actual_route_taken"],
         )
-        # basis is the same features_seen dict the api_end carried.
-        self.assertEqual(sd["shadow_decision_basis"],
-                         evs[i_api]["data"]["features_seen"])
+        # v3 Phase 1b Step 3 (Step3B-F3): shadow_decision_basis is the PRE-call
+        # merged features the policy decided on, so its observed_prompt_token_count
+        # is None (the count isn't known until after the call); the api_end's
+        # features_seen carries the real post-call count. They agree on every
+        # other key.
+        basis = sd["shadow_decision_basis"]
+        fs = evs[i_api]["data"]["features_seen"]
+        self.assertIsNone(basis["observed_prompt_token_count"])
+        self.assertEqual(fs["observed_prompt_token_count"], 620)
+        for k in ("stage", "step_idx", "context_paths_count"):
+            self.assertEqual(basis[k], fs[k])
 
     def test_one_shadow_per_planner_stage_in_full_plan_step(self) -> None:
         # A full plan_step (Stage A + Stage B) → 2 api_end → 2 shadow rows.
@@ -885,7 +897,10 @@ class TestPolicyEngineWiring(_PlannerEventsBase):
         self.assertEqual(basis["context_paths_count"], 999)   # lint wins collision
         self.assertEqual(basis["brief_token_estimate"], 50)   # lint-only key
         self.assertEqual(basis["stage"], "B")                 # features_seen key
-        self.assertEqual(basis["observed_prompt_token_count"], 620)
+        # v3 Phase 1b Step 3 (Step3B-F3): the decision is made PRE-call, so the
+        # basis's observed_prompt_token_count is None (the api_end's features_seen
+        # carries the real post-call count).
+        self.assertIsNone(basis["observed_prompt_token_count"])
 
     def test_decision_basis_without_lint_is_features_seen_only(self) -> None:
         # No _current_lint_result stashed → only Phase 0 features_seen in basis;
@@ -953,6 +968,70 @@ class TestPhase1bStageAShadowWiring(_PlannerEventsBase):
                    if e["kind"] == "planner.stage_b.api_end")["data"]
         self.assertEqual(end["route_candidate"], "claude-opus-4-7")
         self.assertEqual(end["route_actual"], "claude-opus-4-7")
+
+
+class TestPhase1bStageACanaryWiring(_PlannerEventsBase):
+    """v3 Phase 1b Step 3: the canary makes the API ACTUALLY run Haiku — the
+    pre-call decision restructure (api_model = decision.route_actual under the
+    canary) and the parallel-Opus baseline in plan_step."""
+
+    def _canary_planner(self):
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        return Planner(
+            model="claude-opus-4-7",
+            policy=RoutingPolicy(PHASE_1B_STAGE_A_CANARY, calibration=cal),
+        )
+
+    def test_canary_api_call_runs_haiku(self) -> None:
+        client, capture = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0, cache_read=2603)
+        p = self._canary_planner()
+        p._client = client
+        p._current_step_idx = 0
+        p._current_context_paths_count = 0
+        p._call_anthropic(system="SYS", user="u", timeout=30, step=1, stage="A")
+        # The API ACTUALLY ran Haiku — the Step3-F1 swap, now production.
+        self.assertEqual(capture["model"], CHEAP_STAGE_A_MODEL)
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_a.api_end")["data"]
+        self.assertEqual(end["model"], CHEAP_STAGE_A_MODEL)        # model = ran
+        self.assertEqual(end["route_actual"], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(end["route_candidate"], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(end["policy_version"], "v3-phase-1b-stage-a-canary")
+
+    def test_canary_stage_b_still_opus_no_leak(self) -> None:
+        client, capture = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0, cache_read=2603)
+        p = self._canary_planner()
+        p._client = client
+        p._current_step_idx = 0
+        p._current_context_paths_count = 0
+        p._call_anthropic(system="SYS", user="u", timeout=30, step=1, stage="B")
+        self.assertEqual(capture["model"], "claude-opus-4-7")  # Stage B unchanged
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_b.api_end")["data"]
+        self.assertEqual(end["model"], "claude-opus-4-7")
+        self.assertEqual(end["route_actual"], "claude-opus-4-7")
+
+    def test_plan_step_canary_baseline_fires_silent_miss_zero(self) -> None:
+        # A full plan_step on a canary planner, empty context: the primary
+        # Stage A runs Haiku; the parallel-Opus baseline fires; both select
+        # nothing (text="" → empty selection) → silent_miss == 0, and one
+        # canary_baseline.api_end is emitted (the comparator's ground truth).
+        client, _ = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0,
+            cache_read=2603, text="")
+        p = self._canary_planner()
+        p._client = client
+        p.plan_step(self.brief, self.state, 0)
+        evs = self._events_for()
+        baselines = [e for e in evs
+                     if e["kind"] == "planner.stage_a.canary_baseline.api_end"]
+        self.assertEqual(len(baselines), 1)  # the parallel Opus baseline fired
+        ce = next(e for e in evs
+                  if e["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(ce["silent_miss_count"], 0)  # Haiku == Opus (both empty)
 
 
 if __name__ == "__main__":

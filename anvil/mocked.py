@@ -43,6 +43,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -144,27 +145,25 @@ class MockedPlanner(Planner):
             usage = {}
 
         # Synthesised api_end. Same shape as the production wrapper's
-        # emit at planner.py:_call_anthropic. Critically, data.model is
-        # the per-stage model via the inherited _model_for_stage(stage)
-        # (notes.md Step 4 outcome finding 2 — operations view filters on
-        # model; v3 Phase 1a Step 1 made the read per-stage).
+        # emit at planner.py:_call_anthropic.
         stage_key = stage.lower()
         observed_input_tokens = int(usage.get("input_tokens", 0))
         cache_creation = int(usage.get("cache_creation_input_tokens", 0))
-        # v3 Phase 1a Step 3 (V3P0-3 parallel-wire): route the synthesised
-        # api_end through the inherited _policy_routing, exactly as the
-        # production wrapper does. route_actual sources from the policy
-        # decision (Phase 1a placeholder → Opus); the `model` data field
-        # below stays per-stage. The inherited plan_step / Stage-C path
-        # stashes _current_step_idx + _current_context_paths_count +
-        # _current_lint_result before this override runs (MockedPlanner
-        # overrides only _call_anthropic).
-        routing, decision = self._policy_routing(stage, observed_input_tokens)
+        # v3 Phase 1b Step 3 (V3P0-3 parallel-wire): mirror the production
+        # wrapper's restructure — decide the route (pre-"call", stashing
+        # _current_route_decision for plan_step's canary baseline check), then
+        # build the routing dict. data.model sources from decision.route_actual
+        # (Step3-F1 "model = ran"): canary → Haiku, shadow/placeholder → Opus.
+        # The inherited plan_step / Stage-C path stashes _current_step_idx +
+        # _current_context_paths_count + _current_lint_result before this
+        # override runs (MockedPlanner overrides only _call_anthropic).
+        decision = self._decide_route(stage)
+        routing = self._routing_for(stage, decision, observed_input_tokens)
         _events.emit(
             f"planner.stage_{stage_key}.api_end",
             {
                 "step_idx": step_idx,
-                "model": self._model_for_stage(stage),
+                "model": self._api_model(stage, decision),
                 "input_tokens": observed_input_tokens,
                 "output_tokens": int(usage.get("output_tokens", 0)),
                 "cache_creation_input_tokens": cache_creation,
@@ -196,6 +195,44 @@ class MockedPlanner(Planner):
         )
 
         return text
+
+    def _stage_a_canary_baseline(self, prompt, step_idx):
+        """v3 Phase 1b Step 3 (V3P0-3 parallel-wire): mock the canary
+        parallel-Opus baseline by reading the SAME Stage A fixture the primary
+        call read (fixtures are model-agnostic), so the baseline selection
+        equals the primary → silent_miss == 0 deterministically. Emits
+        planner.stage_a.canary_baseline.api_end (sidecar usage) so the mock
+        sweep exercises the cost-ledger wiring end-to-end. Never raises."""
+        baseline_model = self._model_for_stage("A")
+        try:
+            task_id = _task_id()
+            root = _fixture_root()
+            fixture_path = root / f"{task_id}-step{step_idx}.json"
+            text = (
+                fixture_path.read_text(encoding="utf-8")
+                if fixture_path.is_file() else ""
+            )
+            usage = {}
+            usage_path = root / f"{task_id}-step{step_idx}.usage.json"
+            if usage_path.is_file():
+                try:
+                    usage = json.loads(usage_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    usage = {}
+            ns = SimpleNamespace(
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                cache_creation_input_tokens=int(
+                    usage.get("cache_creation_input_tokens", 0)),
+                cache_read_input_tokens=int(
+                    usage.get("cache_read_input_tokens", 0)),
+            )
+            self._emit_canary_baseline(step_idx, baseline_model, ns, 0, ok=True)
+            return text
+        except Exception as e:  # noqa: BLE001 — never-raise
+            self._emit_canary_baseline(
+                step_idx, baseline_model, None, 0, ok=False, error=str(e)[:300])
+            return ""
 
 
 # ---------------------------------------------------------------------------

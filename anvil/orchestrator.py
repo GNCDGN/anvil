@@ -173,23 +173,40 @@ class Orchestrator:
         )
 
     def _build_routing_policy(self):
-        """v3 Phase 1b Step 2: select the routing policy from the opt-in
-        `ANVIL_CALIBRATION_DB` env var.
+        """Select the routing policy from the opt-in calibration env vars.
 
-        Unset → return None (the Planner defaults to PHASE_1A_PLACEHOLDER, so a
-        default sweep is byte-identical to Phase 1a). Set → derive the Stage A
-        calibration from that DuckDB and wire it into a
-        PHASE_1B_STAGE_A_SHADOW policy. `RoutingCalibration.from_db` is
-        never-raise (a missing/broken DB → empty corpus → degraded predicate),
-        so a misconfigured path can never block the build — it just yields a
-        shadow policy that recommends Opus everywhere.
+        v3 Phase 1b Step 2 + 3 — three-way selection:
+        - `ANVIL_CALIBRATION_DB` unset → None (Planner defaults to
+          PHASE_1A_PLACEHOLDER; a default sweep is byte-identical to Phase 1a).
+        - set, and the current task (`ANVIL_CURRENT_TASK`, set per-subprocess
+          by the calibration runner) is in the `ANVIL_CANARY_TASKS` allowlist
+          → PHASE_1B_STAGE_A_CANARY (the canary ACTS — the API runs the cheap
+          model on empty-context Stage A).
+        - set, but the task is not allowlisted → PHASE_1B_STAGE_A_SHADOW
+          (route_candidate diverges, the API still runs Opus).
+
+        `RoutingCalibration.from_db` is never-raise (a missing/broken DB →
+        empty corpus → degraded predicate), so a misconfigured path can never
+        block the build — it just recommends Opus everywhere.
         """
         cal_db = os.environ.get("ANVIL_CALIBRATION_DB", "").strip()
         if not cal_db:
             return None
         from anvil.calibration import RoutingCalibration
-        from anvil.policy import PHASE_1B_STAGE_A_SHADOW, RoutingPolicy
+        from anvil.policy import (
+            PHASE_1B_STAGE_A_CANARY,
+            PHASE_1B_STAGE_A_SHADOW,
+            RoutingPolicy,
+        )
         calibration = RoutingCalibration.from_db(cal_db).policy
+        canary_tasks = {
+            t.strip()
+            for t in os.environ.get("ANVIL_CANARY_TASKS", "").split(",")
+            if t.strip()
+        }
+        current_task = os.environ.get("ANVIL_CURRENT_TASK", "").strip()
+        if current_task and current_task in canary_tasks:
+            return RoutingPolicy(PHASE_1B_STAGE_A_CANARY, calibration=calibration)
         return RoutingPolicy(PHASE_1B_STAGE_A_SHADOW, calibration=calibration)
 
     def _build_coder(self) -> Coder:

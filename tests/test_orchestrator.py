@@ -256,6 +256,33 @@ class TestOrchestrator(unittest.TestCase):
             os.environ.pop("ANVIL_CALIBRATION_DB", None)
             self.assertIsNone(orch._build_routing_policy())
 
+    def test_build_routing_policy_canary_when_task_in_allowlist(self) -> None:
+        # v3 Phase 1b Step 3: calibration set + the current task in the canary
+        # allowlist → PHASE_1B_STAGE_A_CANARY (from_db is never-raise, so the
+        # path need not be a valid DB for the selection to fire).
+        from anvil.policy import PHASE_1B_STAGE_A_CANARY
+        orch = self._orch([])
+        with mock.patch.dict(os.environ, {
+            "ANVIL_CALIBRATION_DB": "/tmp/anvil-cal-nonexistent.duckdb",
+            "ANVIL_CANARY_TASKS": "T1-doc-edit",
+            "ANVIL_CURRENT_TASK": "T1-doc-edit",
+        }):
+            policy = orch._build_routing_policy()
+        self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_CANARY)
+
+    def test_build_routing_policy_shadow_when_task_not_in_allowlist(self) -> None:
+        # Calibration set, but the current task is NOT allowlisted → shadow
+        # (the canary is narrow; non-canary tasks stay shadow-only).
+        from anvil.policy import PHASE_1B_STAGE_A_SHADOW
+        orch = self._orch([])
+        with mock.patch.dict(os.environ, {
+            "ANVIL_CALIBRATION_DB": "/tmp/anvil-cal-nonexistent.duckdb",
+            "ANVIL_CANARY_TASKS": "T1-doc-edit",
+            "ANVIL_CURRENT_TASK": "T2-two-step",
+        }):
+            policy = orch._build_routing_policy()
+        self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_SHADOW)
+
     def test_move_brief_updates_state_brief_path_for_resume(self) -> None:
         """Step 10 hotfix: after inbox→active move, state.brief_path must
         point at the active/ file (persisted), so resume() re-parses a path

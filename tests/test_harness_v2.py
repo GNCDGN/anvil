@@ -1283,6 +1283,47 @@ class TestStep3PolicyVersion(_HarnessTestBase):
         self.assertEqual(by_pv["v3-phase-1a-placeholder"], (1, 0))    # agreement
         self.assertEqual(by_pv["v3-phase-1b-stage-a-shadow"], (0, 1))  # disagreement
 
+    def _ingest_canary_baseline(self, run_id) -> None:
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir()
+        baseline = {
+            "step_idx": 0, "model": "claude-opus-4-7",
+            "input_tokens": 1000, "output_tokens": 50,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "duration_ms": 1500, "ok": True,
+        }
+        rows = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.canary_baseline.api_end", baseline,
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in rows) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+    def test_canary_baseline_appears_in_operations_with_cost(self) -> None:
+        # v3 Phase 1b Step 3: the parallel-Opus baseline is a counted operation,
+        # its cost computed by the token formula (like any non-coder api_end).
+        self._ingest_canary_baseline("T1-cb-ops")
+        row = self.con.execute(
+            "SELECT operation_kind, cost_usd FROM operations "
+            "WHERE run_id = 'T1-cb-ops' "
+            "AND operation_kind = 'planner.stage_a.canary_baseline.api_end'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertGreater(row[1], 0.0)  # 1000*15 + 50*75 over 1e6 = $0.01875
+
+    def test_canary_baseline_cost_in_per_run_summary(self) -> None:
+        # Spend reconciliation (criterion 5 carry-forward): the baseline's cost
+        # is ledgered into the per-run total.
+        self._ingest_canary_baseline("T1-cb-sum")
+        total = self.con.execute(
+            "SELECT total_cost_usd FROM per_run_summary WHERE run_id = 'T1-cb-sum'"
+        ).fetchone()[0]
+        self.assertGreater(total, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

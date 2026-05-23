@@ -40,6 +40,15 @@ PHASE_1A_PLACEHOLDER = "v3-phase-1a-placeholder"
 # (Step 3) adds a third version that also changes route_actual + the API call.
 PHASE_1B_STAGE_A_SHADOW = "v3-phase-1b-stage-a-shadow"
 
+# v3 Phase 1b Step 3: the canary policy_version. Unlike the shadow rule, the
+# canary ACTS — for an allowlisted task's empty-context Stage A, both
+# route_candidate AND route_actual become the cheap model, so the wrapper's
+# API call (which sources from decision.route_actual) actually runs the cheap
+# model. champion_challenger agreement is 100% by design (candidate == actual);
+# the canary's real signal is silent_miss == 0 (the parallel-Opus comparator),
+# not disagreement (Step3B-F4).
+PHASE_1B_STAGE_A_CANARY = "v3-phase-1b-stage-a-canary"
+
 # The route the placeholder returns unconditionally. Deliberately a SEPARATE
 # constant from planner.DEFAULT_PLANNER_MODEL and events.SHADOW_ROUTE_PHASE_0
 # (all "claude-opus-4-7" today): the policy's placeholder route, the planner's
@@ -112,6 +121,10 @@ class RoutingPolicy:
             # deep-copy via dict() first so a non-dict `features` raises here
             # (caught below) rather than silently passing through.
             basis = copy.deepcopy(dict(features)) if features else {}
+            if self.policy_version == PHASE_1B_STAGE_A_CANARY:
+                return self._decide_stage_a_canary(
+                    stage, features, basis, fallback_model
+                )
             if self.policy_version == PHASE_1B_STAGE_A_SHADOW:
                 return self._decide_stage_a_shadow(
                     stage, features, basis, fallback_model
@@ -162,6 +175,30 @@ class RoutingPolicy:
             basis["calibration_rationale"] = self._rationale(rec)
             if rec.confidence_band == "high" and rec.recommended_model != actual:
                 candidate = rec.recommended_model
+        return RouteDecision(
+            route_candidate=candidate,
+            route_actual=actual,
+            route_fallback_fired=False,
+            decision_basis=basis,
+        )
+
+    def _decide_stage_a_canary(
+        self, stage, features, basis, fallback_model
+    ) -> RouteDecision:
+        """PHASE_1B_STAGE_A_CANARY: the canary ACTS. For Stage A with a wired
+        calibration recommending a high-confidence cheap model, BOTH
+        route_candidate AND route_actual become that cheap model — so the
+        wrapper's API call (sourced from route_actual) actually runs it. All
+        other cases (non-Stage-A, no calibration, uncalibrated): candidate ==
+        actual == per-stage model (no leak — only allowlisted canary tasks
+        reach this policy_version, and only empty-context Stage A acts)."""
+        base = fallback_model or PHASE_1A_PLACEHOLDER_MODEL
+        candidate = actual = base
+        if stage == "A" and self.calibration is not None:
+            rec = self.calibration(features)
+            basis["calibration_rationale"] = self._rationale(rec)
+            if rec.confidence_band == "high" and rec.recommended_model != base:
+                candidate = actual = rec.recommended_model  # canary acts
         return RouteDecision(
             route_candidate=candidate,
             route_actual=actual,

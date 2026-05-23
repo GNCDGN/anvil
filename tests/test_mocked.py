@@ -29,7 +29,11 @@ from anvil.config import Config
 from anvil.mocked import MockedCoder, MockedPlanner
 from anvil.orchestrator import Orchestrator
 from anvil.planner import Plan
-from anvil.policy import PHASE_1B_STAGE_A_SHADOW, RoutingPolicy
+from anvil.policy import (
+    PHASE_1B_STAGE_A_CANARY,
+    PHASE_1B_STAGE_A_SHADOW,
+    RoutingPolicy,
+)
 from anvil.state import init_state, read_state
 
 _FIX_ROOT = (
@@ -549,6 +553,32 @@ class TestMockedPerStageModel(_MockedTestBase):
         sd = next(e for e in evs if e["kind"] == "shadow.decision")["data"]
         self.assertEqual(sd["policy_version"], "v3-phase-1a-placeholder")
         self.assertTrue(sd["agreement"])
+
+    def test_canary_baseline_fires_on_mock(self) -> None:
+        # v3 Phase 1b Step 3: MockedPlanner's _stage_a_canary_baseline override
+        # reads the same fixture (model-agnostic) → silent_miss == 0
+        # deterministically, exercising the canary wiring end-to-end on a free
+        # mock run. The primary Stage A api_end shows the API "ran" Haiku.
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        brief, state = _brief_and_state("T1")
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        p = MockedPlanner(
+            model="claude-opus-4-7",
+            policy=RoutingPolicy(PHASE_1B_STAGE_A_CANARY, calibration=cal),
+        )
+        p.plan_step(brief, state, 0)
+        evs = self._events()
+        baselines = [e for e in evs
+                     if e["kind"] == "planner.stage_a.canary_baseline.api_end"]
+        self.assertEqual(len(baselines), 1)
+        end_a = next(e for e in evs
+                     if e["kind"] == "planner.stage_a.api_end")["data"]
+        self.assertEqual(end_a["route_actual"], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(end_a["model"], CHEAP_STAGE_A_MODEL)  # API "ran" Haiku
+        ce = next(e for e in evs
+                  if e["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(ce["silent_miss_count"], 0)
 
     def test_parallel_wire_shadow_divergence(self) -> None:
         # v3 Phase 1b Step 2 (V3P0-3 parallel-wire verification): MockedPlanner's

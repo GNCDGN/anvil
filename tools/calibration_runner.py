@@ -317,6 +317,12 @@ def build_env(task: str, mode: str) -> dict[str, str]:
     # is on; harmless when off. Keep set unconditionally for clarity.
     env["MOCKED_TASK_ID"] = task
     env["ANVIL_RUN_ID_OVERRIDE"] = run_id_for(task, mode)
+    # v3 Phase 1b Step 3: the canary task label (e.g. "T1-doc-edit") so the
+    # orchestrator's _build_routing_policy can match it against the
+    # ANVIL_CANARY_TASKS allowlist (mode-independent — the canary decision is
+    # per task shape, not per mode). ANVIL_CALIBRATION_DB / ANVIL_CANARY_TASKS
+    # are inherited from the parent env (the sweep command sets them).
+    env["ANVIL_CURRENT_TASK"] = f"{task}-{TASK_LABELS[task]}"
     env["AUTO_REPLY_FOR_CALIBRATION"] = AUTO_REPLIES[task]
     env["CALIBRATION_TELEGRAM_PREFIX"] = "[ANVIL-calibration]"
     # CODER_MODE must be auto for the orchestrator to invoke the Coder.

@@ -14,6 +14,7 @@ from anvil.calibration import CHEAP_STAGE_A_MODEL, RoutingCalibration
 from anvil.policy import (
     PHASE_1A_PLACEHOLDER,
     PHASE_1A_PLACEHOLDER_MODEL,
+    PHASE_1B_STAGE_A_CANARY,
     PHASE_1B_STAGE_A_SHADOW,
     RouteDecision,
     RoutingPolicy,
@@ -202,6 +203,41 @@ class TestPhase1bStageAShadow(unittest.TestCase):
             "A", {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
         self.assertEqual(d.route_candidate, PHASE_1A_PLACEHOLDER_MODEL)
         self.assertEqual(d.route_actual, PHASE_1A_PLACEHOLDER_MODEL)
+
+
+class TestPhase1bStageACanary(unittest.TestCase):
+    """v3 Phase 1b Step 3: PHASE_1B_STAGE_A_CANARY ACTS — for an empty-context
+    Stage A it sets BOTH route_candidate AND route_actual to the cheap model, so
+    the wrapper's API call (api_model = decision.route_actual under the canary)
+    actually runs it. champion_challenger agreement is 100% by design (candidate
+    == actual); the canary's signal is silent_miss == 0 (Step3B-F4)."""
+
+    def _canary(self):
+        return RoutingPolicy(PHASE_1B_STAGE_A_CANARY, calibration=_haiku_calibration())
+
+    def test_constant_and_construction(self) -> None:
+        self.assertEqual(PHASE_1B_STAGE_A_CANARY, "v3-phase-1b-stage-a-canary")
+        self.assertEqual(self._canary().policy_version, "v3-phase-1b-stage-a-canary")
+
+    def test_canary_acts_route_actual_and_candidate_both_haiku(self) -> None:
+        d = self._canary().decide_route(
+            "A", {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
+        self.assertEqual(d.route_candidate, CHEAP_STAGE_A_MODEL)
+        self.assertEqual(d.route_actual, CHEAP_STAGE_A_MODEL)  # canary ACTS
+        self.assertFalse(d.route_fallback_fired)
+
+    def test_canary_no_leak_to_stage_b_and_c(self) -> None:
+        for stage in ("B", "C"):
+            d = self._canary().decide_route(
+                stage, {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
+            self.assertEqual(d.route_candidate, "claude-opus-4-7")
+            self.assertEqual(d.route_actual, "claude-opus-4-7")
+
+    def test_canary_no_act_on_uncalibrated_stage_a(self) -> None:
+        d = self._canary().decide_route(
+            "A", {"context_paths_count": 3}, fallback_model="claude-opus-4-7")
+        self.assertEqual(d.route_actual, "claude-opus-4-7")  # uncalibrated → no act
+        self.assertEqual(d.route_candidate, "claude-opus-4-7")
 
 
 if __name__ == "__main__":

@@ -86,6 +86,16 @@ class TestRunIdAndDirShape(unittest.TestCase):
         self.assertEqual(env_real["ANVIL_RUN_ID_OVERRIDE"],
                          "T3-out-of-scope-real")
 
+    def test_build_env_sets_current_task_label_mode_independent(self) -> None:
+        # v3 Phase 1b Step 3: ANVIL_CURRENT_TASK is the mode-independent task
+        # label the orchestrator matches against the ANVIL_CANARY_TASKS allowlist.
+        self.assertEqual(
+            calibration_runner.build_env("T1", "mock")["ANVIL_CURRENT_TASK"],
+            "T1-doc-edit")
+        self.assertEqual(
+            calibration_runner.build_env("T1", "real")["ANVIL_CURRENT_TASK"],
+            "T1-doc-edit")
+
 
 class TestDryRun(unittest.TestCase):
     """--dry-run lists the plan, validates briefs, runs no subprocess."""

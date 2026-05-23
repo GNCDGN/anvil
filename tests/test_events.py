@@ -91,11 +91,12 @@ class TestEventSchema(_EventsTestBase):
             )
 
     def test_valid_kinds_catalogue_size(self) -> None:
-        # Pinned at 50 by the module's assert; this test surfaces drift
-        # at the test-suite level too. (45 → 46: v3 Phase 0 Step 2 added
+        # Pinned by the module's assert; this test surfaces drift at the
+        # test-suite level too. (45 → 46: v3 Phase 0 Step 2 added
         # "shadow.decision". 46 → 50: v3 Phase 0 Step 3 added the four
-        # silent-miss / parser-drop kinds.)
-        self.assertEqual(len(events.VALID_KINDS), 50)
+        # silent-miss / parser-drop kinds. 50 → 51: v3 Phase 1b Step 3 added
+        # "planner.stage_a.canary_baseline.api_end" — the first v3 bump.)
+        self.assertEqual(len(events.VALID_KINDS), 51)
         # A few canonical kinds present:
         for k in ("run.start", "planner.stage_b.api_end",
                   "ssh.stage.end", "telegram.poll.reply", "shadow.decision",

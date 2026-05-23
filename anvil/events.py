@@ -144,8 +144,17 @@ VALID_KINDS: frozenset[str] = frozenset({
     "stage_a.shadow_compare.end",
     "stage_a.silent_miss.detected",
     "stage_a.parser_drop",
+    # v3 Phase 1b Step 3 (V3P1B-3): the parallel Opus baseline call on a
+    # canary Stage A call — its own cost-bearing api_end kind so it doesn't
+    # double-count the primary Stage A call or perturb the shadow 1:1
+    # invariant. First v3 VALID_KINDS bump (Step3B-F1). (1)
+    "planner.stage_a.canary_baseline.api_end",
 })
-assert len(VALID_KINDS) == 50, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
+assert len(VALID_KINDS) == 51, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
+
+# v3 Phase 1b Step 3: the canary baseline event kind, referenced by the Planner
+# emit + the harness operations view (so the baseline's cost is ledgered).
+CANARY_BASELINE_KIND = "planner.stage_a.canary_baseline.api_end"
 
 # ---------------------------------------------------------------------------
 # v3 Phase 0 Step 1 — routing observability (V3P0-1)

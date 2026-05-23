@@ -100,6 +100,10 @@ OPERATION_KINDS: tuple[str, ...] = (
     "planner.stage_a.api_end",
     "planner.stage_b.api_end",
     "planner.stage_c.api_end",
+    # v3 Phase 1b Step 3 (V3P1B-3): the canary's parallel Opus baseline call —
+    # a cost-bearing operation so its spend is ledgered (the token-formula cost
+    # CASE applies automatically, like any non-coder api_end).
+    "planner.stage_a.canary_baseline.api_end",
     "planner.validation.pass",
     "planner.validation.fail",
     "planner.retry.end",
@@ -378,6 +382,7 @@ WHERE e.kind IN (
     'planner.stage_a.api_end',
     'planner.stage_b.api_end',
     'planner.stage_c.api_end',
+    'planner.stage_a.canary_baseline.api_end',
     'planner.validation.pass',
     'planner.validation.fail',
     'planner.retry.end',

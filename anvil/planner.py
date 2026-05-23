@@ -32,7 +32,7 @@ from pydantic import BaseModel
 
 from anvil import events as _events
 from anvil.brief import Step
-from anvil.policy import PHASE_1A_PLACEHOLDER, RoutingPolicy
+from anvil.policy import PHASE_1A_PLACEHOLDER, PHASE_1B_STAGE_A_CANARY, RoutingPolicy
 from anvil.voice import load_voice_spec
 
 log = logging.getLogger("anvil.planner")
@@ -275,17 +275,34 @@ class Planner:
             },
             step_idx=step_idx,
         )
-        # v3 Phase 0 Step 3 (V3P0-4): silent-miss comparator. Phase 0 feeds
-        # the same parsed selection on both sides (routed == baseline), so
-        # silent_miss_count is always 0 and jaccard always 1.0 — the path
-        # is wired and tested before Phase 1 supplies a real cheap-vs-Opus
-        # baseline. Lives here (not in _call_anthropic) because `selected`
-        # — the parsed Stage A response — only exists after the parse; the
-        # mock path inherits this via plan_step (no mocked.py wire needed).
+        # v3 Phase 0 Step 3 (V3P0-4): silent-miss comparator. Lives here (not in
+        # _call_anthropic) because `selected` — the parsed Stage A response —
+        # only exists after the parse; the mock path inherits this via plan_step.
+        # v3 Phase 1b Step 3 (V3P1B-3): canary parallel-Opus baseline. When the
+        # canary fired (policy is the canary version AND the API ran the cheap
+        # model, route_actual != per-stage Opus), run Opus in parallel on the
+        # same prompt for the ground-truth baseline selection (comparator
+        # option (a)); otherwise baseline == routed (identity, as before). For
+        # empty-context briefs both select nothing → silent_miss == 0 (the
+        # canary's success criterion).
+        decision = getattr(self, "_current_route_decision", None)
+        canary_fired = (
+            decision is not None
+            and getattr(self._policy, "policy_version", None)
+            == PHASE_1B_STAGE_A_CANARY
+            and decision.route_actual != self._model_for_stage("A")
+        )
+        if canary_fired:
+            baseline_resp = self._stage_a_canary_baseline(stage_a_prompt, step_idx)
+            baseline_selected = _parse_stage_a_response(
+                baseline_resp, vault_index, step_idx=step_idx
+            )
+        else:
+            baseline_selected = selected
         _events.emit_stage_a_shadow_compare(
             step_idx=step_idx,
             routed_paths=selected,
-            baseline_paths=selected,
+            baseline_paths=baseline_selected,
         )
         result = self._run_stage_b_with_retry(brief, state, step_idx, selected)
         if result.get("escalate"):
@@ -333,23 +350,25 @@ class Planner:
             seconds_since_cache_creation=seconds_since,
         )
 
-    def _policy_routing(self, stage: str, observed_prompt_token_count):
-        """v3 Phase 1a Step 3 (V3P1A-3): consult the routing policy and build
-        the routing-observability dict for an api_end emit.
+    def _decide_route(self, stage: str):
+        """v3 Phase 1b Step 3 (V3P1B-3): compute the RouteDecision PRE-call, so
+        the API model can source from `decision.route_actual` (the canary runs
+        the cheap model). Splits the old `_policy_routing` into a pre-call
+        decide + a post-call `_routing_for`, computed once at the top of
+        `_call_anthropic` and reused on the success + both error emit paths.
 
         `features` = Phase 0's `features_seen` merged with the stashed lint
-        `structured_features` (lint wins on key collision — the lint is the
-        authoritative source for brief-shape features, e.g. context_paths_count).
-        `route_actual` sources from the policy decision; the API call kwarg and
-        the `model` data field stay on `_model_for_stage(stage)` (Step3-F1:
-        "model" = what ran, "route_actual" = what the router decided). Returns
-        `(routing_dict, decision)` — the caller emits `**routing_dict` on the
-        api_end and feeds `decision` into the paired shadow.decision.
+        `structured_features` (lint wins on key collision, e.g.
+        context_paths_count). Uses **pre-call** features only:
+        observed_prompt_token_count is None here (it's a post-call observability
+        value; Phase 1b's predicate uses context_paths_count, which is pre-call
+        — Step3B-F3). Stashes `self._current_route_decision` so plan_step can
+        detect whether the canary fired and run the parallel-Opus baseline.
         """
         step_idx = getattr(self, "_current_step_idx", None)
         context_paths_count = getattr(self, "_current_context_paths_count", None)
         features_seen = _events._compute_features_seen(
-            stage, step_idx, observed_prompt_token_count, context_paths_count
+            stage, step_idx, None, context_paths_count
         )
         lint_res = getattr(self, "_current_lint_result", None)
         lint_features = getattr(lint_res, "structured_features", None) or {}
@@ -357,17 +376,44 @@ class Planner:
         decision = self._policy.decide_route(
             stage, merged, fallback_model=self._model_for_stage(stage)
         )
-        routing = _events.routing_observability(
+        self._current_route_decision = decision
+        return decision
+
+    def _routing_for(self, stage: str, decision, observed_prompt_token_count):
+        """v3 Phase 1b Step 3: build the routing-observability dict from the
+        pre-computed `decision` + the post-call observed token count. The
+        decision was made in `_decide_route` (pre-call); this only stamps the
+        observability token count into `features_seen` (the recorded
+        `decision_basis` keeps observed=None — Step3B-F3). `route_actual` /
+        `route_candidate` / `route_fallback_fired` / `policy_version` all come
+        from the decision."""
+        return _events.routing_observability(
             stage=stage,
-            step_idx=step_idx,
+            step_idx=getattr(self, "_current_step_idx", None),
             observed_prompt_token_count=observed_prompt_token_count,
-            context_paths_count=context_paths_count,
+            context_paths_count=getattr(self, "_current_context_paths_count", None),
             route_actual=decision.route_actual,
             route_candidate=decision.route_candidate,
             route_fallback_fired=decision.route_fallback_fired,
             policy_version=self._policy.policy_version,
         )
-        return routing, decision
+
+    def _api_model(self, stage: str, decision) -> str:
+        """v3 Phase 1b Step 3 (V3P1B-3): the model the API actually runs (and the
+        `model` data field = "what ran").
+
+        Default = the per-stage model — so Step 1's per-stage plumbing AND the
+        Step3-F1 inversion (route_actual observational, model = per-stage) are
+        PRESERVED for placeholder + shadow. The CANARY is the one policy where
+        route_actual means "what runs": under it the API sources from
+        decision.route_actual (the acted cheap model, or the per-stage fallback
+        when it didn't act). Gating on the canary policy_version — not on
+        `route_actual != _model_for_stage` — avoids a placeholder per-stage
+        override falsely triggering a model swap (which would defeat Step 1's
+        per-stage plumbing under the default policy)."""
+        if self._policy.policy_version == PHASE_1B_STAGE_A_CANARY:
+            return decision.route_actual
+        return self._model_for_stage(stage)
 
     # -----------------------------------------------------------------------
     # Phase 1 Step 5 — Anthropic call wrapper + Stage B retry loop
@@ -391,6 +437,14 @@ class Planner:
         retried once after sleeping min(60, retry-after); a second
         failure returns "". A broad Exception is logged and returns "".
         """
+        # v3 Phase 1b Step 3 (V3P1B-3): decide the route BEFORE the call so the
+        # API model can source from decision.route_actual — under the canary the
+        # API actually runs the cheap model (the Step3-F1 "model = ran" change,
+        # now production). The one decision is reused by the success + both
+        # error emit paths (A3). For shadow/placeholder, decision.route_actual
+        # == _model_for_stage(stage), so this is behaviour-neutral there.
+        decision = self._decide_route(stage)
+        api_model = self._api_model(stage, decision)
 
         def _attempt() -> str:
             client = self._client.with_options(timeout=timeout)
@@ -414,7 +468,7 @@ class Planner:
                 else system
             )
             with client.messages.stream(
-                model=self._model_for_stage(stage),
+                model=api_model,
                 max_tokens=8192,
                 system=system_param,
                 messages=[{"role": "user", "content": user}],
@@ -427,7 +481,7 @@ class Planner:
             )
             u = final.usage
             log.info(
-                f"[planner] step={step} stage={stage} model={self._model_for_stage(stage)} "
+                f"[planner] step={step} stage={stage} model={api_model} "
                 f"input_tokens={u.input_tokens} "
                 f"output_tokens={u.output_tokens} "
                 f"cache_creation_input_tokens="
@@ -447,12 +501,12 @@ class Planner:
             # + route_actual. v3 Phase 1a Step 1: route_actual now sources from
             # the per-stage attribute (_model_for_stage(stage)), matching the
             # model actually passed to client.messages.stream above.
-            routing, decision = self._policy_routing(stage, u.input_tokens)
+            routing = self._routing_for(stage, decision, u.input_tokens)
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
                 {
                     "step_idx": getattr(self, "_current_step_idx", None),
-                    "model": self._model_for_stage(stage),
+                    "model": api_model,
                     "input_tokens": u.input_tokens,
                     "output_tokens": u.output_tokens,
                     "cache_creation_input_tokens":
@@ -508,12 +562,12 @@ class Planner:
                     # v3 Phase 0 Step 1 (V3P0-1): error-path api_end still
                     # carries the five fields; observed_prompt_token_count
                     # is None (the call failed, no usage was returned).
-                    routing, decision = self._policy_routing(stage, None)
+                    routing = self._routing_for(stage, decision, None)
                     _events.emit(
                         f"planner.stage_{stage.lower()}.api_end",
                         {
                             "step_idx": getattr(self, "_current_step_idx", None),
-                            "model": self._model_for_stage(stage),
+                            "model": api_model,
                             "ok": False,
                             "error": "rate-limit/timeout",
                             **routing,
@@ -542,12 +596,12 @@ class Planner:
             )
             # v3 Phase 0 Step 1 (V3P0-1): error-path api_end carries the
             # five fields; no usage on this path.
-            routing, decision = self._policy_routing(stage, None)
+            routing = self._routing_for(stage, decision, None)
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
                 {
                     "step_idx": getattr(self, "_current_step_idx", None),
-                    "model": self._model_for_stage(stage),
+                    "model": api_model,
                     "ok": False,
                     "error": str(e)[:300],
                     **routing,
@@ -565,6 +619,76 @@ class Planner:
                 actual_route_taken=decision.route_actual,
                 shadow_route_candidate=decision.route_candidate,
                 policy_version=self._policy.policy_version,
+            )
+            return ""
+
+    def _emit_canary_baseline(
+        self, step_idx, model, usage, duration_ms, *, ok, error=None
+    ) -> None:
+        """v3 Phase 1b Step 3 (V3P1B-3): emit the canary parallel-Opus baseline
+        call's cost-bearing event. Its own kind (not stage_a.api_end) so it
+        doesn't double-count the primary Stage A call or perturb the shadow 1:1
+        invariant; the operations view counts its cost via the token formula."""
+        data = {
+            "step_idx": step_idx,
+            "model": model,
+            "duration_ms": duration_ms,
+            "ok": ok,
+        }
+        if usage is not None:
+            data.update({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_creation_input_tokens":
+                    usage.cache_creation_input_tokens or 0,
+                "cache_read_input_tokens": usage.cache_read_input_tokens or 0,
+            })
+        if error is not None:
+            data["error"] = error
+        _events.emit(_events.CANARY_BASELINE_KIND, data, step_idx=step_idx)
+
+    def _stage_a_canary_baseline(self, prompt: str, step_idx) -> str:
+        """v3 Phase 1b Step 3 (V3P1B-3): the parallel Opus baseline for a canary
+        Stage A call. Streams the per-stage Opus reference model on the SAME
+        prompt to get a ground-truth selection for the silent-miss comparator,
+        emits planner.stage_a.canary_baseline.api_end (cost ledgered), and
+        returns the response text. Never raises (→ "" on failure, an empty
+        baseline selection). MockedPlanner overrides this to read the fixture."""
+        baseline_model = self._model_for_stage("A")  # Opus reference
+        try:
+            client = self._client.with_options(timeout=_STAGE_A_TIMEOUT)
+            t0 = time.monotonic()
+            system_param = (
+                [{
+                    "type": "text",
+                    "text": self._system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+                if self._system_prompt else self._system_prompt
+            )
+            with client.messages.stream(
+                model=baseline_model,
+                max_tokens=8192,
+                system=system_param,
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                final = stream.get_final_message()
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            text = "".join(
+                b.text for b in final.content
+                if getattr(b, "type", None) == "text"
+            )
+            self._emit_canary_baseline(
+                step_idx, baseline_model, final.usage, duration_ms, ok=True
+            )
+            return text
+        except Exception as e:  # noqa: BLE001 — never-raise contract
+            log.error(
+                f"[planner] canary baseline (step={step_idx}) failed "
+                f"({e}); empty baseline"
+            )
+            self._emit_canary_baseline(
+                step_idx, baseline_model, None, 0, ok=False, error=str(e)[:300]
             )
             return ""
 
