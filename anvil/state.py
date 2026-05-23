@@ -22,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from anvil.errors import StateCorruptError
+from anvil.lint import LintResult
 
 _STATUS = Literal[
     "running", "waiting", "paused-by-user",
@@ -91,6 +92,12 @@ class State(BaseModel):
     # to constructing a fresh id and logging the un-instrumented case.
     # Back-compatible (default None); no schema_version bump.
     run_id: str | None = None
+    # v3 Phase 1a Step 2: advisory brief-lint output, stashed by
+    # handle_brief after validate_or_reject (before the step loop). Carries
+    # advisory_warnings + the flat structured_features the Step 3 routing
+    # policy engine consumes. Optional/back-compatible (default None — Phase 0
+    # state files deserialise with lint_result=None); no schema_version bump.
+    lint_result: LintResult | None = None
 
 
 def state_dir() -> Path:

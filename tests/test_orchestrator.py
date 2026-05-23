@@ -214,6 +214,25 @@ class TestOrchestrator(unittest.TestCase):
             markers, [], f"clean run must produce no marker; found {markers}",
         )
 
+    def test_handle_brief_stashes_lint_result(self) -> None:
+        # v3 Phase 1a Step 2: handle_brief runs lint_brief after
+        # validate_or_reject (and resolve_context_paths) and persists the
+        # result on state.lint_result before the step loop.
+        orch = self._orch(["done", "go", "done", "done", "go"])
+        rc = orch.handle_brief(self.brief_path)
+        self.assertEqual(rc, 0)
+        st = read_state()
+        self.assertIsNotNone(st.lint_result)
+        self.assertEqual(
+            set(st.lint_result.structured_features),
+            {"brief_token_estimate", "step_count", "total_scope_files",
+             "has_vps_deploy", "has_end_to_end_test", "context_paths_count",
+             "confidence_band"},
+        )
+        # Trivial brief is in-corpus (3 steps, no deploy, canonical ops).
+        self.assertEqual(st.lint_result.structured_features["step_count"], 3)
+        self.assertEqual(st.lint_result.confidence_band, "high")
+
     def test_move_brief_updates_state_brief_path_for_resume(self) -> None:
         """Step 10 hotfix: after inbox→active move, state.brief_path must
         point at the active/ file (persisted), so resume() re-parses a path

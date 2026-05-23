@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 from anvil import events as _events
 from anvil import git_ops as _git_ops
 from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
+from anvil.lint import lint_brief
 from anvil.coder import Coder
 from anvil import ssh_ops
 # v2 Phase 1 Step 6: `anvil.checkpoint` does `from anvil.orchestrator
@@ -367,6 +368,16 @@ class Orchestrator:
             # caught below — a brief defect surfaces, not a silent blind run.
             brief = resolve_context_paths(brief, self.config.vault_path)
 
+            # v3 Phase 1a Step 2: advisory brief lint. Runs after
+            # resolve_context_paths (so context_paths_count reflects the
+            # resolved paths) and before the step loop. Pure advisory —
+            # never mutates the brief, never gates execution; lint_brief
+            # owns its own never-raise contract, so no wrap here. Stashed
+            # on state.lint_result via each branch's transition() write
+            # below (re-linting on resume is intentional — it back-fills
+            # legacy state files that predate the field).
+            lint_result = lint_brief(brief)
+
             if resumed_state is not None:
                 # Decision #15 fix (Phase 2 Step 2): on resume, reuse the
                 # loaded state instead of clobbering it with init_state.
@@ -392,7 +403,10 @@ class Orchestrator:
                 # The brief is already in active/ from the original run; do
                 # not re-move it. transition() back to "running" so the
                 # loop's status checks see a runnable state.
-                state = transition(state, "running", pending_action=None)
+                state = transition(
+                    state, "running", pending_action=None,
+                    lint_result=lint_result,
+                )
                 self._state = state
             else:
                 started_at = datetime.now(_UK).isoformat(timespec="seconds")
@@ -405,7 +419,8 @@ class Orchestrator:
 
                 self._open_run_log(brief, started_at)
                 state = transition(state, "running",
-                                   run_log=str(self._run_log))
+                                   run_log=str(self._run_log),
+                                   lint_result=lint_result)
                 self._state = state
                 self._log_event(
                     "start", f"{len(brief.steps)} steps; manual mode"

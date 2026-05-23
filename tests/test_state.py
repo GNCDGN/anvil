@@ -160,6 +160,20 @@ class TestState(unittest.TestCase):
         self.assertTrue(all(st.plan is None for st in back.steps))
         self.assertTrue(all(st.coder_output is None for st in back.steps))
 
+    def test_phase0_state_without_lint_result_loads_as_none(self) -> None:
+        # v3 Phase 1a Step 2: a state JSON predating lint_result (Phase 0 era)
+        # deserialises with lint_result=None — back-compat, no schema bump.
+        s = self._mk_state()
+        raw = s.model_dump()
+        raw.pop("lint_result", None)
+        (self._dir / "current-run.json").write_text(
+            json.dumps(raw), encoding="utf-8"
+        )
+        back = read_state()
+        self.assertIsNotNone(back)
+        self.assertIsNone(back.lint_result)
+        self.assertEqual(back.schema_version, 2)  # field is optional; no bump
+
     def test_round_trip_preserves_plan(self) -> None:
         s = self._mk_state()
         s.steps[0].plan = {"step_number": 1, "approach": "x"}
