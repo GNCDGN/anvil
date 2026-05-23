@@ -151,23 +151,15 @@ class MockedPlanner(Planner):
         stage_key = stage.lower()
         observed_input_tokens = int(usage.get("input_tokens", 0))
         cache_creation = int(usage.get("cache_creation_input_tokens", 0))
-        # v3 Phase 0 Step 1 (V3P0-1): routing observability, same shape as
-        # the production wrapper. route_actual is the per-stage model via
-        # the inherited _model_for_stage(stage) (the inherited plan_step /
-        # Stage-C path stashes _current_context_paths_count before this
-        # override runs, since MockedPlanner overrides only _call_anthropic).
-        # Built once so the paired Step 2 shadow.decision reuses
-        # features_seen + route_actual. v3 Phase 1a Step 1 (V3P0-3
-        # parallel-wire): the per-stage read here mirrors planner.py.
-        routing = _events.routing_observability(
-            stage=stage,
-            step_idx=step_idx,
-            observed_prompt_token_count=observed_input_tokens,
-            context_paths_count=getattr(
-                self, "_current_context_paths_count", None
-            ),
-            route_actual=self._model_for_stage(stage),
-        )
+        # v3 Phase 1a Step 3 (V3P0-3 parallel-wire): route the synthesised
+        # api_end through the inherited _policy_routing, exactly as the
+        # production wrapper does. route_actual sources from the policy
+        # decision (Phase 1a placeholder → Opus); the `model` data field
+        # below stays per-stage. The inherited plan_step / Stage-C path
+        # stashes _current_step_idx + _current_context_paths_count +
+        # _current_lint_result before this override runs (MockedPlanner
+        # overrides only _call_anthropic).
+        routing, decision = self._policy_routing(stage, observed_input_tokens)
         _events.emit(
             f"planner.stage_{stage_key}.api_end",
             {
@@ -197,8 +189,10 @@ class MockedPlanner(Planner):
         _events.emit_shadow_decision(
             stage=stage,
             step_idx=step_idx,
-            features_seen=routing["features_seen"],
-            actual_route_taken=routing["route_actual"],
+            features_seen=decision.decision_basis,
+            actual_route_taken=decision.route_actual,
+            shadow_route_candidate=decision.route_candidate,
+            policy_version=self._policy.policy_version,
         )
 
         return text

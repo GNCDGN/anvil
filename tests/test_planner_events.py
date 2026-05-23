@@ -24,6 +24,7 @@ from unittest import mock
 from anvil import events
 from anvil import planner as planner_mod
 from anvil.brief import Brief, Step
+from anvil.lint import LintResult
 from anvil.planner import Planner, DEFAULT_PLANNER_MODEL
 from anvil.state import init_state
 
@@ -481,11 +482,14 @@ class TestRoutingObservability(_PlannerEventsBase):
         end = next(e for e in self._events_for()
                    if e["kind"] == "planner.stage_b.api_end")
         d = end["data"]
-        # route_actual is self.model (the test planner's model string).
-        self.assertEqual(d["route_actual"], "claude-opus-4-7-test")
+        # v3 Phase 1a Step 3: route_actual now sources from the policy
+        # (placeholder → "claude-opus-4-7"), NOT the planner's per-stage model
+        # "claude-opus-4-7-test"; policy_version flips to the Phase 1a stamp.
+        # route_candidate still mirrors route_actual (placeholder shell).
+        self.assertEqual(d["route_actual"], "claude-opus-4-7")
         self.assertEqual(d["route_candidate"], d["route_actual"])
         self.assertFalse(d["route_fallback_fired"])
-        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        self.assertEqual(d["policy_version"], "v3-phase-1a-placeholder")
         fs = d["features_seen"]
         # observed_prompt_token_count is the API's input_tokens (620).
         self.assertEqual(fs["observed_prompt_token_count"], 620)
@@ -510,8 +514,10 @@ class TestRoutingObservability(_PlannerEventsBase):
                    if e["kind"] == "planner.stage_a.api_end")
         d = end["data"]
         self.assertFalse(d["ok"])
-        self.assertEqual(d["route_actual"], "claude-opus-4-7-test")
-        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        # v3 Phase 1a Step 3: route_actual + policy_version source from the
+        # policy on the error path too (the wrapper still consults it).
+        self.assertEqual(d["route_actual"], "claude-opus-4-7")
+        self.assertEqual(d["policy_version"], "v3-phase-1a-placeholder")
         self.assertFalse(d["route_fallback_fired"])
         fs = d["features_seen"]
         # No usage on the error path → token count is None, keys still present.
@@ -546,10 +552,10 @@ class TestShadowDecisionPairing(_PlannerEventsBase):
         sd = evs[i_shadow]["data"]
         self.assertEqual(sd["stage"], "B")
         self.assertEqual(sd["shadow_route_candidate"], "claude-opus-4-7")
-        self.assertEqual(sd["actual_route_taken"], "claude-opus-4-7-test")
-        # agreement: candidate (opus-4-7) vs actual (the test model string)
-        # — they differ here only because the test planner uses a sentinel
-        # model; the logic is exercised either way.
+        # v3 Phase 1a Step 3: actual_route_taken now sources from the policy
+        # decision (route_actual = placeholder opus), not the sentinel per-stage
+        # model — so candidate == actual → agreement is True.
+        self.assertEqual(sd["actual_route_taken"], "claude-opus-4-7")
         self.assertEqual(
             sd["agreement"],
             sd["shadow_route_candidate"] == sd["actual_route_taken"],
@@ -754,11 +760,14 @@ class TestPerStageModelPlumbing(_PlannerEventsBase):
             p._model_for_stage("Z")
 
     def test_stage_c_routes_without_leaking_into_a_or_b(self) -> None:
-        # Criterion 4 (dual assertion): with Stage C routed to a different
-        # model, the Stage C call must (a) emit route_actual/model = sonnet
-        # AND (b) pass model="…sonnet" to client.messages.stream; Stage A
-        # and Stage B must stay opus on both axes. The dual axis catches
-        # the A1 false-pass risk (route_actual aligned but the API call not).
+        # Step 1's no-leak proof, updated for Step 3's inversion. The API-call
+        # no-leak axis (the mock-client kwarg) is unchanged and remains
+        # load-bearing: Stage C's per-stage override reaches the API and does
+        # not leak into A/B. The route_actual axis now proves POLICY-sourcing:
+        # route_actual = the placeholder ("opus") on every stage, while the
+        # `model` data field = what the API ran (per-stage). They DIVERGE for
+        # Stage C here (model=sonnet, route_actual=opus) — that divergence IS
+        # the Step3-F1 inversion ("model" = ran, "route_actual" = decided).
         client, capture = _make_fake_client(
             input_tokens=600, output_tokens=40, cache_creation=0, cache_read=2603,
         )
@@ -767,13 +776,14 @@ class TestPerStageModelPlumbing(_PlannerEventsBase):
         p._current_step_idx = None
         p._current_context_paths_count = 0
 
-        # Stage C → sonnet on both axes.
+        # Stage C: API call + model field = sonnet (per-stage, what ran);
+        # route_actual = opus (policy placeholder, what the router decided).
         p._call_anthropic(system="SYS", user="u", timeout=120, step=0, stage="C")
-        self.assertEqual(capture["model"], "claude-sonnet-4-6")
+        self.assertEqual(capture["model"], "claude-sonnet-4-6")          # API ran
         end_c = next(e for e in self._events_for()
                      if e["kind"] == "planner.stage_c.api_end")
-        self.assertEqual(end_c["data"]["route_actual"], "claude-sonnet-4-6")
-        self.assertEqual(end_c["data"]["model"], "claude-sonnet-4-6")
+        self.assertEqual(end_c["data"]["model"], "claude-sonnet-4-6")    # ran
+        self.assertEqual(end_c["data"]["route_actual"], "claude-opus-4-7")  # decided
 
         # Stage A → opus, no leak from the Stage C override.
         p._current_step_idx = 0
@@ -791,6 +801,105 @@ class TestPerStageModelPlumbing(_PlannerEventsBase):
                      if e["kind"] == "planner.stage_b.api_end")
         self.assertEqual(end_b["data"]["route_actual"], "claude-opus-4-7")
         self.assertEqual(end_b["data"]["model"], "claude-opus-4-7")
+
+
+class TestPolicyEngineWiring(_PlannerEventsBase):
+    """v3 Phase 1a Step 3: the RoutingPolicy is wired into _call_anthropic.
+    route_actual sources from the policy decision (placeholder → Opus); the
+    API call + model data field stay per-stage; policy_version stamps the
+    routing event and the shadow.decision; decision_basis is the lint+features
+    merge (lint wins)."""
+
+    def _drive_success(self, *, stage="B", step=2, input_tokens=620):
+        client, capture = _make_fake_client(
+            input_tokens=input_tokens, output_tokens=40,
+            cache_creation=0, cache_read=2603,
+        )
+        self.planner._client = client
+        self.planner._current_step_idx = step - 1
+        self.planner._current_context_paths_count = 5
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=step, stage=stage,
+        )
+        return capture
+
+    def test_route_actual_sources_from_policy_not_per_stage(self) -> None:
+        # The planner's model is the sentinel "claude-opus-4-7-test", but
+        # route_actual = the policy placeholder "claude-opus-4-7". The `model`
+        # data field = the sentinel (what the API ran). The inversion.
+        self._drive_success(stage="B")
+        d = next(e for e in self._events_for()
+                 if e["kind"] == "planner.stage_b.api_end")["data"]
+        self.assertEqual(d["route_actual"], "claude-opus-4-7")          # policy
+        self.assertEqual(d["model"], "claude-opus-4-7-test")            # ran
+
+    def test_policy_route_actual_independent_of_per_stage_model(self) -> None:
+        # route_actual = the placeholder regardless of the per-stage model;
+        # the API call kwarg + model field track the per-stage model.
+        client, capture = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0, cache_read=2603,
+        )
+        p = Planner(model="model-x", stage_c_model="model-y")
+        p._client = client
+        p._current_step_idx = None
+        p._current_context_paths_count = 0
+        p._call_anthropic(system="SYS", user="u", timeout=120, step=0, stage="C")
+        end_c = next(e for e in self._events_for()
+                     if e["kind"] == "planner.stage_c.api_end")["data"]
+        self.assertEqual(capture["model"], "model-y")          # API ran per-stage
+        self.assertEqual(end_c["model"], "model-y")            # data field = ran
+        self.assertEqual(end_c["route_actual"], "claude-opus-4-7")    # policy
+        self.assertEqual(end_c["route_candidate"], "claude-opus-4-7")
+
+    def test_policy_version_stamped_on_api_end(self) -> None:
+        self._drive_success(stage="A", step=1)
+        d = next(e for e in self._events_for()
+                 if e["kind"] == "planner.stage_a.api_end")["data"]
+        self.assertEqual(d["policy_version"], "v3-phase-1a-placeholder")
+        self.assertFalse(d["route_fallback_fired"])
+
+    def test_policy_version_stamped_on_shadow_event(self) -> None:
+        self._drive_success(stage="A", step=1)
+        sd = next(e for e in self._events_for()
+                  if e["kind"] == "shadow.decision")["data"]
+        self.assertEqual(sd["policy_version"], "v3-phase-1a-placeholder")
+        # Placeholder shell: candidate == actual → agreement True.
+        self.assertEqual(sd["shadow_route_candidate"], sd["actual_route_taken"])
+        self.assertTrue(sd["agreement"])
+
+    def test_decision_basis_merges_lint_features_lint_wins(self) -> None:
+        # Stash a lint result with a colliding key (context_paths_count) and a
+        # lint-only key (brief_token_estimate). The merge into decision_basis
+        # must let lint WIN on the collision and carry both feature sets.
+        self.planner._current_lint_result = LintResult(
+            structured_features={
+                "context_paths_count": 999, "brief_token_estimate": 50,
+            },
+        )
+        self._drive_success(stage="B", step=2)  # sets _current_context_paths_count=5
+        sd = next(e for e in self._events_for()
+                  if e["kind"] == "shadow.decision")["data"]
+        basis = sd["shadow_decision_basis"]
+        self.assertEqual(basis["context_paths_count"], 999)   # lint wins collision
+        self.assertEqual(basis["brief_token_estimate"], 50)   # lint-only key
+        self.assertEqual(basis["stage"], "B")                 # features_seen key
+        self.assertEqual(basis["observed_prompt_token_count"], 620)
+
+    def test_decision_basis_without_lint_is_features_seen_only(self) -> None:
+        # No _current_lint_result stashed → only Phase 0 features_seen in basis;
+        # context_paths_count keeps its features_seen value (not overridden).
+        self.assertIsNone(getattr(self.planner, "_current_lint_result", None))
+        self._drive_success(stage="B", step=2)
+        sd = next(e for e in self._events_for()
+                  if e["kind"] == "shadow.decision")["data"]
+        basis = sd["shadow_decision_basis"]
+        self.assertEqual(basis["context_paths_count"], 5)     # features_seen value
+        self.assertNotIn("brief_token_estimate", basis)       # no lint keys
+        self.assertEqual(
+            set(basis),
+            {"observed_prompt_token_count", "step_idx", "stage",
+             "context_paths_count"},
+        )
 
 
 if __name__ == "__main__":

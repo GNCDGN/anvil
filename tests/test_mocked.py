@@ -155,7 +155,10 @@ class TestMockedPlannerCallAnthropic(_MockedTestBase):
         self.assertEqual(d["route_actual"], "claude-opus-4-7")
         self.assertEqual(d["route_candidate"], "claude-opus-4-7")
         self.assertFalse(d["route_fallback_fired"])
-        self.assertEqual(d["policy_version"], "v3-phase-0-passive")
+        # v3 Phase 1a Step 3: policy_version flips to the Phase 1a stamp
+        # (the mocked planner's model already == the placeholder, so
+        # route_actual is unchanged at "claude-opus-4-7").
+        self.assertEqual(d["policy_version"], "v3-phase-1a-placeholder")
         fs = d["features_seen"]
         self.assertEqual(fs["stage"], "A")
         self.assertEqual(fs["step_idx"], 0)
@@ -513,12 +516,37 @@ class TestMockedPerStageModel(_MockedTestBase):
         self.assertTrue(a, "expected a Stage A api_end")
         self.assertTrue(b, "expected a Stage B api_end")
         self.assertTrue(c, "expected a Stage C api_end")
+        # v3 Phase 1a Step 3 inversion: route_actual = policy placeholder
+        # ("opus") on every stage; the `model` data field = what the API ran
+        # (per-stage). A/B coincide (both opus); Stage C diverges (model=sonnet
+        # from the per-stage override, route_actual=opus from the policy).
         for e in a + b:
             self.assertEqual(e["data"]["route_actual"], "claude-opus-4-7")
             self.assertEqual(e["data"]["model"], "claude-opus-4-7")
         for e in c:
-            self.assertEqual(e["data"]["route_actual"], "claude-sonnet-4-6")
-            self.assertEqual(e["data"]["model"], "claude-sonnet-4-6")
+            self.assertEqual(e["data"]["route_actual"], "claude-opus-4-7")   # policy
+            self.assertEqual(e["data"]["model"], "claude-sonnet-4-6")        # per-stage ran
+
+    def test_parallel_wire_policy_route_actual_and_policy_version(self) -> None:
+        # v3 Phase 1a Step 3 (V3P0-3 parallel-wire): MockedPlanner's overridden
+        # _call_anthropic routes through the inherited _policy_routing, so its
+        # synthesised api_end + shadow.decision carry the policy's route_actual
+        # and policy_version — identical to the production wrapper.
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        p = MockedPlanner(model="claude-opus-4-7")
+        p._current_step_idx = 0
+        p._current_context_paths_count = 0
+        p._call_anthropic(system="(sys)", user="(usr)", timeout=30,
+                          step=1, stage="A")
+        evs = self._events()
+        end = next(e for e in evs
+                   if e["kind"] == "planner.stage_a.api_end")["data"]
+        self.assertEqual(end["route_actual"], "claude-opus-4-7")          # policy
+        self.assertEqual(end["policy_version"], "v3-phase-1a-placeholder")
+        self.assertFalse(end["route_fallback_fired"])
+        sd = next(e for e in evs if e["kind"] == "shadow.decision")["data"]
+        self.assertEqual(sd["policy_version"], "v3-phase-1a-placeholder")
+        self.assertTrue(sd["agreement"])
 
 
 if __name__ == "__main__":

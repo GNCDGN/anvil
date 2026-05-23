@@ -1131,5 +1131,95 @@ class TestPerStageRouteActual(_HarnessTestBase):
         self.assertEqual(by_kind["planner.stage_c.api_end"], "claude-sonnet-4-6")
 
 
+class TestStep3PolicyVersion(_HarnessTestBase):
+    """v3 Phase 1a Step 3: the shadow_decisions ingest reads policy_version from
+    the event (criterion 4), and champion_challenger_comparison segregates the
+    two policy generations into separate rows (criterion 5)."""
+
+    def test_shadow_ingest_reads_policy_version(self) -> None:
+        run_dir = self.tmp_path / "T9-pv"
+        run_dir.mkdir()
+        rows = [
+            _event_row(0, "run.start", {}, run_id="T9-pv"),
+            _event_row(
+                10, "shadow.decision",
+                {"stage": "A", "shadow_route_candidate": "claude-opus-4-7",
+                 "shadow_decision_basis": {"stage": "A"},
+                 "actual_route_taken": "claude-opus-4-7", "agreement": True,
+                 "policy_version": "v3-phase-1a-placeholder"},
+                run_id="T9-pv", step_idx=0),
+            _event_row(
+                20, "shadow.decision",
+                {"stage": "B", "shadow_route_candidate": "claude-opus-4-7",
+                 "shadow_decision_basis": {"stage": "B"},
+                 "actual_route_taken": "claude-opus-4-7", "agreement": True},
+                run_id="T9-pv", step_idx=0),  # no policy_version → column default
+            _event_row(30, "run.end", {"drops": 0}, run_id="T9-pv"),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in rows) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+        got = dict(self.con.execute(
+            "SELECT stage, policy_version FROM shadow_decisions "
+            "WHERE run_id = 'T9-pv' ORDER BY stage"
+        ).fetchall())
+        self.assertEqual(got["A"], "v3-phase-1a-placeholder")  # read from event
+        self.assertEqual(got["B"], "v3-phase-0-passive")       # column default
+
+    def _make_policy_run(self, run_id: str, policy_version: str) -> None:
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir()
+        api_data = {
+            "model": "claude-opus-4-7", "input_tokens": 1000, "output_tokens": 50,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "duration_ms": 1500, "ok": True,
+            "route_candidate": "claude-opus-4-7", "route_actual": "claude-opus-4-7",
+            "route_fallback_fired": False, "policy_version": policy_version,
+            "features_seen": {"stage": "A", "step_idx": 0,
+                              "observed_prompt_token_count": 1000,
+                              "context_paths_count": 0},
+        }
+        shadow_data = {
+            "stage": "A", "shadow_route_candidate": "claude-opus-4-7",
+            "shadow_decision_basis": {"stage": "A"},
+            "actual_route_taken": "claude-opus-4-7", "agreement": True,
+            "policy_version": policy_version,
+        }
+        rows = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end", api_data,
+                       run_id=run_id, step_idx=0),
+            _event_row(11, "shadow.decision", shadow_data,
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in rows) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+    def test_champion_challenger_returns_both_policy_versions(self) -> None:
+        # Distinct task_ids (T8 vs T9) so the two policy generations aggregate
+        # as SEPARATE rows rather than merging into one (stage, task_id) group.
+        self._make_policy_run("T8-passive", "v3-phase-0-passive")
+        self._make_policy_run("T9-placeholder", "v3-phase-1a-placeholder")
+
+        rows = self.con.execute(
+            "SELECT policy_version, agreement_count, disagreement_count "
+            "FROM champion_challenger_comparison "
+            "WHERE policy_version IS NOT NULL"
+        ).fetchall()
+        by_pv = {pv: (ac, dc) for pv, ac, dc in rows}
+        self.assertIn("v3-phase-0-passive", by_pv)
+        self.assertIn("v3-phase-1a-placeholder", by_pv)
+        # 100% agreement on each: agreement_count > 0, disagreement_count == 0.
+        for pv in ("v3-phase-0-passive", "v3-phase-1a-placeholder"):
+            ac, dc = by_pv[pv]
+            self.assertGreater(ac, 0)
+            self.assertEqual(dc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

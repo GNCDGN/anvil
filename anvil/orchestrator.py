@@ -377,6 +377,13 @@ class Orchestrator:
             # below (re-linting on resume is intentional — it back-fills
             # legacy state files that predate the field).
             lint_result = lint_brief(brief)
+            # v3 Phase 1a Step 3 (V3P1A-3): stash the lint result on the
+            # Planner so _call_anthropic's _policy_routing can merge the lint
+            # structured_features into the policy's decision_basis (lint wins
+            # on collision). Instance-attribute stash mirrors the V3P0-2 /
+            # V3P0-6 precedent; the wrapper reads it via getattr (None when
+            # unset → lint features simply absent from the merge).
+            self.planner._current_lint_result = lint_result
 
             if resumed_state is not None:
                 # Decision #15 fix (Phase 2 Step 2): on resume, reuse the

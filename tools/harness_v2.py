@@ -910,9 +910,12 @@ def ingest(con: duckdb.DuckDBPyConnection, run_dir: Path) -> dict:
         # v3 Phase 0 Step 2 (V3P0-3): populate shadow_decisions from the
         # shadow.decision events in the same JSONL. One table row per
         # event; fields read from the event's `data` payload. step_idx
-        # comes from the event top-level (consistent with the events
-        # table); policy_version is omitted so the column DEFAULT
-        # ('v3-phase-0-passive') applies in Phase 0.
+        # comes from the event top-level (consistent with the events table).
+        # v3 Phase 1a Step 3 (V3P1A-3): policy_version is now read from the
+        # event data and inserted into the column (criterion 4 — stamp every
+        # shadow_decisions row). Phase 0 events that lack the key fall back to
+        # the column's default stamp, so the existing self-check fixtures keep
+        # producing 'v3-phase-0-passive' rows unchanged.
         for ev in rows:
             if ev.get("kind") != "shadow.decision":
                 continue
@@ -922,9 +925,9 @@ def ingest(con: duckdb.DuckDBPyConnection, run_dir: Path) -> dict:
                 INSERT INTO shadow_decisions
                     (run_id, mode, step_idx, stage, ts,
                      shadow_route_candidate, shadow_decision_basis,
-                     actual_route_taken, agreement)
+                     actual_route_taken, agreement, policy_version)
                 VALUES (?, ?, ?, ?, CAST(? AS TIMESTAMP),
-                        ?, CAST(? AS JSON), ?, ?)
+                        ?, CAST(? AS JSON), ?, ?, ?)
                 """,
                 [
                     ev.get("run_id") or run_id,
@@ -936,6 +939,7 @@ def ingest(con: duckdb.DuckDBPyConnection, run_dir: Path) -> dict:
                     json.dumps(d.get("shadow_decision_basis") or {}),
                     d.get("actual_route_taken"),
                     d.get("agreement"),
+                    d.get("policy_version") or "v3-phase-0-passive",
                 ],
             )
         # v2 Phase 3 Step 1: append to spend_ledger inside the SAME

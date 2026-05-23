@@ -191,20 +191,31 @@ def routing_observability(
     observed_prompt_token_count: int | None,
     context_paths_count: int | None,
     route_actual: str | None,
+    route_candidate: str | None = None,
+    route_fallback_fired: bool = False,
+    policy_version: str | None = None,
 ) -> dict[str, Any]:
     """Return the five v3 Phase 0 routing-observability fields, ready to
     merge into an event's `data` payload.
 
-    Phase 0 is passive: `route_candidate` mirrors `route_actual` (no
-    policy engine selects an alternative), `route_fallback_fired` is
-    always False (no fallback paths exist), and `policy_version` is the
-    literal placeholder. Wire Phase 1's policy engine here when it lands.
+    Phase 0 / back-compat callers (e.g. coder.py) pass only `route_actual`:
+    `route_candidate` mirrors it, `route_fallback_fired` is False, and
+    `policy_version` is the Phase 0 placeholder.
+
+    v3 Phase 1a Step 3: the Planner wrapper now passes `route_candidate`,
+    `route_fallback_fired`, and `policy_version` from the RoutingPolicy
+    decision, so `route_actual` reflects what the router DECIDED while the
+    `model` data field reflects what the API RAN (Step3-F1).
     """
     return {
-        "route_candidate": route_actual,
+        "route_candidate": (
+            route_candidate if route_candidate is not None else route_actual
+        ),
         "route_actual": route_actual,
-        "route_fallback_fired": False,
-        "policy_version": POLICY_VERSION_PHASE_0,
+        "route_fallback_fired": route_fallback_fired,
+        "policy_version": (
+            policy_version if policy_version is not None else POLICY_VERSION_PHASE_0
+        ),
         "features_seen": _compute_features_seen(
             stage, step_idx, observed_prompt_token_count, context_paths_count
         ),
@@ -244,27 +255,36 @@ def emit_shadow_decision(
     step_idx: int | None,
     features_seen: dict[str, Any],
     actual_route_taken: str | None,
+    shadow_route_candidate: str | None = None,
+    policy_version: str | None = None,
 ) -> bool:
     """Emit one `shadow.decision` event pairing the shadow router's
     candidate against the actual route taken.
 
-    `agreement` is `shadow_route_candidate == actual_route_taken`. In
-    Phase 0 the candidate is always Opus and the actual Planner route is
-    always Opus, so agreement is always True — the recorder proves the
-    mechanism end-to-end. Never raises (delegates to `emit`).
+    `agreement` is `shadow_route_candidate == actual_route_taken`. Phase 0
+    callers pass neither override: the candidate comes from the Phase 0
+    placeholder rule and `policy_version` defaults to the Phase 0 stamp.
+
+    v3 Phase 1a Step 3: the Planner wrapper passes `shadow_route_candidate`
+    (the RoutingPolicy's candidate) and `policy_version` (the policy's
+    version), and supplies the merged decision_basis as `features_seen`. The
+    ingest reads `policy_version` into the shadow_decisions row (criterion 4);
+    Phase 0 events without it fall to the column DEFAULT.
     """
-    candidate = _compute_shadow_decision(features_seen)
-    return emit(
-        "shadow.decision",
-        {
-            "stage": stage,
-            "shadow_route_candidate": candidate,
-            "shadow_decision_basis": features_seen,
-            "actual_route_taken": actual_route_taken,
-            "agreement": candidate == actual_route_taken,
-        },
-        step_idx=step_idx,
+    candidate = (
+        shadow_route_candidate if shadow_route_candidate is not None
+        else _compute_shadow_decision(features_seen)
     )
+    data: dict[str, Any] = {
+        "stage": stage,
+        "shadow_route_candidate": candidate,
+        "shadow_decision_basis": features_seen,
+        "actual_route_taken": actual_route_taken,
+        "agreement": candidate == actual_route_taken,
+    }
+    if policy_version is not None:
+        data["policy_version"] = policy_version
+    return emit("shadow.decision", data, step_idx=step_idx)
 
 
 # ---------------------------------------------------------------------------

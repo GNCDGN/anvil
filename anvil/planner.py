@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from anvil import events as _events
 from anvil.brief import Step
+from anvil.policy import PHASE_1A_PLACEHOLDER, RoutingPolicy
 from anvil.voice import load_voice_spec
 
 log = logging.getLogger("anvil.planner")
@@ -143,6 +144,12 @@ class Planner:
         # at plan time.
         self._vault_index_cache: dict[str, dict] = {}
         self._last_cache_creation_monotonic: dict[str, float] = {}
+        # v3 Phase 1a Step 3 (V3P1A-3): per-instance routing policy engine.
+        # Per-instance (not module-global) for the same test-isolation reason
+        # as the V3P0-6 cache state — a fresh Planner per build/test starts
+        # clean. Phase 1a's PHASE_1A_PLACEHOLDER returns Opus unconditionally;
+        # MockedPlanner inherits this (no __init__ override).
+        self._policy = RoutingPolicy(PHASE_1A_PLACEHOLDER)
 
     def _model_for_stage(self, stage: str) -> str:
         """v3 Phase 1a Step 1: resolve the model for a Planner stage.
@@ -319,6 +326,42 @@ class Planner:
             seconds_since_cache_creation=seconds_since,
         )
 
+    def _policy_routing(self, stage: str, observed_prompt_token_count):
+        """v3 Phase 1a Step 3 (V3P1A-3): consult the routing policy and build
+        the routing-observability dict for an api_end emit.
+
+        `features` = Phase 0's `features_seen` merged with the stashed lint
+        `structured_features` (lint wins on key collision — the lint is the
+        authoritative source for brief-shape features, e.g. context_paths_count).
+        `route_actual` sources from the policy decision; the API call kwarg and
+        the `model` data field stay on `_model_for_stage(stage)` (Step3-F1:
+        "model" = what ran, "route_actual" = what the router decided). Returns
+        `(routing_dict, decision)` — the caller emits `**routing_dict` on the
+        api_end and feeds `decision` into the paired shadow.decision.
+        """
+        step_idx = getattr(self, "_current_step_idx", None)
+        context_paths_count = getattr(self, "_current_context_paths_count", None)
+        features_seen = _events._compute_features_seen(
+            stage, step_idx, observed_prompt_token_count, context_paths_count
+        )
+        lint_res = getattr(self, "_current_lint_result", None)
+        lint_features = getattr(lint_res, "structured_features", None) or {}
+        merged = {**features_seen, **lint_features}  # lint wins on collision
+        decision = self._policy.decide_route(
+            stage, merged, fallback_model=self._model_for_stage(stage)
+        )
+        routing = _events.routing_observability(
+            stage=stage,
+            step_idx=step_idx,
+            observed_prompt_token_count=observed_prompt_token_count,
+            context_paths_count=context_paths_count,
+            route_actual=decision.route_actual,
+            route_candidate=decision.route_candidate,
+            route_fallback_fired=decision.route_fallback_fired,
+            policy_version=self._policy.policy_version,
+        )
+        return routing, decision
+
     # -----------------------------------------------------------------------
     # Phase 1 Step 5 — Anthropic call wrapper + Stage B retry loop
     #
@@ -397,15 +440,7 @@ class Planner:
             # + route_actual. v3 Phase 1a Step 1: route_actual now sources from
             # the per-stage attribute (_model_for_stage(stage)), matching the
             # model actually passed to client.messages.stream above.
-            routing = _events.routing_observability(
-                stage=stage,
-                step_idx=getattr(self, "_current_step_idx", None),
-                observed_prompt_token_count=u.input_tokens,
-                context_paths_count=getattr(
-                    self, "_current_context_paths_count", None
-                ),
-                route_actual=self._model_for_stage(stage),
-            )
+            routing, decision = self._policy_routing(stage, u.input_tokens)
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
                 {
@@ -433,8 +468,10 @@ class Planner:
             _events.emit_shadow_decision(
                 stage=stage,
                 step_idx=getattr(self, "_current_step_idx", None),
-                features_seen=routing["features_seen"],
-                actual_route_taken=routing["route_actual"],
+                features_seen=decision.decision_basis,
+                actual_route_taken=decision.route_actual,
+                shadow_route_candidate=decision.route_candidate,
+                policy_version=self._policy.policy_version,
             )
             return text
 
@@ -464,15 +501,7 @@ class Planner:
                     # v3 Phase 0 Step 1 (V3P0-1): error-path api_end still
                     # carries the five fields; observed_prompt_token_count
                     # is None (the call failed, no usage was returned).
-                    routing = _events.routing_observability(
-                        stage=stage,
-                        step_idx=getattr(self, "_current_step_idx", None),
-                        observed_prompt_token_count=None,
-                        context_paths_count=getattr(
-                            self, "_current_context_paths_count", None
-                        ),
-                        route_actual=self._model_for_stage(stage),
-                    )
+                    routing, decision = self._policy_routing(stage, None)
                     _events.emit(
                         f"planner.stage_{stage.lower()}.api_end",
                         {
@@ -493,8 +522,10 @@ class Planner:
                     _events.emit_shadow_decision(
                         stage=stage,
                         step_idx=getattr(self, "_current_step_idx", None),
-                        features_seen=routing["features_seen"],
-                        actual_route_taken=routing["route_actual"],
+                        features_seen=decision.decision_basis,
+                        actual_route_taken=decision.route_actual,
+                        shadow_route_candidate=decision.route_candidate,
+                        policy_version=self._policy.policy_version,
                     )
                     return ""
         except Exception as e:  # noqa: BLE001 — never-raise contract
@@ -504,15 +535,7 @@ class Planner:
             )
             # v3 Phase 0 Step 1 (V3P0-1): error-path api_end carries the
             # five fields; no usage on this path.
-            routing = _events.routing_observability(
-                stage=stage,
-                step_idx=getattr(self, "_current_step_idx", None),
-                observed_prompt_token_count=None,
-                context_paths_count=getattr(
-                    self, "_current_context_paths_count", None
-                ),
-                route_actual=self._model_for_stage(stage),
-            )
+            routing, decision = self._policy_routing(stage, None)
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
                 {
@@ -531,8 +554,10 @@ class Planner:
             _events.emit_shadow_decision(
                 stage=stage,
                 step_idx=getattr(self, "_current_step_idx", None),
-                features_seen=routing["features_seen"],
-                actual_route_taken=routing["route_actual"],
+                features_seen=decision.decision_basis,
+                actual_route_taken=decision.route_actual,
+                shadow_route_candidate=decision.route_candidate,
+                policy_version=self._policy.policy_version,
             )
             return ""
 
