@@ -471,5 +471,55 @@ class TestDeterminism(unittest.TestCase):
             )
 
 
+class TestMockedPerStageModel(_MockedTestBase):
+    """v3 Phase 1a Step 1: MockedPlanner inherits the per-stage attribute
+    shape (no __init__ override) and its overridden _call_anthropic reads
+    the per-stage model — so a Stage-C override does not leak into Stage A
+    or B across a full mock sweep (V3P0-3 parallel-wire)."""
+
+    def test_mocked_inherits_per_stage_attrs_without_init_override(self) -> None:
+        # MockedPlanner defines no __init__ of its own — it inherits
+        # Planner's, so the per-stage attrs resolve identically (criterion 5).
+        self.assertNotIn("__init__", MockedPlanner.__dict__)
+        p = MockedPlanner(
+            model="claude-opus-4-7", stage_c_model="claude-sonnet-4-6",
+        )
+        self.assertEqual(p.stage_a_model, "claude-opus-4-7")
+        self.assertEqual(p.stage_b_model, "claude-opus-4-7")
+        self.assertEqual(p.stage_c_model, "claude-sonnet-4-6")
+        self.assertEqual(p._model_for_stage("C"), "claude-sonnet-4-6")
+
+    def test_per_stage_no_leak_end_to_end_mock_sweep(self) -> None:
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        brief, state = _brief_and_state("T1")
+        p = MockedPlanner(
+            model="claude-opus-4-7", stage_c_model="claude-sonnet-4-6",
+        )
+        # Stage A + B via the inherited plan_step (T1-step0 fixtures).
+        p.plan_step(brief, state, 0)
+        # Stage C via draft_completion_artefacts: with no T1-stepC fixture
+        # the mock returns "" but STILL emits planner.stage_c.api_end
+        # carrying route_actual — the same code path real-mode hits.
+        p.draft_completion_artefacts(brief, state)
+
+        evs = self._events()
+
+        def ends(kind):
+            return [e for e in evs if e["kind"] == kind]
+
+        a = ends("planner.stage_a.api_end")
+        b = ends("planner.stage_b.api_end")
+        c = ends("planner.stage_c.api_end")
+        self.assertTrue(a, "expected a Stage A api_end")
+        self.assertTrue(b, "expected a Stage B api_end")
+        self.assertTrue(c, "expected a Stage C api_end")
+        for e in a + b:
+            self.assertEqual(e["data"]["route_actual"], "claude-opus-4-7")
+            self.assertEqual(e["data"]["model"], "claude-opus-4-7")
+        for e in c:
+            self.assertEqual(e["data"]["route_actual"], "claude-sonnet-4-6")
+            self.assertEqual(e["data"]["model"], "claude-sonnet-4-6")
+
+
 if __name__ == "__main__":
     unittest.main()

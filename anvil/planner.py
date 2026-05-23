@@ -40,6 +40,14 @@ log = logging.getLogger("anvil.planner")
 # Stage B uses self.timeout (the configured planner_timeout).
 _STAGE_A_TIMEOUT = 30
 
+# v3 Phase 1a Step 1: canonical default model for unrouted Planner
+# construction. A bare Planner() — or one given neither `model=` nor any
+# per-stage kwarg — routes all three stages here. Deliberately NOT aliased
+# to events.SHADOW_ROUTE_PHASE_0 (also "claude-opus-4-7" today): the
+# planner's construction default and the placeholder shadow route are
+# distinct concepts that will diverge once Phase 1b lands real routing.
+DEFAULT_PLANNER_MODEL = "claude-opus-4-7"
+
 
 class ScopeBoundaries(BaseModel):
     in_scope: str
@@ -73,9 +81,23 @@ class Planner:
         model: str | None = None,
         timeout: int | None = None,
         vault_root=None,
+        *,
+        stage_a_model: str | None = None,
+        stage_b_model: str | None = None,
+        stage_c_model: str | None = None,
     ) -> None:
         self.api_key = api_key
-        self.model = model
+        # v3 Phase 1a Step 1: per-stage model plumbing replaces the single
+        # self.model. Three-tier resolution per stage: an explicit per-stage
+        # kwarg wins; else the single `model=` kwarg (the back-compat base
+        # that sets all three at once); else DEFAULT_PLANNER_MODEL. Every
+        # former self.model read site now dispatches through
+        # _model_for_stage(stage), so the wrong model can never leak into
+        # an adjacent stage.
+        base = model if model is not None else DEFAULT_PLANNER_MODEL
+        self.stage_a_model = stage_a_model if stage_a_model is not None else base
+        self.stage_b_model = stage_b_model if stage_b_model is not None else base
+        self.stage_c_model = stage_c_model if stage_c_model is not None else base
         self.timeout = timeout
         self.vault_root = Path(vault_root) if vault_root else Path(".")
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else None
@@ -121,6 +143,24 @@ class Planner:
         # at plan time.
         self._vault_index_cache: dict[str, dict] = {}
         self._last_cache_creation_monotonic: dict[str, float] = {}
+
+    def _model_for_stage(self, stage: str) -> str:
+        """v3 Phase 1a Step 1: resolve the model for a Planner stage.
+
+        Explicit dict dispatch (not getattr-by-convention): an unknown
+        stage raises a loud KeyError naming the offending value rather
+        than silently masking a typo. Single source of truth for every
+        model read site — plan_step / _run_stage_b_with_retry api_start
+        emits, the _call_anthropic API call + emits, and Stage C via
+        draft_completion_artefacts — and inherited unchanged by
+        MockedPlanner (its overridden _call_anthropic reads it too;
+        V3P0-3 parallel-wire).
+        """
+        return {
+            "A": self.stage_a_model,
+            "B": self.stage_b_model,
+            "C": self.stage_c_model,
+        }[stage]
 
     def plan_step(self, brief, state, step_idx: int):
         """Stage A -> Stage B (with retry). Returns a validated Plan, or an
@@ -182,7 +222,7 @@ class Planner:
             {
                 "step_idx": step_idx,
                 "prompt_chars": len(stage_a_prompt),
-                "model": self.model,
+                "model": self._model_for_stage("A"),
                 "stage": "A",
             },
             step_idx=step_idx,
@@ -324,7 +364,7 @@ class Planner:
                 else system
             )
             with client.messages.stream(
-                model=self.model,
+                model=self._model_for_stage(stage),
                 max_tokens=8192,
                 system=system_param,
                 messages=[{"role": "user", "content": user}],
@@ -337,7 +377,7 @@ class Planner:
             )
             u = final.usage
             log.info(
-                f"[planner] step={step} stage={stage} model={self.model} "
+                f"[planner] step={step} stage={stage} model={self._model_for_stage(stage)} "
                 f"input_tokens={u.input_tokens} "
                 f"output_tokens={u.output_tokens} "
                 f"cache_creation_input_tokens="
@@ -352,9 +392,11 @@ class Planner:
             # here; the [planner] log line above stays unchanged for
             # backward-compat with tools/exam_harness.py.
             # v3 Phase 0 Step 1 (V3P0-1): routing observability. Passive —
-            # route_actual is self.model (Opus); observed prompt size is the
-            # API's reported input_tokens. Built once so the paired Step 2
-            # shadow.decision can reuse features_seen + route_actual.
+            # observed prompt size is the API's reported input_tokens. Built
+            # once so the paired Step 2 shadow.decision can reuse features_seen
+            # + route_actual. v3 Phase 1a Step 1: route_actual now sources from
+            # the per-stage attribute (_model_for_stage(stage)), matching the
+            # model actually passed to client.messages.stream above.
             routing = _events.routing_observability(
                 stage=stage,
                 step_idx=getattr(self, "_current_step_idx", None),
@@ -362,13 +404,13 @@ class Planner:
                 context_paths_count=getattr(
                     self, "_current_context_paths_count", None
                 ),
-                route_actual=self.model,
+                route_actual=self._model_for_stage(stage),
             )
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
                 {
                     "step_idx": getattr(self, "_current_step_idx", None),
-                    "model": self.model,
+                    "model": self._model_for_stage(stage),
                     "input_tokens": u.input_tokens,
                     "output_tokens": u.output_tokens,
                     "cache_creation_input_tokens":
@@ -429,13 +471,13 @@ class Planner:
                         context_paths_count=getattr(
                             self, "_current_context_paths_count", None
                         ),
-                        route_actual=self.model,
+                        route_actual=self._model_for_stage(stage),
                     )
                     _events.emit(
                         f"planner.stage_{stage.lower()}.api_end",
                         {
                             "step_idx": getattr(self, "_current_step_idx", None),
-                            "model": self.model,
+                            "model": self._model_for_stage(stage),
                             "ok": False,
                             "error": "rate-limit/timeout",
                             **routing,
@@ -469,13 +511,13 @@ class Planner:
                 context_paths_count=getattr(
                     self, "_current_context_paths_count", None
                 ),
-                route_actual=self.model,
+                route_actual=self._model_for_stage(stage),
             )
             _events.emit(
                 f"planner.stage_{stage.lower()}.api_end",
                 {
                     "step_idx": getattr(self, "_current_step_idx", None),
-                    "model": self.model,
+                    "model": self._model_for_stage(stage),
                     "ok": False,
                     "error": str(e)[:300],
                     **routing,
@@ -548,7 +590,7 @@ class Planner:
             {
                 "step_idx": step_idx,
                 "prompt_chars": len(user_prompt),
-                "model": self.model,
+                "model": self._model_for_stage("B"),
                 "stage": "B",
                 "retry_attempt": 0,
             },
@@ -622,7 +664,7 @@ class Planner:
                 {
                     "step_idx": step_idx,
                     "prompt_chars": len(retry_prompt),
-                    "model": self.model,
+                    "model": self._model_for_stage("B"),
                     "stage": "B",
                     "retry_attempt": 1,
                 },

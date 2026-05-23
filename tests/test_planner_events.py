@@ -24,7 +24,7 @@ from unittest import mock
 from anvil import events
 from anvil import planner as planner_mod
 from anvil.brief import Brief, Step
-from anvil.planner import Planner
+from anvil.planner import Planner, DEFAULT_PLANNER_MODEL
 from anvil.state import init_state
 
 
@@ -113,7 +113,7 @@ def _fake_call_with_usage(response_text: str, *, input_tokens: int = 1000,
             f"planner.stage_{stage.lower()}.api_end",
             {
                 "step_idx": getattr(self, "_current_step_idx", None),
-                "model": self.model,
+                "model": self._model_for_stage(stage),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cache_creation_input_tokens": 0,
@@ -143,7 +143,7 @@ def _make_fake(responses_by_stage, *, input_tokens=1000, output_tokens=100):
             f"planner.stage_{stage.lower()}.api_end",
             {
                 "step_idx": getattr(self, "_current_step_idx", None),
-                "model": self.model,
+                "model": self._model_for_stage(stage),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cache_creation_input_tokens": 0,
@@ -218,7 +218,7 @@ class TestPlanStepRetryAndFailure(_PlannerEventsBase):
                 f"planner.stage_{stage.lower()}.api_end",
                 {
                     "step_idx": getattr(self, "_current_step_idx", None),
-                    "model": self.model,
+                    "model": self._model_for_stage(stage),
                     "input_tokens": 100,
                     "output_tokens": 10,
                     "cache_creation_input_tokens": 0,
@@ -302,7 +302,7 @@ class TestPlanStepRetryAndFailure(_PlannerEventsBase):
                 f"planner.stage_{stage.lower()}.api_end",
                 {
                     "step_idx": getattr(self, "_current_step_idx", None),
-                    "model": self.model,
+                    "model": self._model_for_stage(stage),
                     "ok": False,
                     "error": "simulated failure",
                 },
@@ -340,7 +340,7 @@ class TestStageCArtefacts(_PlannerEventsBase):
                 f"planner.stage_{stage.lower()}.api_end",
                 {
                     "step_idx": getattr(self, "_current_step_idx", None),
-                    "model": self.model,
+                    "model": self._model_for_stage(stage),
                     "input_tokens": 5000,
                     "output_tokens": 500,
                     "cache_creation_input_tokens": 0,
@@ -574,7 +574,7 @@ class TestShadowDecisionPairing(_PlannerEventsBase):
                     stage, getattr(self, "_current_step_idx", None), 100,
                     getattr(self, "_current_context_paths_count", None),
                 ),
-                actual_route_taken=self.model,
+                actual_route_taken=self._model_for_stage(stage),
             )
             return text
 
@@ -697,6 +697,100 @@ class TestCacheFamilyDiagnostics(_PlannerEventsBase):
         self.assertIs(p._cache_diag_fields("A", 0)["vault_index_hit"], True)
         self.assertIsNone(p._cache_diag_fields("B", 0)["vault_index_hit"])
         self.assertIsNone(p._cache_diag_fields("C", 0)["vault_index_hit"])
+
+
+class TestPerStageModelPlumbing(_PlannerEventsBase):
+    """v3 Phase 1a Step 1: per-stage model plumbing — constructor
+    resolution, the _model_for_stage dispatch helper, and the Stage-C-
+    routed-differently no-leak guarantee on BOTH the emitted route_actual
+    AND the model handed to client.messages.stream."""
+
+    def test_single_model_sets_all_three_stages(self) -> None:
+        p = Planner(model="claude-opus-4-7")
+        self.assertEqual(p.stage_a_model, "claude-opus-4-7")
+        self.assertEqual(p.stage_b_model, "claude-opus-4-7")
+        self.assertEqual(p.stage_c_model, "claude-opus-4-7")
+
+    def test_per_stage_kwargs_override_each_stage(self) -> None:
+        p = Planner(
+            model="base-model",
+            stage_a_model="model-a",
+            stage_b_model="model-b",
+            stage_c_model="model-c",
+        )
+        self.assertEqual(p.stage_a_model, "model-a")
+        self.assertEqual(p.stage_b_model, "model-b")
+        self.assertEqual(p.stage_c_model, "model-c")
+
+    def test_partial_per_stage_defaults_unset_stages(self) -> None:
+        # No model= given; only Stage C overridden → A/B fall back to
+        # DEFAULT_PLANNER_MODEL, C takes the override (the rehearsal shape).
+        p = Planner(stage_c_model="claude-sonnet-4-6")
+        self.assertEqual(p.stage_a_model, DEFAULT_PLANNER_MODEL)
+        self.assertEqual(p.stage_b_model, DEFAULT_PLANNER_MODEL)
+        self.assertEqual(p.stage_c_model, "claude-sonnet-4-6")
+
+    def test_all_stages_default_to_default_planner_model(self) -> None:
+        p = Planner()
+        self.assertEqual(p.stage_a_model, DEFAULT_PLANNER_MODEL)
+        self.assertEqual(p.stage_b_model, DEFAULT_PLANNER_MODEL)
+        self.assertEqual(p.stage_c_model, DEFAULT_PLANNER_MODEL)
+        self.assertEqual(DEFAULT_PLANNER_MODEL, "claude-opus-4-7")
+
+    def test_model_for_stage_dispatches_per_stage(self) -> None:
+        p = Planner(
+            model="base-model",
+            stage_a_model="model-a",
+            stage_b_model="model-b",
+            stage_c_model="model-c",
+        )
+        self.assertEqual(p._model_for_stage("A"), "model-a")
+        self.assertEqual(p._model_for_stage("B"), "model-b")
+        self.assertEqual(p._model_for_stage("C"), "model-c")
+
+    def test_model_for_stage_bad_stage_raises_keyerror(self) -> None:
+        p = Planner(model="claude-opus-4-7")
+        with self.assertRaises(KeyError):
+            p._model_for_stage("Z")
+
+    def test_stage_c_routes_without_leaking_into_a_or_b(self) -> None:
+        # Criterion 4 (dual assertion): with Stage C routed to a different
+        # model, the Stage C call must (a) emit route_actual/model = sonnet
+        # AND (b) pass model="…sonnet" to client.messages.stream; Stage A
+        # and Stage B must stay opus on both axes. The dual axis catches
+        # the A1 false-pass risk (route_actual aligned but the API call not).
+        client, capture = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0, cache_read=2603,
+        )
+        p = Planner(model="claude-opus-4-7", stage_c_model="claude-sonnet-4-6")
+        p._client = client
+        p._current_step_idx = None
+        p._current_context_paths_count = 0
+
+        # Stage C → sonnet on both axes.
+        p._call_anthropic(system="SYS", user="u", timeout=120, step=0, stage="C")
+        self.assertEqual(capture["model"], "claude-sonnet-4-6")
+        end_c = next(e for e in self._events_for()
+                     if e["kind"] == "planner.stage_c.api_end")
+        self.assertEqual(end_c["data"]["route_actual"], "claude-sonnet-4-6")
+        self.assertEqual(end_c["data"]["model"], "claude-sonnet-4-6")
+
+        # Stage A → opus, no leak from the Stage C override.
+        p._current_step_idx = 0
+        p._call_anthropic(system="SYS", user="u", timeout=30, step=1, stage="A")
+        self.assertEqual(capture["model"], "claude-opus-4-7")
+        end_a = next(e for e in self._events_for()
+                     if e["kind"] == "planner.stage_a.api_end")
+        self.assertEqual(end_a["data"]["route_actual"], "claude-opus-4-7")
+        self.assertEqual(end_a["data"]["model"], "claude-opus-4-7")
+
+        # Stage B → opus, no leak.
+        p._call_anthropic(system="SYS", user="u", timeout=30, step=1, stage="B")
+        self.assertEqual(capture["model"], "claude-opus-4-7")
+        end_b = next(e for e in self._events_for()
+                     if e["kind"] == "planner.stage_b.api_end")
+        self.assertEqual(end_b["data"]["route_actual"], "claude-opus-4-7")
+        self.assertEqual(end_b["data"]["model"], "claude-opus-4-7")
 
 
 if __name__ == "__main__":

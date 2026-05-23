@@ -145,17 +145,20 @@ class MockedPlanner(Planner):
 
         # Synthesised api_end. Same shape as the production wrapper's
         # emit at planner.py:_call_anthropic. Critically, data.model is
-        # `self.model` (notes.md Step 4 outcome finding 2 — operations
-        # view filters on model).
+        # the per-stage model via the inherited _model_for_stage(stage)
+        # (notes.md Step 4 outcome finding 2 — operations view filters on
+        # model; v3 Phase 1a Step 1 made the read per-stage).
         stage_key = stage.lower()
         observed_input_tokens = int(usage.get("input_tokens", 0))
         cache_creation = int(usage.get("cache_creation_input_tokens", 0))
         # v3 Phase 0 Step 1 (V3P0-1): routing observability, same shape as
-        # the production wrapper. route_actual is self.model (the inherited
-        # plan_step / Stage-C path stashes _current_context_paths_count
-        # before this override runs, since MockedPlanner overrides only
-        # _call_anthropic). Built once so the paired Step 2 shadow.decision
-        # reuses features_seen + route_actual.
+        # the production wrapper. route_actual is the per-stage model via
+        # the inherited _model_for_stage(stage) (the inherited plan_step /
+        # Stage-C path stashes _current_context_paths_count before this
+        # override runs, since MockedPlanner overrides only _call_anthropic).
+        # Built once so the paired Step 2 shadow.decision reuses
+        # features_seen + route_actual. v3 Phase 1a Step 1 (V3P0-3
+        # parallel-wire): the per-stage read here mirrors planner.py.
         routing = _events.routing_observability(
             stage=stage,
             step_idx=step_idx,
@@ -163,13 +166,13 @@ class MockedPlanner(Planner):
             context_paths_count=getattr(
                 self, "_current_context_paths_count", None
             ),
-            route_actual=self.model,
+            route_actual=self._model_for_stage(stage),
         )
         _events.emit(
             f"planner.stage_{stage_key}.api_end",
             {
                 "step_idx": step_idx,
-                "model": self.model,
+                "model": self._model_for_stage(stage),
                 "input_tokens": observed_input_tokens,
                 "output_tokens": int(usage.get("output_tokens", 0)),
                 "cache_creation_input_tokens": cache_creation,

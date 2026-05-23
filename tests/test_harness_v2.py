@@ -1077,5 +1077,59 @@ class TestCacheDiagnosticsView(_HarnessTestBase):
         self.assertEqual([r[0] for r in rows], ["A", "B"])
 
 
+class TestPerStageRouteActual(_HarnessTestBase):
+    """v3 Phase 1a Step 1: the operations view surfaces route_actual
+    distinctly per stage now that a Planner can route Stage C to a
+    different model than Stage A/B. The harness is pure projection (no
+    functional change this step); this guards that the per-stage
+    attribution reaches the operations.route_actual column intact."""
+
+    def _routing(self, route):
+        return {
+            "route_candidate": route,
+            "route_actual": route,
+            "route_fallback_fired": False,
+            "policy_version": "v3-phase-0-passive",
+        }
+
+    def _api_end(self, kind, route, *, stage, step_idx):
+        data = {
+            "model": route, "input_tokens": 1000, "output_tokens": 50,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "duration_ms": 1500, "ok": True,
+            "features_seen": {"stage": stage},
+        }
+        data.update(self._routing(route))
+        return _event_row(10, kind, data, run_id="T9-perstage", step_idx=step_idx)
+
+    def test_operations_route_actual_differs_per_stage(self) -> None:
+        run_dir = self.tmp_path / "T9-perstage"
+        run_dir.mkdir()
+        rows = [
+            _event_row(0, "run.start", {}, run_id="T9-perstage"),
+            self._api_end("planner.stage_a.api_end", "claude-opus-4-7",
+                          stage="A", step_idx=0),
+            self._api_end("planner.stage_b.api_end", "claude-opus-4-7",
+                          stage="B", step_idx=0),
+            self._api_end("planner.stage_c.api_end", "claude-sonnet-4-6",
+                          stage="C", step_idx=None),
+            _event_row(20, "run.end", {"drops": 0}, run_id="T9-perstage"),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in rows) + "\n", encoding="utf-8",
+        )
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+        result = self.con.execute(
+            "SELECT operation_kind, route_actual FROM operations "
+            "WHERE run_id = 'T9-perstage' ORDER BY operation_kind"
+        ).fetchall()
+        by_kind = {k: ra for k, ra in result}
+        self.assertEqual(by_kind["planner.stage_a.api_end"], "claude-opus-4-7")
+        self.assertEqual(by_kind["planner.stage_b.api_end"], "claude-opus-4-7")
+        self.assertEqual(by_kind["planner.stage_c.api_end"], "claude-sonnet-4-6")
+
+
 if __name__ == "__main__":
     unittest.main()
