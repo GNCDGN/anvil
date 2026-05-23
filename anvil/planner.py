@@ -471,7 +471,10 @@ class Planner:
                 model=api_model,
                 max_tokens=8192,
                 system=system_param,
-                messages=[{"role": "user", "content": user}],
+                messages=[{
+                    "role": "user",
+                    "content": _split_user_for_brief_cache(user),
+                }],
             ) as stream:
                 final = stream.get_final_message()
             duration = time.monotonic() - t0
@@ -670,7 +673,10 @@ class Planner:
                 model=baseline_model,
                 max_tokens=8192,
                 system=system_param,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{
+                    "role": "user",
+                    "content": _split_user_for_brief_cache(prompt),
+                }],
             ) as stream:
                 final = stream.get_final_message()
             duration_ms = int((time.monotonic() - t0) * 1000)
@@ -1171,6 +1177,50 @@ def _read_brief_md(state) -> str:
         return Path(state.brief_path).read_text(encoding="utf-8")
     except OSError:
         return ""
+
+
+# v3 Phase 1c Step 2 (V3P1C-2): narrowed planner-side caching. The brief
+# block sits at the prefix of both the Stage A and Stage B user prompts
+# (`## Build brief\n\n<brief>\n…\n</brief>\n…`) and is byte-stable across every
+# step of a build, so `[system + brief]` is a stable cacheable prefix.
+# Anthropic's 1024-token cache minimum is on the CUMULATIVE prefix — the
+# 3479-token system prompt alone clears it (Step2C-F1) — so the brief caches
+# even though the block itself is < 1024 tokens. Splitting the user content
+# adds a second cache_control breakpoint after the brief (2 total, under the
+# 4-breakpoint limit); cache_read then fires on every subsequent same-model
+# call within the 5-min TTL (Stage B reads what Stage A created; multi-step
+# tasks read across steps).
+_BRIEF_CLOSE_TAG = "</brief>"
+
+
+def _split_user_for_brief_cache(user_text: str) -> "list[dict] | str":
+    """Split an assembled user prompt into a 2-block content list with
+    cache_control:ephemeral on the brief-prefix block, for Anthropic prompt
+    caching of the (stable, prefix-positioned) brief.
+
+    block1 = everything through the brief's closing `</brief>` tag (cached);
+    block2 = the remainder. `block1["text"] + block2["text"]` is byte-identical
+    to `user_text` — the model sees the same prompt; only the request structure
+    changes (cache_control is request metadata, not content), so the prompt
+    TEXT stays byte-identical (criterion 5).
+
+    No-op contract: returns `user_text` UNCHANGED (a bare string) when the
+    `</brief>` marker is absent (the Stage C artefacts prompt, or an empty
+    prompt) so those calls pass through uncached. Assumes the brief markdown
+    contains no literal `</brief>` tag — true for ANVIL briefs, where
+    `<brief>…</brief>` is the template's own wrapper, so the FIRST `</brief>`
+    is unambiguously the brief block's close."""
+    idx = user_text.find(_BRIEF_CLOSE_TAG)
+    if idx == -1:
+        return user_text
+    split = idx + len(_BRIEF_CLOSE_TAG)
+    prefix, rest = user_text[:split], user_text[split:]
+    if not prefix or not rest:
+        return user_text
+    return [
+        {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": rest},
+    ]
 
 
 def _assemble_stage_a_prompt(

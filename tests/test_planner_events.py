@@ -1149,5 +1149,128 @@ class TestCriterion3SumCheckReframe(unittest.TestCase):
             sum(1 for e in opus_only if e <= 5.0) / len(opus_only), 0.85)
 
 
+# v3 Phase 1c Step 2 — narrowed planner-side caching of the brief block.
+_BRIEF_USER_PROMPT = (
+    "## Build brief\n\n<brief>\nDo the thing carefully.\n</brief>\n\n"
+    "## Current state\n\n<state>\n{}\n</state>\n\n"
+    "## Step being planned\nStep 0: do-thing\n"
+)
+
+
+class TestBriefBlockCaching(_PlannerEventsBase):
+    """v3 Phase 1c Step 2 (V3P1C-2): cache_control on the brief block (stable,
+    prefix-positioned). The split is real-path-only — MockedPlanner overrides
+    _call_anthropic and makes no API call (Step2C-F2)."""
+
+    def test_split_helper_two_blocks_with_cache_control(self) -> None:
+        # Q10.1: split helper → 2 blocks, cache_control on the brief-prefix.
+        blocks = planner_mod._split_user_for_brief_cache(_BRIEF_USER_PROMPT)
+        self.assertIsInstance(blocks, list)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["type"], "text")
+        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+        self.assertTrue(blocks[0]["text"].endswith("</brief>"))
+        self.assertNotIn("cache_control", blocks[1])
+        # byte-identical reconstruction (criterion 5).
+        self.assertEqual(blocks[0]["text"] + blocks[1]["text"], _BRIEF_USER_PROMPT)
+
+    def test_split_helper_noops_without_brief_marker(self) -> None:
+        # Q10.2: no </brief> → return the string unchanged (Stage C / empty).
+        self.assertEqual(
+            planner_mod._split_user_for_brief_cache("no marker here"), "no marker here")
+        self.assertEqual(planner_mod._split_user_for_brief_cache(""), "")
+        # prompt ending exactly at </brief> (empty remainder) → no 2-block split.
+        self.assertEqual(
+            planner_mod._split_user_for_brief_cache("<brief>x</brief>"), "<brief>x</brief>")
+
+    def test_call_anthropic_stage_a_caches_brief(self) -> None:
+        # Q10.3: Stage A user content is the 2-block shape, byte-identical.
+        client, capture = _make_fake_client(
+            input_tokens=500, output_tokens=50, cache_creation=4180, cache_read=0)
+        self.planner._client = client
+        self.planner._call_anthropic(
+            system="SYS", user=_BRIEF_USER_PROMPT, timeout=30, step=0, stage="A")
+        content = capture["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(content[0]["text"] + content[1]["text"], _BRIEF_USER_PROMPT)
+
+    def test_call_anthropic_stage_b_caches_brief(self) -> None:
+        # Q10.4: same 2-block shape on Stage B via the shared wrapper.
+        client, capture = _make_fake_client(
+            input_tokens=500, output_tokens=50, cache_creation=4180, cache_read=0)
+        self.planner._client = client
+        self.planner._call_anthropic(
+            system="SYS", user=_BRIEF_USER_PROMPT, timeout=30, step=0, stage="B")
+        content = capture["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[0]["cache_control"], {"type": "ephemeral"})
+
+    def test_brief_cache_creation_recorded_first_call(self) -> None:
+        # Q10.5: cache_creation recorded, cache_read=0 on the first call.
+        client, _ = _make_fake_client(
+            input_tokens=500, output_tokens=50, cache_creation=4180, cache_read=0)
+        self.planner._client = client
+        self.planner._call_anthropic(
+            system="SYS", user=_BRIEF_USER_PROMPT, timeout=30, step=0, stage="A")
+        data = [e for e in self._events_for()
+                if e["kind"] == "planner.stage_a.api_end"][-1]["data"]
+        self.assertEqual(data["cache_creation_input_tokens"], 4180)
+        self.assertEqual(data["cache_read_input_tokens"], 0)
+
+    def test_brief_cache_read_recorded_second_call(self) -> None:
+        # Q10.6: cache_read > 0 recorded on the subsequent (hit) call.
+        c1, _ = _make_fake_client(
+            input_tokens=500, output_tokens=50, cache_creation=4180, cache_read=0)
+        self.planner._client = c1
+        self.planner._call_anthropic(
+            system="SYS", user=_BRIEF_USER_PROMPT, timeout=30, step=0, stage="A")
+        c2, _ = _make_fake_client(
+            input_tokens=21, output_tokens=50, cache_creation=0, cache_read=4180)
+        self.planner._client = c2
+        self.planner._call_anthropic(
+            system="SYS", user=_BRIEF_USER_PROMPT, timeout=30, step=1, stage="A")
+        data = [e for e in self._events_for()
+                if e["kind"] == "planner.stage_a.api_end"][-1]["data"]
+        self.assertEqual(data["cache_read_input_tokens"], 4180)
+        self.assertEqual(data["input_tokens"], 21)
+
+    def test_affine_invariant_holds_pre_caching(self) -> None:
+        # Q10.7: regression guard — Step 1 affine relation on pre-caching rows.
+        opus = [r for r in _STEP0_REAL_STAGE_EVENTS if r[1] == "opus"]
+        errs = [_abs_pct_err(*r) for r in opus]
+        self.assertGreaterEqual(sum(1 for e in errs if e <= 5.0), 15)
+
+    def test_affine_invariant_survives_brief_caching(self) -> None:
+        # Q10.8 (Q5): caching moves ~brief tokens from input_tokens to
+        # cache_read; the cache-invariant equiv (and the affine relation) is
+        # unchanged with the SAME constants (1.64, 407, 3479).
+        opus = [r for r in _STEP0_REAL_STAGE_EVENTS if r[1] == "opus"]
+        moved = 700  # ~brief tokens that move input_tokens → cache_read post-caching
+        for (stage, model, bsum, inp, cr, cc) in opus:
+            pre = _uncached_user_prompt_equiv(inp, cr, cc)
+            post = _uncached_user_prompt_equiv(inp - moved, cr + moved, cc)
+            self.assertEqual(pre, post)  # equiv invariant to the token movement
+            self.assertEqual(
+                _abs_pct_err(stage, model, bsum, inp, cr, cc),
+                _abs_pct_err(stage, model, bsum, inp - moved, cr + moved, cc))
+
+    def test_canary_baseline_caches_brief(self) -> None:
+        # Q10.10: the canary's parallel Opus baseline also emits the 2-block
+        # shape — so it cache-CREATES the Opus brief prefix that T1's Stage B
+        # Opus call reads (forgetting this silently breaks T1 caching).
+        client, capture = _make_fake_client(
+            input_tokens=500, output_tokens=50, cache_creation=4180, cache_read=0)
+        self.planner._client = client
+        self.planner._stage_a_canary_baseline(_BRIEF_USER_PROMPT, 0)
+        content = capture["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(content[0]["text"] + content[1]["text"], _BRIEF_USER_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()

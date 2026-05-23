@@ -1097,6 +1097,49 @@ class TestCacheDiagnosticsView(_HarnessTestBase):
         # equiv = input_tokens + cache_read + cache_creation - 3479 = 1500
         self.assertEqual(row[3], 1500)
 
+    def test_brief_cache_read_pattern_surfaces(self) -> None:
+        # v3 Phase 1c Step 2 (Q10.9): the brief cache pattern — cache_creation
+        # on step 0 (read=0), cache_read>0 on step 1 (the [system+brief] prefix
+        # hit) — surfaces per-step in cache_diagnostics.
+        run_id = "T11-briefcache"
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        blocks = {"brief": 700, "state": 200, "vault_files": 0, "prior_step": 0}
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 900,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 4180,
+                        "vault_index_hit": False,
+                        "candidate_user_block_sizes": blocks,
+                        "seconds_since_cache_creation": None, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "planner.stage_a.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 200,
+                        "cache_read_input_tokens": 4180,
+                        "cache_creation_input_tokens": 0,
+                        "vault_index_hit": True,
+                        "candidate_user_block_sizes": blocks,
+                        "seconds_since_cache_creation": 2.0, "ok": True},
+                       run_id=run_id, step_idx=1),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+        rows = self.con.execute(
+            "SELECT step_idx, cache_read_input_tokens, cache_creation_input_tokens, "
+            "       uncached_user_prompt_equiv "
+            "FROM cache_diagnostics WHERE run_id='T11-briefcache' AND stage='A' "
+            "ORDER BY step_idx"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0][1], rows[0][2]), (0, 4180))      # step 0: creation
+        self.assertEqual((rows[1][1], rows[1][2]), (4180, 0))      # step 1: read
+        self.assertEqual(rows[1][3], 200 + 4180 + 0 - 3479)        # equiv computes
+
     def test_columns_match_declared_tuple(self) -> None:
         self._ingest_cache_run()
         row = self.con.execute(
