@@ -33,6 +33,13 @@ log = logging.getLogger("anvil.policy")
 # so the two generations aggregate as separate rows.
 PHASE_1A_PLACEHOLDER = "v3-phase-1a-placeholder"
 
+# v3 Phase 1b Step 2: the first active routing rule's policy_version. Under this
+# version, decide_route consults the wired calibration for Stage A and lets
+# route_candidate diverge to the cheap model — but route_actual stays the
+# per-stage model (the API call is unchanged; shadow-only). The canary
+# (Step 3) adds a third version that also changes route_actual + the API call.
+PHASE_1B_STAGE_A_SHADOW = "v3-phase-1b-stage-a-shadow"
+
 # The route the placeholder returns unconditionally. Deliberately a SEPARATE
 # constant from planner.DEFAULT_PLANNER_MODEL and events.SHADOW_ROUTE_PHASE_0
 # (all "claude-opus-4-7" today): the policy's placeholder route, the planner's
@@ -81,40 +88,35 @@ class RoutingPolicy:
     def decide_route(
         self, stage: str, features, *, fallback_model: str | None = None
     ) -> RouteDecision:
-        """Return a RouteDecision for `stage` given `features` (the merged
-        lint + features_seen dict). Phase 1a: unconditionally the placeholder
-        model, with route_actual == route_candidate (no fallback fired).
+        """Return a RouteDecision for `stage` given `features` (merged lint +
+        features_seen). Dispatches by `policy_version`:
 
-        v3 Phase 1b Step 1: when a calibration is wired AND stage == "A", the
-        calibration is CONSULTED — its recommendation is recorded under
-        `decision_basis["calibration_rationale"]` — but the returned models are
-        still the placeholder (consult-not-act). Step 2 makes `route_candidate`
-        source from the recommendation.
+        - PHASE_1A_PLACEHOLDER: route_candidate == route_actual ==
+          PHASE_1A_PLACEHOLDER_MODEL. A wired calibration is consulted on
+          Stage A (recommendation recorded under
+          `decision_basis["calibration_rationale"]`) but never acted on —
+          consult-not-act.
+        - PHASE_1B_STAGE_A_SHADOW (v3 Phase 1b Step 2): route_actual stays the
+          per-stage model (`fallback_model` — what the API runs); only
+          route_candidate may diverge. For empty-context Stage A with a
+          high-confidence cheap recommendation, route_candidate becomes the
+          cheap model (the shadow divergence; Step3-F1 inversion preserved —
+          the API call is unchanged). A1.
 
-        Never raises. On any internal failure returns a degraded decision with
+        Never raises. On internal failure → degraded decision with
         route_fallback_fired=True and route_actual=fallback_model (the wrapper's
-        per-stage attr) so route_actual stays honest about what the API runs on
-        the fallback path; the brief's 2-arg call (no fallback_model) degrades to
-        the placeholder model.
+        per-stage attr), so route_actual stays honest about what the API runs;
+        the 2-arg call (no fallback_model) degrades to the placeholder model.
         """
         try:
             # deep-copy via dict() first so a non-dict `features` raises here
             # (caught below) rather than silently passing through.
             basis = copy.deepcopy(dict(features)) if features else {}
-            candidate = PHASE_1A_PLACEHOLDER_MODEL
-            if self.calibration is not None and stage == "A":
-                rec = self.calibration(features)
-                basis["calibration_rationale"] = {
-                    "rationale": rec.rationale,
-                    "recommended_model": rec.recommended_model,
-                    "confidence_band": rec.confidence_band,
-                }
-            return RouteDecision(
-                route_candidate=candidate,
-                route_actual=candidate,
-                route_fallback_fired=False,
-                decision_basis=basis,
-            )
+            if self.policy_version == PHASE_1B_STAGE_A_SHADOW:
+                return self._decide_stage_a_shadow(
+                    stage, features, basis, fallback_model
+                )
+            return self._decide_placeholder(stage, features, basis)
         except Exception as exc:  # noqa: BLE001 — never-raise contract
             log.warning(
                 f"[policy] decide_route failed for stage={stage} "
@@ -127,3 +129,51 @@ class RoutingPolicy:
                 route_fallback_fired=True,
                 decision_basis={"error": str(exc)},
             )
+
+    def _decide_placeholder(self, stage, features, basis) -> RouteDecision:
+        """PHASE_1A_PLACEHOLDER: unconditional placeholder model. A wired
+        calibration is consulted on Stage A (rationale recorded) but never acted
+        on — the placeholder is always returned (consult-not-act)."""
+        candidate = PHASE_1A_PLACEHOLDER_MODEL
+        if self.calibration is not None and stage == "A":
+            basis["calibration_rationale"] = self._rationale(
+                self.calibration(features)
+            )
+        return RouteDecision(
+            route_candidate=candidate,
+            route_actual=candidate,
+            route_fallback_fired=False,
+            decision_basis=basis,
+        )
+
+    def _decide_stage_a_shadow(
+        self, stage, features, basis, fallback_model
+    ) -> RouteDecision:
+        """PHASE_1B_STAGE_A_SHADOW: route_actual is always the per-stage model
+        (fallback_model — what the API runs); only route_candidate may diverge.
+        For Stage A with a wired calibration recommending a high-confidence cheap
+        model, route_candidate becomes that cheap model (the shadow divergence).
+        All other cases (non-Stage-A, no calibration, uncalibrated/degraded
+        recommendation): candidate == actual == per-stage model (no leak)."""
+        actual = fallback_model or PHASE_1A_PLACEHOLDER_MODEL
+        candidate = actual
+        if stage == "A" and self.calibration is not None:
+            rec = self.calibration(features)
+            basis["calibration_rationale"] = self._rationale(rec)
+            if rec.confidence_band == "high" and rec.recommended_model != actual:
+                candidate = rec.recommended_model
+        return RouteDecision(
+            route_candidate=candidate,
+            route_actual=actual,
+            route_fallback_fired=False,
+            decision_basis=basis,
+        )
+
+    @staticmethod
+    def _rationale(rec) -> dict:
+        """Pack a RouteRecommendation into the decision_basis audit record."""
+        return {
+            "rationale": rec.rationale,
+            "recommended_model": rec.recommended_model,
+            "confidence_band": rec.confidence_band,
+        }

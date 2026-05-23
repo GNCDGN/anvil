@@ -14,9 +14,16 @@ from anvil.calibration import CHEAP_STAGE_A_MODEL, RoutingCalibration
 from anvil.policy import (
     PHASE_1A_PLACEHOLDER,
     PHASE_1A_PLACEHOLDER_MODEL,
+    PHASE_1B_STAGE_A_SHADOW,
     RouteDecision,
     RoutingPolicy,
 )
+
+
+def _haiku_calibration():
+    """A CalibratedPolicy that recommends Haiku (high) for empty-context Stage A."""
+    return RoutingCalibration(
+        [{"context_paths_count": 0, "paths_returned": 0}]).policy
 
 
 class TestRoutingPolicy(unittest.TestCase):
@@ -102,7 +109,10 @@ class TestRoutingPolicyCalibration(unittest.TestCase):
         self.assertEqual(d.route_actual, PHASE_1A_PLACEHOLDER_MODEL)
         self.assertNotIn("calibration_rationale", d.decision_basis)
 
-    def test_decide_route_consults_calibration_but_returns_placeholder(self) -> None:
+    def test_phase_1a_placeholder_consults_but_returns_placeholder(self) -> None:
+        # v3 Phase 1b Step 2: this consult-not-act invariant is scoped to
+        # PHASE_1A_PLACEHOLDER. PHASE_1B_STAGE_A_SHADOW deliberately acts on the
+        # recommendation (route_candidate diverges) — tested separately.
         p = RoutingPolicy(PHASE_1A_PLACEHOLDER).decide_route_with_calibration(
             self._calibration())
         d = p.decide_route("A", {"context_paths_count": 0})
@@ -135,6 +145,63 @@ class TestRoutingPolicyCalibration(unittest.TestCase):
                            fallback_model="claude-opus-4-7")
         self.assertTrue(d.route_fallback_fired)
         self.assertIn("error", d.decision_basis)
+
+
+class TestPhase1bStageAShadow(unittest.TestCase):
+    """v3 Phase 1b Step 2: PHASE_1B_STAGE_A_SHADOW acts on the calibration for
+    Stage A — route_candidate diverges to Haiku — while route_actual stays the
+    per-stage Opus (the API call is unchanged; Step3-F1 inversion preserved)."""
+
+    def _shadow(self):
+        return RoutingPolicy(PHASE_1B_STAGE_A_SHADOW, calibration=_haiku_calibration())
+
+    def test_constant_and_construction(self) -> None:
+        self.assertEqual(PHASE_1B_STAGE_A_SHADOW, "v3-phase-1b-stage-a-shadow")
+        self.assertEqual(self._shadow().policy_version, "v3-phase-1b-stage-a-shadow")
+
+    def test_route_candidate_haiku_on_empty_context_stage_a(self) -> None:
+        d = self._shadow().decide_route(
+            "A", {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
+        self.assertEqual(d.route_candidate, CHEAP_STAGE_A_MODEL)
+        cr = d.decision_basis["calibration_rationale"]
+        self.assertEqual(cr["recommended_model"], CHEAP_STAGE_A_MODEL)
+
+    def test_route_actual_stays_fallback_divergence_invariant(self) -> None:
+        # The load-bearing A1 invariant: route_actual = the per-stage model
+        # (what the API runs), so candidate != actual is the divergence.
+        d = self._shadow().decide_route(
+            "A", {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
+        self.assertEqual(d.route_actual, "claude-opus-4-7")
+        self.assertNotEqual(d.route_candidate, d.route_actual)
+        self.assertFalse(d.route_fallback_fired)
+
+    def test_route_candidate_opus_on_uncalibrated_stage_a(self) -> None:
+        # Non-empty context is uncalibrated → no divergence (both Opus), but
+        # the unsupported-shape recommendation is still recorded.
+        d = self._shadow().decide_route(
+            "A", {"context_paths_count": 3}, fallback_model="claude-opus-4-7")
+        self.assertEqual(d.route_candidate, "claude-opus-4-7")
+        self.assertEqual(d.route_actual, "claude-opus-4-7")
+        self.assertEqual(
+            d.decision_basis["calibration_rationale"]["confidence_band"],
+            "unsupported-shape")
+
+    def test_no_leak_to_stage_b_and_c(self) -> None:
+        for stage in ("B", "C"):
+            d = self._shadow().decide_route(
+                stage, {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
+            self.assertEqual(d.route_candidate, "claude-opus-4-7")
+            self.assertEqual(d.route_actual, "claude-opus-4-7")
+            self.assertNotIn("calibration_rationale", d.decision_basis)
+
+    def test_placeholder_version_does_not_act_no_cross_version_leak(self) -> None:
+        # The SAME calibration wired into a PHASE_1A_PLACEHOLDER policy must NOT
+        # diverge — same inputs, no Haiku candidate (the rule is version-scoped).
+        d = RoutingPolicy(
+            PHASE_1A_PLACEHOLDER, calibration=_haiku_calibration()).decide_route(
+            "A", {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
+        self.assertEqual(d.route_candidate, PHASE_1A_PLACEHOLDER_MODEL)
+        self.assertEqual(d.route_actual, PHASE_1A_PLACEHOLDER_MODEL)
 
 
 if __name__ == "__main__":

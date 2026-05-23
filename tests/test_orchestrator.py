@@ -22,6 +22,7 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
+from unittest import mock
 
 from anvil.config import Config
 from anvil.orchestrator import Orchestrator
@@ -232,6 +233,28 @@ class TestOrchestrator(unittest.TestCase):
         # Trivial brief is in-corpus (3 steps, no deploy, canonical ops).
         self.assertEqual(st.lint_result.structured_features["step_count"], 3)
         self.assertEqual(st.lint_result.confidence_band, "high")
+
+    def test_build_routing_policy_shadow_when_calibration_db_set(self) -> None:
+        # v3 Phase 1b Step 2: ANVIL_CALIBRATION_DB set → the Stage A shadow
+        # policy is selected (from_db is never-raise, so the path need not be a
+        # valid DB for the selection logic to fire — a degraded calibration
+        # still yields a PHASE_1B_STAGE_A_SHADOW policy).
+        from anvil.policy import PHASE_1B_STAGE_A_SHADOW
+        orch = self._orch([])
+        with mock.patch.dict(
+            os.environ, {"ANVIL_CALIBRATION_DB": "/tmp/anvil-cal-nonexistent.duckdb"}
+        ):
+            policy = orch._build_routing_policy()
+        self.assertIsNotNone(policy)
+        self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_SHADOW)
+        self.assertIsNotNone(policy.calibration)
+
+    def test_build_routing_policy_none_when_calibration_db_unset(self) -> None:
+        # Unset → None → Planner defaults to PHASE_1A_PLACEHOLDER (back-compat).
+        orch = self._orch([])
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ANVIL_CALIBRATION_DB", None)
+            self.assertIsNone(orch._build_routing_policy())
 
     def test_move_brief_updates_state_brief_path_for_resume(self) -> None:
         """Step 10 hotfix: after inbox→active move, state.brief_path must

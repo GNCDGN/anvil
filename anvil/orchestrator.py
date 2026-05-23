@@ -147,7 +147,14 @@ class Orchestrator:
         Planner. Lazy import of `anvil.mocked` avoids the circular
         import path (mocked imports Planner; orchestrator imports
         mocked only via this method).
+
+        v3 Phase 1b Step 2: the routing policy is selected by
+        `_build_routing_policy` from the `ANVIL_CALIBRATION_DB` env var
+        (opt-in). Unset → policy=None → Planner defaults to
+        PHASE_1A_PLACEHOLDER (Phase-1a-equivalent). Set → the Stage A shadow
+        rule. The policy is passed to both the real and mocked Planner.
         """
+        policy = self._build_routing_policy()
         if getattr(self.config, "mocked_planner", False):
             from anvil.mocked import MockedPlanner
             return MockedPlanner(
@@ -155,13 +162,35 @@ class Orchestrator:
                 model=self.config.planner_model,
                 timeout=self.config.planner_timeout,
                 vault_root=self.config.vault_path,
+                policy=policy,
             )
         return Planner(
             api_key=self.config.anthropic_api_key,
             model=self.config.planner_model,
             timeout=self.config.planner_timeout,
             vault_root=self.config.vault_path,
+            policy=policy,
         )
+
+    def _build_routing_policy(self):
+        """v3 Phase 1b Step 2: select the routing policy from the opt-in
+        `ANVIL_CALIBRATION_DB` env var.
+
+        Unset → return None (the Planner defaults to PHASE_1A_PLACEHOLDER, so a
+        default sweep is byte-identical to Phase 1a). Set → derive the Stage A
+        calibration from that DuckDB and wire it into a
+        PHASE_1B_STAGE_A_SHADOW policy. `RoutingCalibration.from_db` is
+        never-raise (a missing/broken DB → empty corpus → degraded predicate),
+        so a misconfigured path can never block the build — it just yields a
+        shadow policy that recommends Opus everywhere.
+        """
+        cal_db = os.environ.get("ANVIL_CALIBRATION_DB", "").strip()
+        if not cal_db:
+            return None
+        from anvil.calibration import RoutingCalibration
+        from anvil.policy import PHASE_1B_STAGE_A_SHADOW, RoutingPolicy
+        calibration = RoutingCalibration.from_db(cal_db).policy
+        return RoutingPolicy(PHASE_1B_STAGE_A_SHADOW, calibration=calibration)
 
     def _build_coder(self) -> Coder:
         """Construct a real Coder from config. The system prompt is

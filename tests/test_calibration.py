@@ -141,6 +141,27 @@ class TestCalibrationFromConnection(unittest.TestCase):
         self.assertEqual(rec.recommended_model, CHEAP_STAGE_A_MODEL)
         self.assertEqual(rec.confidence_band, "high")
 
+    @unittest.skipUnless(
+        _EXIT_SWEEP_DB.is_file(),
+        f"integration fixture {_EXIT_SWEEP_DB} not present",
+    )
+    def test_from_db_opens_path_and_derives(self) -> None:
+        # v3 Phase 1b Step 2: from_db opens the DuckDB read-only, derives, closes.
+        cal = RoutingCalibration.from_db(_EXIT_SWEEP_DB)
+        self.assertTrue(cal.predicate_state["empty_context_calibrated"])
+        self.assertEqual(
+            cal.policy({"context_paths_count": 0}).recommended_model,
+            CHEAP_STAGE_A_MODEL)
+
+    def test_from_db_missing_file_degrades_never_raises(self) -> None:
+        # A missing/broken DB must never block the build — empty corpus,
+        # degraded predicate (the orchestrator relies on this).
+        cal = RoutingCalibration.from_db("/tmp/anvil-no-such-calibration.duckdb")
+        self.assertFalse(cal.predicate_state["empty_context_calibrated"])
+        self.assertEqual(
+            cal.policy({"context_paths_count": 0}).recommended_model,
+            PHASE_1A_PLACEHOLDER_MODEL)
+
 
 if __name__ == "__main__":
     unittest.main()

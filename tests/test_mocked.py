@@ -24,10 +24,12 @@ import anvil.checkpoint  # noqa: F401
 
 from anvil import events
 from anvil.brief import Brief, Step
+from anvil.calibration import CHEAP_STAGE_A_MODEL, RoutingCalibration
 from anvil.config import Config
 from anvil.mocked import MockedCoder, MockedPlanner
 from anvil.orchestrator import Orchestrator
 from anvil.planner import Plan
+from anvil.policy import PHASE_1B_STAGE_A_SHADOW, RoutingPolicy
 from anvil.state import init_state, read_state
 
 _FIX_ROOT = (
@@ -547,6 +549,34 @@ class TestMockedPerStageModel(_MockedTestBase):
         sd = next(e for e in evs if e["kind"] == "shadow.decision")["data"]
         self.assertEqual(sd["policy_version"], "v3-phase-1a-placeholder")
         self.assertTrue(sd["agreement"])
+
+    def test_parallel_wire_shadow_divergence(self) -> None:
+        # v3 Phase 1b Step 2 (V3P0-3 parallel-wire verification): MockedPlanner's
+        # overridden _call_anthropic, via the inherited _policy_routing, emits the
+        # SAME route_candidate divergence as the production wrapper when wired
+        # with a PHASE_1B_STAGE_A_SHADOW calibrated policy — no mocked.py change.
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        p = MockedPlanner(
+            model="claude-opus-4-7",
+            policy=RoutingPolicy(PHASE_1B_STAGE_A_SHADOW, calibration=cal),
+        )
+        p._current_step_idx = 0
+        p._current_context_paths_count = 0
+        p._call_anthropic(system="(sys)", user="(usr)", timeout=30,
+                          step=1, stage="A")
+        evs = self._events()
+        end = next(e for e in evs
+                   if e["kind"] == "planner.stage_a.api_end")["data"]
+        self.assertEqual(end["route_candidate"], CHEAP_STAGE_A_MODEL)  # diverges
+        self.assertEqual(end["route_actual"], "claude-opus-4-7")       # per-stage
+        self.assertEqual(end["model"], "claude-opus-4-7")
+        self.assertEqual(end["policy_version"], "v3-phase-1b-stage-a-shadow")
+        sd = next(e for e in evs if e["kind"] == "shadow.decision")["data"]
+        self.assertEqual(sd["shadow_route_candidate"], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(sd["actual_route_taken"], "claude-opus-4-7")
+        self.assertFalse(sd["agreement"])
 
 
 if __name__ == "__main__":

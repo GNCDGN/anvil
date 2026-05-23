@@ -1220,6 +1220,69 @@ class TestStep3PolicyVersion(_HarnessTestBase):
             self.assertGreater(ac, 0)
             self.assertEqual(dc, 0)
 
+    def _make_cc_run(self, run_id, policy_version, candidate, actual) -> None:
+        # v3 Phase 1b Step 2: a run whose Stage A shadow.decision can DISAGREE
+        # (candidate != actual) — the placeholder helper always agrees.
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir()
+        agreement = candidate == actual
+        api_data = {
+            "model": actual, "input_tokens": 1000, "output_tokens": 50,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "duration_ms": 1500, "ok": True,
+            "route_candidate": candidate, "route_actual": actual,
+            "route_fallback_fired": False, "policy_version": policy_version,
+            "features_seen": {"stage": "A", "step_idx": 0,
+                              "observed_prompt_token_count": 1000,
+                              "context_paths_count": 0},
+        }
+        shadow_data = {
+            "stage": "A", "shadow_route_candidate": candidate,
+            "shadow_decision_basis": {"stage": "A"},
+            "actual_route_taken": actual, "agreement": agreement,
+            "policy_version": policy_version,
+        }
+        rows = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end", api_data,
+                       run_id=run_id, step_idx=0),
+            _event_row(11, "shadow.decision", shadow_data,
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in rows) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("mock\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+    def test_shadow_ingest_reads_stage_a_shadow_policy_version(self) -> None:
+        self._make_cc_run("T7-sh", "v3-phase-1b-stage-a-shadow",
+                          "claude-haiku-4-5-20251001", "claude-opus-4-7")
+        got = self.con.execute(
+            "SELECT DISTINCT policy_version FROM shadow_decisions "
+            "WHERE run_id = 'T7-sh'"
+        ).fetchall()
+        self.assertEqual(got, [("v3-phase-1b-stage-a-shadow",)])
+
+    def test_champion_challenger_disagreement_on_shadow_agreement_on_placeholder(
+        self,
+    ) -> None:
+        # Criterion 4 contract proof: in ONE DuckDB, the placeholder rows show
+        # agreement and the shadow rows show disagreement (Haiku candidate ≠ Opus
+        # actual). Distinct task_ids so they aggregate as separate rows.
+        self._make_cc_run("T8-ph", "v3-phase-1a-placeholder",
+                          "claude-opus-4-7", "claude-opus-4-7")
+        self._make_cc_run("T9-sh", "v3-phase-1b-stage-a-shadow",
+                          "claude-haiku-4-5-20251001", "claude-opus-4-7")
+        rows = self.con.execute(
+            "SELECT policy_version, SUM(agreement_count), SUM(disagreement_count) "
+            "FROM champion_challenger_comparison WHERE policy_version IS NOT NULL "
+            "GROUP BY policy_version"
+        ).fetchall()
+        by_pv = {pv: (ac, dc) for pv, ac, dc in rows}
+        self.assertEqual(by_pv["v3-phase-1a-placeholder"], (1, 0))    # agreement
+        self.assertEqual(by_pv["v3-phase-1b-stage-a-shadow"], (0, 1))  # disagreement
+
 
 if __name__ == "__main__":
     unittest.main()

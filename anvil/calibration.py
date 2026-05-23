@@ -187,3 +187,24 @@ class RoutingCalibration:
             )
             samples = []
         return cls(samples)
+
+    @classmethod
+    def from_db(cls, path) -> "RoutingCalibration":
+        """v3 Phase 1b Step 2: open a DuckDB at `path` read-only, extract Stage A
+        samples, derive. Keeps callers (the orchestrator) from importing duckdb
+        or the harness. Never raises — a missing file or DB error derives from an
+        empty corpus (degraded predicate), so a misconfigured ANVIL_CALIBRATION_DB
+        can never block a build."""
+        try:
+            import duckdb
+            con = duckdb.connect(str(path), read_only=True)
+            try:
+                return cls.from_connection(con)
+            finally:
+                con.close()
+        except Exception as exc:  # noqa: BLE001 — never-raise contract
+            log.warning(
+                f"[calibration] from_db({path}) failed "
+                f"({type(exc).__name__}: {exc}); deriving from empty corpus"
+            )
+            return cls([])

@@ -86,6 +86,7 @@ class Planner:
         stage_a_model: str | None = None,
         stage_b_model: str | None = None,
         stage_c_model: str | None = None,
+        policy=None,
     ) -> None:
         self.api_key = api_key
         # v3 Phase 1a Step 1: per-stage model plumbing replaces the single
@@ -147,9 +148,15 @@ class Planner:
         # v3 Phase 1a Step 3 (V3P1A-3): per-instance routing policy engine.
         # Per-instance (not module-global) for the same test-isolation reason
         # as the V3P0-6 cache state — a fresh Planner per build/test starts
-        # clean. Phase 1a's PHASE_1A_PLACEHOLDER returns Opus unconditionally;
-        # MockedPlanner inherits this (no __init__ override).
-        self._policy = RoutingPolicy(PHASE_1A_PLACEHOLDER)
+        # clean. MockedPlanner inherits this (no __init__ override).
+        # v3 Phase 1b Step 2: the orchestrator may pass a calibration-wired
+        # policy (PHASE_1B_STAGE_A_SHADOW) via `policy=`. None → the
+        # PHASE_1A_PLACEHOLDER default (Phase-1a-equivalent, default sweep
+        # byte-identical). The 3 emit sites already flow decision.route_candidate
+        # through (V3P1A-3), so a diverging candidate needs no wrapper change.
+        self._policy = policy if policy is not None else RoutingPolicy(
+            PHASE_1A_PLACEHOLDER
+        )
 
     def _model_for_stage(self, stage: str) -> str:
         """v3 Phase 1a Step 1: resolve the model for a Planner stage.

@@ -24,8 +24,10 @@ from unittest import mock
 from anvil import events
 from anvil import planner as planner_mod
 from anvil.brief import Brief, Step
+from anvil.calibration import CHEAP_STAGE_A_MODEL, RoutingCalibration
 from anvil.lint import LintResult
 from anvil.planner import Planner, DEFAULT_PLANNER_MODEL
+from anvil.policy import PHASE_1B_STAGE_A_SHADOW, RoutingPolicy
 from anvil.state import init_state
 
 
@@ -900,6 +902,57 @@ class TestPolicyEngineWiring(_PlannerEventsBase):
             {"observed_prompt_token_count", "step_idx", "stage",
              "context_paths_count"},
         )
+
+
+class TestPhase1bStageAShadowWiring(_PlannerEventsBase):
+    """v3 Phase 1b Step 2: the Stage A shadow rule diverges route_candidate to
+    Haiku through the REAL _call_anthropic, while route_actual + the `model` data
+    field + the API-call kwarg stay Opus (the first route_candidate ≠ route_actual
+    in v3 history; Step3-F1 inversion preserved)."""
+
+    def _shadow_planner(self):
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        return Planner(
+            model="claude-opus-4-7",
+            policy=RoutingPolicy(PHASE_1B_STAGE_A_SHADOW, calibration=cal),
+        )
+
+    def test_stage_a_shadow_diverges_candidate_through_call_anthropic(self) -> None:
+        client, capture = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0, cache_read=2603)
+        p = self._shadow_planner()
+        p._client = client
+        p._current_step_idx = 0
+        p._current_context_paths_count = 0  # empty context → cheap-route recommended
+        p._call_anthropic(system="SYS", user="u", timeout=30, step=1, stage="A")
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_a.api_end")["data"]
+        # route_candidate diverges to Haiku; route_actual + model + API stay Opus.
+        self.assertEqual(end["route_candidate"], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(end["route_actual"], "claude-opus-4-7")
+        self.assertEqual(end["model"], "claude-opus-4-7")
+        self.assertEqual(capture["model"], "claude-opus-4-7")  # API ran Opus
+        self.assertEqual(end["policy_version"], "v3-phase-1b-stage-a-shadow")
+        # The paired shadow.decision records the divergence → agreement False.
+        sd = next(e for e in self._events_for()
+                  if e["kind"] == "shadow.decision")["data"]
+        self.assertEqual(sd["shadow_route_candidate"], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(sd["actual_route_taken"], "claude-opus-4-7")
+        self.assertFalse(sd["agreement"])
+
+    def test_stage_b_no_divergence_under_shadow(self) -> None:
+        client, _ = _make_fake_client(
+            input_tokens=600, output_tokens=40, cache_creation=0, cache_read=2603)
+        p = self._shadow_planner()
+        p._client = client
+        p._current_step_idx = 0
+        p._current_context_paths_count = 0
+        p._call_anthropic(system="SYS", user="u", timeout=30, step=1, stage="B")
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_b.api_end")["data"]
+        self.assertEqual(end["route_candidate"], "claude-opus-4-7")
+        self.assertEqual(end["route_actual"], "claude-opus-4-7")
 
 
 if __name__ == "__main__":
