@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import unittest
 
+from anvil.calibration import CHEAP_STAGE_A_MODEL, RoutingCalibration
 from anvil.policy import (
     PHASE_1A_PLACEHOLDER,
     PHASE_1A_PLACEHOLDER_MODEL,
@@ -74,6 +75,66 @@ class TestRoutingPolicy(unittest.TestCase):
         feats["new_key"] = "x"
         self.assertEqual(d.decision_basis["nested"], [1, 2, 3])
         self.assertNotIn("new_key", d.decision_basis)
+
+
+class TestRoutingPolicyCalibration(unittest.TestCase):
+    """v3 Phase 1b Step 1: RoutingPolicy gains an optional calibration. In Step 1
+    it is CONSULTED (recommendation recorded in decision_basis) but not acted on —
+    decide_route still returns the placeholder (consult-not-act)."""
+
+    def _calibration(self):
+        # A calibrated policy that recommends Haiku for empty-context Stage A.
+        return RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+
+    def test_factory_returns_policy_with_calibration_stashed(self) -> None:
+        cal = self._calibration()
+        p = RoutingPolicy(PHASE_1A_PLACEHOLDER).decide_route_with_calibration(cal)
+        self.assertIsInstance(p, RoutingPolicy)
+        self.assertIs(p.calibration, cal)
+        self.assertEqual(p.policy_version, PHASE_1A_PLACEHOLDER)
+
+    def test_calibration_none_is_back_compat(self) -> None:
+        # No calibration → identical to Phase 1a (placeholder, no rationale key).
+        d = RoutingPolicy(PHASE_1A_PLACEHOLDER).decide_route(
+            "A", {"context_paths_count": 0})
+        self.assertEqual(d.route_candidate, PHASE_1A_PLACEHOLDER_MODEL)
+        self.assertEqual(d.route_actual, PHASE_1A_PLACEHOLDER_MODEL)
+        self.assertNotIn("calibration_rationale", d.decision_basis)
+
+    def test_decide_route_consults_calibration_but_returns_placeholder(self) -> None:
+        p = RoutingPolicy(PHASE_1A_PLACEHOLDER).decide_route_with_calibration(
+            self._calibration())
+        d = p.decide_route("A", {"context_paths_count": 0})
+        # Consult-not-act: candidate/actual are still the placeholder Opus...
+        self.assertEqual(d.route_candidate, PHASE_1A_PLACEHOLDER_MODEL)
+        self.assertEqual(d.route_actual, PHASE_1A_PLACEHOLDER_MODEL)
+        # ...but the calibration's Haiku recommendation IS recorded.
+        cr = d.decision_basis["calibration_rationale"]
+        self.assertEqual(cr["recommended_model"], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(cr["confidence_band"], "high")
+
+    def test_calibration_rationale_is_stage_a_gated(self) -> None:
+        p = RoutingPolicy(PHASE_1A_PLACEHOLDER).decide_route_with_calibration(
+            self._calibration())
+        self.assertIn(
+            "calibration_rationale",
+            p.decide_route("A", {"context_paths_count": 0}).decision_basis)
+        self.assertNotIn(
+            "calibration_rationale",
+            p.decide_route("B", {"context_paths_count": 0}).decision_basis)
+
+    def test_decide_route_degrades_if_calibration_raises(self) -> None:
+        # decide_route's never-raise holds even if a (future, buggy) calibration
+        # callable raises — the wrapper degrades to the fallback model.
+        def _boom(features):
+            raise RuntimeError("boom")
+
+        p = RoutingPolicy(PHASE_1A_PLACEHOLDER, calibration=_boom)
+        d = p.decide_route("A", {"context_paths_count": 0},
+                           fallback_model="claude-opus-4-7")
+        self.assertTrue(d.route_fallback_fired)
+        self.assertIn("error", d.decision_basis)
 
 
 if __name__ == "__main__":

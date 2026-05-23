@@ -61,8 +61,22 @@ class RoutingPolicy:
     PHASE_1A_PLACEHOLDER_MODEL` regardless of features. `policy_version` is
     stamped onto every routing event and shadow_decisions row the wrapper emits."""
 
-    def __init__(self, policy_version: str) -> None:
+    def __init__(self, policy_version: str, *, calibration=None) -> None:
         self.policy_version = policy_version
+        # v3 Phase 1b Step 1: an optional CalibratedPolicy (from
+        # anvil.calibration). Stashed as a dependency; NOT imported here (the
+        # cycle calibration→policy already exists for PHASE_1A_PLACEHOLDER_MODEL,
+        # so policy must not import calibration). None → identical to Phase 1a.
+        self.calibration = calibration
+
+    def decide_route_with_calibration(self, calibration) -> "RoutingPolicy":
+        """v3 Phase 1b Step 1 (criterion 7): return a RoutingPolicy with the
+        given CalibratedPolicy wired in. A factory despite the verb-y name (the
+        criterion mandates the name). In Step 1 the returned policy still emits
+        PHASE_1A_PLACEHOLDER-equivalent decisions — `decide_route` consults the
+        calibration and records its recommendation, but does not act on it.
+        Step 2 ships the rule that sources `route_candidate` from it."""
+        return RoutingPolicy(self.policy_version, calibration=calibration)
 
     def decide_route(
         self, stage: str, features, *, fallback_model: str | None = None
@@ -70,6 +84,12 @@ class RoutingPolicy:
         """Return a RouteDecision for `stage` given `features` (the merged
         lint + features_seen dict). Phase 1a: unconditionally the placeholder
         model, with route_actual == route_candidate (no fallback fired).
+
+        v3 Phase 1b Step 1: when a calibration is wired AND stage == "A", the
+        calibration is CONSULTED — its recommendation is recorded under
+        `decision_basis["calibration_rationale"]` — but the returned models are
+        still the placeholder (consult-not-act). Step 2 makes `route_candidate`
+        source from the recommendation.
 
         Never raises. On any internal failure returns a degraded decision with
         route_fallback_fired=True and route_actual=fallback_model (the wrapper's
@@ -82,6 +102,13 @@ class RoutingPolicy:
             # (caught below) rather than silently passing through.
             basis = copy.deepcopy(dict(features)) if features else {}
             candidate = PHASE_1A_PLACEHOLDER_MODEL
+            if self.calibration is not None and stage == "A":
+                rec = self.calibration(features)
+                basis["calibration_rationale"] = {
+                    "rationale": rec.rationale,
+                    "recommended_model": rec.recommended_model,
+                    "confidence_band": rec.confidence_band,
+                }
             return RouteDecision(
                 route_candidate=candidate,
                 route_actual=candidate,
