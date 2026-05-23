@@ -47,16 +47,67 @@ from openpyxl.styles import Font
 _real_write = Path.write_text
 
 # ---------------------------------------------------------------------------
-# Cost rates — Opus 4.7, as of 2026-05. Update if pricing changes.
-# Mirrors tools/exam_harness.py rates so the two harnesses agree.
+# Cost rates — per-model, USD per million tokens. Verified against Anthropic's
+# pricing page (platform.claude.com/docs/en/docs/about-claude/pricing,
+# fetched 2026-05-26). v3 Phase 1c Step 3.5 (Step3.5C-F1): replaces the prior
+# single rate table ($15/$75/$18.75/$1.50) — those were Opus 4.1's rates,
+# STALE for the live Opus 4.7 planner model ($5/$25/$6.25/$0.50), and were
+# also (wrongly) applied to the Haiku 4.5 canary. Cache: 5m-write = 1.25x
+# input, read = 0.1x input. Mirrored in tools/exam_harness.py via import so
+# the two harnesses can't drift. Unknown models fall back to Opus 4.7 rates
+# (conservative overcharge); unknown_cost_models() surfaces any for
+# explicit registration (a Phase 2 new-model addition shows up there).
 # ---------------------------------------------------------------------------
 
-RATES_USD_PER_M = {
-    "input": 15.0,
-    "output": 75.0,
-    "cache_creation": 18.75,
-    "cache_read": 1.50,
+MODEL_RATES: dict[str, dict[str, float]] = {
+    "claude-opus-4-7": {
+        "input": 5.0, "output": 25.0, "cache_create": 6.25, "cache_read": 0.50},
+    "claude-haiku-4-5-20251001": {
+        "input": 1.0, "output": 5.0, "cache_create": 1.25, "cache_read": 0.10},
 }
+DEFAULT_MODEL_RATES = MODEL_RATES["claude-opus-4-7"]
+
+
+def _rate_case(component: str) -> str:
+    """Build a SQL CASE mapping the event's model → its per-Mtok rate for
+    `component` (input/output/cache_create/cache_read), defaulting to Opus 4.7
+    for unknown models. Single source of truth: MODEL_RATES."""
+    whens = " ".join(
+        f"WHEN '{model}' THEN {rates[component]}"
+        for model, rates in MODEL_RATES.items()
+    )
+    return (f"CASE json_extract_string(e.data, '$.model') "
+            f"{whens} ELSE {DEFAULT_MODEL_RATES[component]} END")
+
+
+def _cost_usd_case_sql() -> str:
+    """The cost_usd CASE for the operations view: Coder uses its reported
+    CLI cost; null-input rows are 0; planner rows use the per-model token
+    formula (rates from MODEL_RATES via _rate_case)."""
+    return f"""CASE
+        WHEN e.kind LIKE 'coder.%' THEN
+            COALESCE(CAST(json_extract(e.data, '$.total_cost_usd') AS DOUBLE), 0.0)
+        WHEN CAST(json_extract(e.data, '$.input_tokens') AS BIGINT) IS NULL THEN 0.0
+        ELSE (
+            COALESCE(CAST(json_extract(e.data, '$.input_tokens') AS BIGINT), 0) * ({_rate_case('input')}) +
+            COALESCE(CAST(json_extract(e.data, '$.output_tokens') AS BIGINT), 0) * ({_rate_case('output')}) +
+            COALESCE(CAST(json_extract(e.data, '$.cache_creation_input_tokens') AS BIGINT), 0) * ({_rate_case('cache_create')}) +
+            COALESCE(CAST(json_extract(e.data, '$.cache_read_input_tokens') AS BIGINT), 0) * ({_rate_case('cache_read')})
+        ) / 1000000.0
+    END"""
+
+
+def unknown_cost_models(con) -> list[str]:
+    """Planner-event models not in MODEL_RATES (priced at the Opus-4.7
+    fallback). Empty on the v3 corpus; a Phase 2 new model surfaces here."""
+    known = "', '".join(MODEL_RATES)
+    rows = con.execute(
+        "SELECT DISTINCT json_extract_string(data, '$.model') FROM events "
+        "WHERE kind LIKE 'planner.stage_%.api_end' "
+        f"AND json_extract_string(data, '$.model') NOT IN ('{known}') "
+        "AND json_extract_string(data, '$.model') IS NOT NULL"
+    ).fetchall()
+    return [r[0] for r in rows]
 
 # ---------------------------------------------------------------------------
 # FIELD_MAP — operations-view projection generator
@@ -318,24 +369,13 @@ SELECT
                 CAST(json_extract(e.data, '$.input_tokens') AS BIGINT)
             )
     END AS cache_hit_rate,
-    CASE
-        -- v2 Phase 5 Step 1a: Coder cost is the CLI's *reported* total_cost_usd
-        -- (`claude --output-format json`), NOT the token-weighted formula
-        -- below. The Coder runs a cheaper model than the Planner's Opus, so
-        -- applying the Opus rates to its tokens would ~3x-over-cost it (Step 0
-        -- follow-up Q2). This branch precedes the input_tokens check because
-        -- coder.subprocess.end now carries input/output_tokens too. Mock /
-        -- fallback rows have a null total_cost_usd → 0.0.
-        WHEN e.kind LIKE 'coder.%' THEN
-            COALESCE(CAST(json_extract(e.data, '$.total_cost_usd') AS DOUBLE), 0.0)
-        WHEN CAST(json_extract(e.data, '$.input_tokens') AS BIGINT) IS NULL THEN 0.0
-        ELSE (
-            COALESCE(CAST(json_extract(e.data, '$.input_tokens') AS BIGINT), 0) * 15.0 +
-            COALESCE(CAST(json_extract(e.data, '$.output_tokens') AS BIGINT), 0) * 75.0 +
-            COALESCE(CAST(json_extract(e.data, '$.cache_creation_input_tokens') AS BIGINT), 0) * 18.75 +
-            COALESCE(CAST(json_extract(e.data, '$.cache_read_input_tokens') AS BIGINT), 0) * 1.50
-        ) / 1000000.0
-    END AS cost_usd,
+    -- v2 Phase 5 Step 1a: Coder cost is the CLI's *reported* total_cost_usd
+    -- (`claude --output-format json`), NOT the token formula. v3 Phase 1c
+    -- Step 3.5 (Step3.5C-F1): planner rows now use per-model rates (MODEL_RATES,
+    -- via _cost_usd_case_sql) instead of a single Opus-4.1 table — Opus 4.7 and
+    -- the Haiku canary are priced honestly. Injected below to keep MODEL_RATES
+    -- the single source of truth.
+    __COST_USD_CASE__ AS cost_usd,
     (
         SELECT CAST(json_extract(s.data, '$.prompt_chars') AS BIGINT) FROM events s
         WHERE s.run_id = e.run_id
@@ -399,6 +439,11 @@ WHERE e.kind IN (
     'escalation.resolved'
 )
 """
+
+# v3 Phase 1c Step 3.5: inject the per-model cost CASE (MODEL_RATES is the
+# single source of truth; the SQL is generated from it at module load).
+_OPERATIONS_VIEW_SQL = _OPERATIONS_VIEW_SQL.replace(
+    "__COST_USD_CASE__", _cost_usd_case_sql())
 
 # Column order in operations (mirrored in XLSX export):
 _OPERATIONS_COLUMNS: tuple[str, ...] = (

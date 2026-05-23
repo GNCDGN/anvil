@@ -220,14 +220,15 @@ class TestOperationsView(_HarnessTestBase):
 
     def test_cost_computation_correctness(self) -> None:
         harness_v2.ingest(self.con, _CLEAN_DIR)
-        # Stage A: input=10500, output=115, cache=0/0
-        #   cost = (10500*15 + 115*75) / 1e6 = (157500 + 8625) / 1e6 = 0.166125
+        # Stage A (model=claude-opus-4-7): input=10500, output=115, cache=0/0
+        #   v3 Phase 1c Step 3.5: Opus 4.7 rates $5/$25 (was Opus-4.1 $15/$75).
+        #   cost = (10500*5 + 115*25) / 1e6 = (52500 + 2875) / 1e6 = 0.055375
         rows = self.con.execute(
             "SELECT cost_usd FROM operations "
             "WHERE run_id = 'T1-doc-edit-mock' AND operation_kind = 'planner.stage_a.api_end'"
         ).fetchall()
         self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(rows[0][0], 0.166125, places=4)
+        self.assertAlmostEqual(rows[0][0], 0.055375, places=4)
 
     def test_two_distinct_latency_columns_surface(self) -> None:
         # poll_reply_chars vs escalation_user_latency_ms — they live in
@@ -402,9 +403,10 @@ class TestValidationFailureEpisodes(_HarnessTestBase):
         self.assertIsNone(r[6], "second_error should be NULL")
         self.assertFalse(r[7], "recovered should be FALSE (escalated)")
         self.assertEqual(r[8], 1, "extra_api_calls")
-        # total_extra_cost_usd = cost of the retry stage_b.api_end =
-        # (2000 input * 15 + 20 output * 75) / 1e6 = 0.0315
-        self.assertAlmostEqual(r[9], 0.0315, places=6,
+        # total_extra_cost_usd = cost of the retry stage_b.api_end.
+        # v3 Phase 1c Step 3.5: Opus 4.7 rates $5/$25 (was $15/$75).
+        # (2000 input * 5 + 20 output * 25) / 1e6 = 0.0105
+        self.assertAlmostEqual(r[9], 0.0105, places=6,
                                msg="total_extra_cost_usd")
 
     def test_empty_db_returns_no_episodes(self) -> None:
@@ -770,7 +772,7 @@ class TestCoderCostFromReported(_HarnessTestBase):
                 {"exit_code": 0, "duration_ms": 1299, "stdout_chars": 30,
                  "stderr_chars": 0, "total_cost_usd": 0.04953225,
                  "input_tokens": 2152, "output_tokens": 4,
-                 "cache_creation_input_tokens": 5283,
+                 "cache_creation_input_tokens": 21000,
                  "cache_read_input_tokens": 10315},
                 run_id="T9-coder-cost", step_idx=0,
             ),
@@ -787,9 +789,10 @@ class TestCoderCostFromReported(_HarnessTestBase):
             "WHERE run_id='T9-coder-cost' AND operation_kind='coder.subprocess.end'"
         ).fetchone()
         self.assertIsNotNone(row)
-        # cost_usd = the reported figure, NOT the ~$0.147 Opus formula value.
+        # cost_usd = the reported figure, NOT the ~$0.147 formula value.
+        # v3 Phase 1c Step 3.5: per-model Opus 4.7 rates $5/$25/$6.25/$0.50.
         self.assertAlmostEqual(row[0], 0.04953225, places=8)
-        formula = (2152 * 15.0 + 4 * 75.0 + 5283 * 18.75 + 10315 * 1.50) / 1e6
+        formula = (2152 * 5.0 + 4 * 25.0 + 21000 * 6.25 + 10315 * 0.50) / 1e6
         self.assertNotAlmostEqual(row[0], formula, places=3)  # ~0.147, rejected
         # token columns populated for observability (cost still reported).
         self.assertEqual(row[1], 2152)
@@ -1402,6 +1405,118 @@ class TestStep3PolicyVersion(_HarnessTestBase):
             "SELECT total_cost_usd FROM per_run_summary WHERE run_id = 'T1-cb-sum'"
         ).fetchone()[0]
         self.assertGreater(total, 0.0)
+
+
+class TestPerModelCostRates(_HarnessTestBase):
+    """v3 Phase 1c Step 3.5 (Step3.5C-F1): the operations-view cost formula
+    uses per-model rates (MODEL_RATES) — Opus 4.7 $5/$25/$6.25/$0.50 and Haiku
+    4.5 $1/$5/$1.25/$0.10 — instead of a single (stale Opus-4.1) table."""
+
+    def _ingest_planner_event(self, run_id, model, inp, outp, cc, cr,
+                              kind="planner.stage_a.api_end", mode="real"):
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, kind,
+                       {"model": model, "input_tokens": inp, "output_tokens": outp,
+                        "cache_creation_input_tokens": cc,
+                        "cache_read_input_tokens": cr, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "run.end", {}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text(f"{mode}\n", encoding="utf-8")
+        return harness_v2.ingest(self.con, run_dir)
+
+    def _cost(self, run_id):
+        return self.con.execute(
+            "SELECT cost_usd FROM operations WHERE run_id = ? "
+            "AND operation_kind = 'planner.stage_a.api_end'", [run_id]
+        ).fetchone()[0]
+
+    def test_model_rates_table_entries(self) -> None:
+        # Q8.1: MODEL_RATES carries the two v3 models at the real rates.
+        self.assertEqual(harness_v2.MODEL_RATES["claude-opus-4-7"],
+                         {"input": 5.0, "output": 25.0,
+                          "cache_create": 6.25, "cache_read": 0.50})
+        self.assertEqual(harness_v2.MODEL_RATES["claude-haiku-4-5-20251001"],
+                         {"input": 1.0, "output": 5.0,
+                          "cache_create": 1.25, "cache_read": 0.10})
+        self.assertIs(harness_v2.DEFAULT_MODEL_RATES,
+                      harness_v2.MODEL_RATES["claude-opus-4-7"])
+
+    def test_opus_row_cost(self) -> None:
+        # Q8.2: Opus 4.7 row → (1000*5 + 100*25)/1e6 = 0.0075.
+        self._ingest_planner_event("T-opus", "claude-opus-4-7", 1000, 100, 0, 0)
+        self.assertAlmostEqual(self._cost("T-opus"), 0.0075, places=8)
+
+    def test_haiku_row_cost(self) -> None:
+        # Q8.3: Haiku 4.5 row → (1000*1 + 100*5)/1e6 = 0.0015.
+        self._ingest_planner_event(
+            "T-haiku", "claude-haiku-4-5-20251001", 1000, 100, 0, 0)
+        self.assertAlmostEqual(self._cost("T-haiku"), 0.0015, places=8)
+
+    def test_unknown_model_falls_back_to_opus(self) -> None:
+        # Q8.4: unknown model → Opus 4.7 fallback (0.0075), and is surfaced.
+        self._ingest_planner_event("T-future", "claude-future-99", 1000, 100, 0, 0)
+        self.assertAlmostEqual(self._cost("T-future"), 0.0075, places=8)
+        self.assertIn("claude-future-99",
+                      harness_v2.unknown_cost_models(self.con))
+
+    def test_mixed_model_spend_ledger_reconciles(self) -> None:
+        # Q8.5: a mixed-model run (Haiku Stage A + Opus Stage B) — the stored
+        # spend_ledger snapshot equals the recomputed per_run_summary total.
+        run_id = "T-mixed"
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-haiku-4-5-20251001", "input_tokens": 3800,
+                        "output_tokens": 50, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(20, "planner.stage_b.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 900,
+                        "output_tokens": 380, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 3479, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+        ledger = self.con.execute(
+            "SELECT total_cost_usd FROM spend_ledger "
+            "WHERE run_id = ? AND superseded = FALSE", [run_id]).fetchone()[0]
+        per_run = self.con.execute(
+            "SELECT total_cost_usd FROM per_run_summary WHERE run_id = ?",
+            [run_id]).fetchone()[0]
+        self.assertAlmostEqual(ledger, per_run, places=8)
+        # Haiku Stage A (3800*1 + 50*5)/1e6 + Opus Stage B (900*5 + 380*25 + 3479*0.5)/1e6
+        expected = (3800 * 1 + 50 * 5) / 1e6 + (900 * 5 + 380 * 25 + 3479 * 0.50) / 1e6
+        self.assertAlmostEqual(per_run, expected, places=8)
+
+    def test_phase1c_step4_db_recompute_in_band(self) -> None:
+        # Q8.6 (load-bearing): the existing Phase 1c Step 4 exit-sweep, recomputed
+        # under honest per-model rates, lands in the Option-2 band $1.00-1.10.
+        # state/ is gitignored → skip when the transient sweep DB is absent.
+        db = (Path(__file__).resolve().parent.parent
+              / "state" / "v3-phase-1c" / "exit-sweep.duckdb")
+        if not db.is_file():
+            self.skipTest("Phase 1c Step 4 exit-sweep DB not present (state/ gitignored)")
+        con = harness_v2.open_db(db)  # CREATE OR REPLACE recomputes the view
+        try:
+            total = con.execute(
+                "SELECT SUM(cost_usd) FROM operations WHERE mode = 'real'"
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertGreater(total, 1.00)
+        self.assertLess(total, 1.10)
 
 
 if __name__ == "__main__":

@@ -27,15 +27,21 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# --- Pricing. Opus 4.7, USD per token, current as of 2026-05-18. Update
-# here if Anthropic pricing changes; surface --rate-* flags if these go
-# stale during a run. cache_creation has no spec-named rate — the 1.25x
-# input convention is used and flagged. ---
-RATE_INPUT = 15.0 / 1_000_000
-RATE_OUTPUT = 75.0 / 1_000_000
-RATE_CACHE_READ = 1.50 / 1_000_000
-RATE_CACHE_CREATION = 18.75 / 1_000_000  # 1.25x input (convention; not spec-named)
+# --- Pricing. v3 Phase 1c Step 3.5 (Step3.5C-F2): per-model rates imported
+# from harness_v2 (the mirror invariant — single source of truth, no drift).
+# Verified against Anthropic's pricing page on 2026-05-26: Opus 4.7
+# $5/$25/$6.25/$0.50, Haiku 4.5 $1/$5/$1.25/$0.10 (in/out/5m-write/read per
+# Mtok). Replaces the prior stale Opus-4.1 constants ($15/$75). ---
+from tools.harness_v2 import MODEL_RATES, DEFAULT_MODEL_RATES  # noqa: E402
 BUDGET_USD = 20.0
+
+
+def _model_cost_usd(model, inp, outp, cc, cr):
+    """Per-model token cost (USD), Step3.5C-F2 — mirrors harness_v2's formula.
+    Unknown models fall back to Opus 4.7 rates (conservative overcharge)."""
+    r = MODEL_RATES.get(model, DEFAULT_MODEL_RATES)
+    return (inp * r["input"] + outp * r["output"]
+            + cc * r["cache_create"] + cr * r["cache_read"]) / 1_000_000
 
 TERMINAL = {"done", "failed", "aborted"}
 
@@ -218,10 +224,7 @@ def _parse_planner_lines(log_path: Path) -> list[dict]:
         d = m.groupdict()
         inp, outp = int(d["inp"]), int(d["out"])
         cc, cr = int(d["cc"]), int(d["cr"])
-        cost = (
-            inp * RATE_INPUT + outp * RATE_OUTPUT
-            + cc * RATE_CACHE_CREATION + cr * RATE_CACHE_READ
-        )
+        cost = _model_cost_usd(d["model"], inp, outp, cc, cr)
         out.append({
             "ts": ts, "step": int(d["step"]), "stage": d["stage"],
             "model": d["model"], "input_tokens": inp, "output_tokens": outp,
@@ -488,9 +491,10 @@ def render(cap: Capture, planner_calls: list[dict],
             "",
             f"Cumulative Planner cost: ${total:.4f}  "
             f"(budget ${BUDGET_USD:.0f}, remaining ${BUDGET_USD - total:.2f})",
-            f"Calls captured: {len(planner_calls)}. Rates: input "
-            f"$15/M, output $75/M, cache-read $1.50/M, cache-creation "
-            f"$18.75/M (1.25x input, convention — not spec-named).",
+            f"Calls captured: {len(planner_calls)}. Per-model rates "
+            f"(USD/Mtok, in/out/5m-write/read): "
+            f"Opus 4.7 $5/$25/$6.25/$0.50, Haiku 4.5 $1/$5/$1.25/$0.10 "
+            f"(5m-write 1.25x input, read 0.1x input).",
         ]
     else:
         L.append("No [planner] token lines found in the log. If the run "
