@@ -342,12 +342,75 @@ def compare_stage_a_selections(
     }
 
 
+# v3 Phase 2d Step 2 (Step3C-F1 hardening): the binary "silent_miss_count > 0"
+# gate is hardened into four explicit dispositions (Q-D4 hybrid heuristic:
+# per-row N=1, per-corpus K=2). The empty-context pass that Phase 1c-2c recorded
+# implicitly as silent_miss == 0 is now recorded explicitly as `vacuous-empty`,
+# and a silent_miss episode fires only on a `genuine-mismatch`. On T1-T6's
+# uniformly empty-context corpus every row is vacuous-empty and
+# silent_miss_episodes stays 0 (observationally identical to Phase 1c/2a/2b/2c);
+# the genuine/uniform branches are forward-readiness for Phase 2d2's extended
+# corpus, exercised by synthetic-corpus tests, not this build's sweep.
+DISPOSITION_VACUOUS_EMPTY = "vacuous-empty"
+DISPOSITION_VACUOUS_UNIFORM = "vacuous-uniform"
+DISPOSITION_GENUINE_MATCH = "genuine-match"
+DISPOSITION_GENUINE_MISMATCH = "genuine-mismatch"
+DISPOSITION_UNKNOWN = "unknown"
+
+
+def classify_comparator_disposition(
+    comparator_result: dict[str, Any],
+    baseline_paths: list[str],
+    *,
+    corpus_baselines: list[list[str]] | None = None,
+    n: int = 1,
+    k: int = 2,
+) -> str:
+    """Classify a Stage A comparison into one of four dispositions.
+
+    Precedence (per-row before per-corpus — the cheaper check short-circuits):
+      1. vacuous-empty   — per-row: the baseline holds fewer than N=1 distinct
+         paths (an empty baseline). The canary cannot be graded against
+         nothing → pass. Returned BEFORE the per-corpus check is evaluated.
+      2. vacuous-uniform — per-corpus: across the baseline rows visible at call
+         time (`corpus_baselines`, defaulting to this row alone) fewer than K=2
+         distinct path values appear → no diversity to grade equivalence
+         against → pass.
+      3. genuine-match   — non-trivial baseline + diverse corpus + the routed
+         selection dropped no baseline path (silent_miss_count == 0) → pass.
+      4. genuine-mismatch — non-trivial baseline + diverse corpus + the routed
+         selection dropped >=1 baseline path (silent_miss_count > 0) → the
+         canary records a silent_miss episode (the Phase 1c-2c behavior,
+         preserved on exactly this disposition).
+
+    Match/mismatch is keyed on `silent_miss_count` (dropped baseline context),
+    NOT full-set inequality — a pure hallucination (extra routed paths) is not
+    a silent miss; it stays tracked by hallucination_count as before. Defensive:
+    any malformed input → `unknown` (never raises)."""
+    try:
+        baseline = set(baseline_paths or [])
+        if len(baseline) < n:
+            return DISPOSITION_VACUOUS_EMPTY
+        corpus = corpus_baselines if corpus_baselines is not None else [baseline_paths]
+        distinct_paths: set[str] = set()
+        for sel in corpus:
+            distinct_paths |= set(sel or [])
+        if len(distinct_paths) < k:
+            return DISPOSITION_VACUOUS_UNIFORM
+        miss = int(comparator_result.get("silent_miss_count", 0))
+        return (DISPOSITION_GENUINE_MISMATCH if miss > 0
+                else DISPOSITION_GENUINE_MATCH)
+    except Exception:  # noqa: BLE001 — never-raise contract (defensive)
+        return DISPOSITION_UNKNOWN
+
+
 def emit_stage_a_shadow_compare(
     *,
     step_idx: int | None,
     routed_paths: list[str],
     baseline_paths: list[str],
     baseline_source: str = "identity",
+    corpus_baselines: list[list[str]] | None = None,
 ) -> dict[str, Any]:
     """Emit the begin/end pair around a Stage A selection comparison.
 
@@ -364,6 +427,14 @@ def emit_stage_a_shadow_compare(
     `"identity"` (non-canary: baseline == routed). A data field on the existing
     shadow_compare kinds (no new VALID_KINDS entry); lets Phase 2 distinguish
     option-a/b episodes when grading rich-context silent_miss.
+
+    v3 Phase 2d Step 2: `disposition` (one of the four enums above plus
+    `unknown`) is recorded on `shadow_compare.end`, and the
+    `stage_a.silent_miss.detected` episode fires only on `genuine-mismatch`
+    (the per-row + per-corpus checks must both pass). `corpus_baselines`
+    defaults to this row alone — the corpus visible at per-row call time; on
+    the empty-context sweep `vacuous-empty` short-circuits before the per-corpus
+    check matters. Phase 2d2 wires the real cross-row corpus.
     """
     emit(
         "stage_a.shadow_compare.begin",
@@ -376,16 +447,21 @@ def emit_stage_a_shadow_compare(
         step_idx=step_idx,
     )
     result = compare_stage_a_selections(routed_paths, baseline_paths)
+    disposition = classify_comparator_disposition(
+        result, list(baseline_paths or []), corpus_baselines=corpus_baselines
+    )
     emit(
         "stage_a.shadow_compare.end",
-        {"step_idx": step_idx, "baseline_source": baseline_source, **result},
+        {"step_idx": step_idx, "baseline_source": baseline_source,
+         "disposition": disposition, **result},
         step_idx=step_idx,
     )
-    if result["silent_miss_count"] > 0:
+    if disposition == DISPOSITION_GENUINE_MISMATCH:
         emit(
             "stage_a.silent_miss.detected",
             {
                 "step_idx": step_idx,
+                "disposition": disposition,
                 "silent_miss_count": result["silent_miss_count"],
                 "baseline_only_paths": result["baseline_only_paths"],
             },

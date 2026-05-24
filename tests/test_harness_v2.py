@@ -945,9 +945,17 @@ class TestSilentMissEpisodes(_HarnessTestBase):
     moment a shadow_compare.end records a non-zero miss (Phase 1 shape)."""
 
     def _ingest_compare_run(self, run_id, silent_miss, *, hallucination=0,
-                            jaccard=1.0):
+                            jaccard=1.0, disposition=None):
         run_dir = self.tmp_path / run_id
         run_dir.mkdir(exist_ok=True)
+        # disposition=None → a legacy (Phase 0-2c) row with no disposition key;
+        # set → a Phase 2d row carrying the disposition field.
+        end_data = {"step_idx": 0, "silent_miss_count": silent_miss,
+                    "hallucination_count": hallucination,
+                    "jaccard_similarity": jaccard,
+                    "baseline_only_paths": [], "routed_only_paths": []}
+        if disposition is not None:
+            end_data["disposition"] = disposition
         evs = [
             _event_row(0, "run.start", {}, run_id=run_id),
             _event_row(10, "planner.stage_a.api_end",
@@ -957,11 +965,7 @@ class TestSilentMissEpisodes(_HarnessTestBase):
             _event_row(11, "stage_a.shadow_compare.begin",
                        {"step_idx": 0, "routed_paths": [], "baseline_paths": []},
                        run_id=run_id, step_idx=0),
-            _event_row(12, "stage_a.shadow_compare.end",
-                       {"step_idx": 0, "silent_miss_count": silent_miss,
-                        "hallucination_count": hallucination,
-                        "jaccard_similarity": jaccard,
-                        "baseline_only_paths": [], "routed_only_paths": []},
+            _event_row(12, "stage_a.shadow_compare.end", end_data,
                        run_id=run_id, step_idx=0),
             _event_row(20, "run.end", {"drops": 0}, run_id=run_id),
         ]
@@ -1005,6 +1009,40 @@ class TestSilentMissEpisodes(_HarnessTestBase):
             "SELECT * FROM silent_miss_episodes WHERE run_id='T9-miss2'"
         ).fetchone()
         self.assertEqual(len(row), len(harness_v2._SILENT_MISS_EPISODES_COLUMNS))
+
+    def test_vacuous_empty_disposition_is_not_an_episode(self) -> None:
+        # v3 Phase 2d Step 2: an explicit vacuous-empty row (the empty-context
+        # sweep shape) is not an episode.
+        self._ingest_compare_run("T9-vac-empty", silent_miss=0,
+                                 disposition="vacuous-empty")
+        rows = self.con.execute(
+            "SELECT * FROM silent_miss_episodes WHERE run_id='T9-vac-empty'"
+        ).fetchall()
+        self.assertEqual(len(rows), 0)
+
+    def test_vacuous_uniform_with_drop_is_not_an_episode(self) -> None:
+        # The hardened gate: a vacuous-uniform row is NOT an episode even with
+        # silent_miss_count > 0 (the old binary view would have surfaced it).
+        # This is what aligns the view with stage_a.silent_miss.detected.
+        self._ingest_compare_run("T9-vac-uniform", silent_miss=1,
+                                 disposition="vacuous-uniform")
+        rows = self.con.execute(
+            "SELECT * FROM silent_miss_episodes WHERE run_id='T9-vac-uniform'"
+        ).fetchall()
+        self.assertEqual(len(rows), 0)
+
+    def test_genuine_mismatch_disposition_is_an_episode(self) -> None:
+        # genuine-mismatch surfaces as an episode and the disposition column is
+        # projected.
+        self._ingest_compare_run("T9-genuine", silent_miss=2, hallucination=0,
+                                 jaccard=0.3, disposition="genuine-mismatch")
+        rows = self.con.execute(
+            "SELECT disposition, silent_miss_count FROM silent_miss_episodes "
+            "WHERE run_id='T9-genuine'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "genuine-mismatch")
+        self.assertEqual(rows[0][1], 2)
 
 
 class TestCacheDiagnosticsView(_HarnessTestBase):

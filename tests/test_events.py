@@ -504,24 +504,131 @@ class TestStageAComparator(_EventsTestBase):
                    if r["kind"] == "stage_a.shadow_compare.end")["data"]
         for f in ("silent_miss_count", "hallucination_count",
                   "jaccard_similarity", "baseline_only_paths",
-                  "routed_only_paths"):
+                  "routed_only_paths", "disposition"):
             self.assertIn(f, end)
         self.assertEqual(end["jaccard_similarity"], 1.0)
+        # v3 Phase 2d Step 2: routed == baseline == {a,b} → 2 distinct paths
+        # (diverse) + no miss → genuine-match.
+        self.assertEqual(end["disposition"], "genuine-match")
 
     def test_emit_pair_silent_miss_fires_detected(self) -> None:
         # Cannot happen in Phase 0 (routed always == baseline), but the
-        # path must exist and fire for Phase 1.
+        # path must exist and fire for Phase 1. baseline {a,b} is 2 distinct
+        # paths → diverse → a drop is graded genuine-mismatch (v3 Phase 2d).
         events.begin_run("r1")
         events.emit_stage_a_shadow_compare(
             step_idx=1, routed_paths=["a"], baseline_paths=["a", "b"],
         )
         events.end_run()
         rows = self._read_events("r1")
+        end = next(r for r in rows
+                   if r["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(end["disposition"], "genuine-mismatch")
         detected = [r for r in rows
                     if r["kind"] == "stage_a.silent_miss.detected"]
         self.assertEqual(len(detected), 1)
         self.assertEqual(detected[0]["data"]["silent_miss_count"], 1)
         self.assertEqual(detected[0]["data"]["baseline_only_paths"], ["b"])
+        self.assertEqual(detected[0]["data"]["disposition"], "genuine-mismatch")
+
+
+class TestComparatorDisposition(_EventsTestBase):
+    """v3 Phase 2d Step 2: the 4-disposition comparator hardening (Q-D4 hybrid,
+    N=1 per-row, K=2 per-corpus). The pure classifier + the emit-path gating of
+    stage_a.silent_miss.detected on genuine-mismatch only."""
+
+    def _classify(self, routed, baseline, **kw):
+        result = events.compare_stage_a_selections(routed, baseline)
+        return events.classify_comparator_disposition(result, baseline, **kw)
+
+    def test_vacuous_empty_on_empty_baseline(self) -> None:
+        # Per-row N=1: an empty baseline is trivial → vacuous-empty (pass).
+        self.assertEqual(self._classify([], []), "vacuous-empty")
+        self.assertEqual(self._classify(["x"], []), "vacuous-empty")
+
+    def test_per_row_short_circuits_per_corpus(self) -> None:
+        # Precedence: an empty baseline returns vacuous-empty even when the
+        # corpus is diverse — the per-corpus check is never reached.
+        self.assertEqual(
+            self._classify([], [], corpus_baselines=[["a"], ["b"], ["c"]]),
+            "vacuous-empty")
+
+    def test_vacuous_uniform_single_path_default_corpus(self) -> None:
+        # Per-corpus K=2: a lone non-empty baseline (default corpus = this row)
+        # holds 1 distinct path < K → no diversity → vacuous-uniform (pass).
+        self.assertEqual(self._classify([], ["a"]), "vacuous-uniform")
+        self.assertEqual(self._classify(["a"], ["a"]), "vacuous-uniform")
+
+    def test_vacuous_uniform_explicit_uniform_corpus(self) -> None:
+        # A corpus whose baselines are all the same single path → 1 distinct
+        # path value across the corpus < K=2 → vacuous-uniform.
+        self.assertEqual(
+            self._classify(["a"], ["a"], corpus_baselines=[["a"], ["a"], ["a"]]),
+            "vacuous-uniform")
+
+    def test_genuine_match_diverse_corpus_no_miss(self) -> None:
+        # Diverse corpus (>=2 distinct paths) + non-trivial baseline + the
+        # routed selection dropped nothing → genuine-match (pass).
+        self.assertEqual(
+            self._classify(["a", "b"], ["a", "b"],
+                           corpus_baselines=[["a"], ["b"]]),
+            "genuine-match")
+
+    def test_genuine_mismatch_diverse_corpus_with_miss(self) -> None:
+        # Diverse corpus + non-trivial baseline + a dropped baseline path →
+        # genuine-mismatch (the only disposition that records a silent miss).
+        self.assertEqual(
+            self._classify(["a"], ["a", "b"], corpus_baselines=[["a"], ["b"]]),
+            "genuine-mismatch")
+
+    def test_hallucination_only_is_not_a_silent_miss(self) -> None:
+        # Match/mismatch keys on dropped context, not full-set inequality: the
+        # routed selection holds an EXTRA path (hallucination) but dropped none
+        # → silent_miss_count 0 → genuine-match, not genuine-mismatch.
+        self.assertEqual(
+            self._classify(["a", "b", "x"], ["a", "b"],
+                           corpus_baselines=[["a"], ["b"]]),
+            "genuine-match")
+
+    def test_unknown_on_malformed_input(self) -> None:
+        # Defensive never-raise: an un-setifiable baseline → unknown.
+        self.assertEqual(
+            events.classify_comparator_disposition({"silent_miss_count": 0},
+                                                   object()),
+            "unknown")
+
+    def test_emit_empty_context_records_vacuous_empty_no_detected(self) -> None:
+        # The Phase 2d exit-sweep shape: routed == baseline == [] → vacuous-empty
+        # recorded explicitly, no silent_miss.detected (Step3C-F1 hardening:
+        # the implicit Phase 1c pass is now explicit).
+        events.begin_run("r1")
+        events.emit_stage_a_shadow_compare(
+            step_idx=0, routed_paths=[], baseline_paths=[])
+        events.end_run()
+        rows = self._read_events("r1")
+        end = next(r for r in rows
+                   if r["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(end["disposition"], "vacuous-empty")
+        self.assertNotIn("stage_a.silent_miss.detected",
+                         [r["kind"] for r in rows])
+
+    def test_emit_vacuous_uniform_with_drop_does_not_fire_detected(self) -> None:
+        # The behaviour CHANGE vs Phase 1c-2c: a single-path baseline the routed
+        # selection dropped (silent_miss_count=1) is vacuous-uniform (no
+        # diversity to grade) → pass, NOT a silent miss. The old binary gate
+        # (silent_miss_count > 0) would have fired here; the hardened gate does
+        # not. Moot on the empty-context corpus (no non-empty baselines exist).
+        events.begin_run("r1")
+        result = events.emit_stage_a_shadow_compare(
+            step_idx=0, routed_paths=[], baseline_paths=["a"])
+        events.end_run()
+        self.assertEqual(result["silent_miss_count"], 1)  # a path WAS dropped
+        rows = self._read_events("r1")
+        end = next(r for r in rows
+                   if r["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(end["disposition"], "vacuous-uniform")
+        self.assertNotIn("stage_a.silent_miss.detected",
+                         [r["kind"] for r in rows])
 
 
 class TestCacheDiagnosticsHelpers(_EventsTestBase):

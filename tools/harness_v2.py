@@ -788,15 +788,21 @@ _CHAMPION_CHALLENGER_COLUMNS: tuple[str, ...] = (
 # v3 Phase 0 Step 3 (V3P0-4): silent_miss_episodes.
 #
 # Per-(run_id, mode, step_idx) episode for each stage_a.shadow_compare.end
-# that recorded a non-zero silent_miss_count — i.e. a Stage A call where
-# the routed selection dropped context the baseline kept. The
-# `WHERE silent_miss_count > 0` filter makes this an EMPTY-SET query in
-# Phase 0 by construction (routed == baseline → silent_miss_count always
-# 0), and it materializes the moment Phase 1 feeds a real cheap-vs-Opus
-# baseline. Reads the events table directly (no new table); events are
-# already (run_id, mode) composite-keyed, so V2P2-2 holds without an
-# ingest change. task_id via the run_metadata join (operations-view
-# pattern; no inline derive_task regex).
+# where the canary genuinely under-contexted — i.e. a Stage A call where
+# the routed selection dropped context the baseline kept.
+#
+# v3 Phase 2d Step 2 (Step3C-F1 hardening): an episode is now a
+# `disposition = 'genuine-mismatch'` row (non-trivial baseline + diverse
+# corpus + silent_miss_count > 0), matching the `stage_a.silent_miss.detected`
+# event's gate exactly — a `vacuous-empty`/`vacuous-uniform` row never counts as
+# an episode even if it dropped a path. Legacy rows (Phase 0-2c, no disposition
+# field) fall back to the original `silent_miss_count > 0` rule, so the view is
+# unchanged on pre-2d DBs. On empty-context corpora every row is vacuous-empty
+# with silent_miss_count 0 → EMPTY-SET either way (Phase 1c/2a/2b/2c parity).
+# Reads the events table directly (no new table); events are already
+# (run_id, mode) composite-keyed, so V2P2-2 holds without an ingest change.
+# task_id via the run_metadata join (operations-view pattern; no inline
+# derive_task regex).
 _SILENT_MISS_EPISODES_VIEW_SQL = """
 CREATE OR REPLACE VIEW silent_miss_episodes AS
 SELECT
@@ -805,17 +811,24 @@ SELECT
     e.mode,
     e.step_idx,
     e.ts,
+    json_extract_string(e.data, '$.disposition') AS disposition,
     CAST(json_extract(e.data, '$.silent_miss_count') AS BIGINT) AS silent_miss_count,
     CAST(json_extract(e.data, '$.hallucination_count') AS BIGINT) AS hallucination_count,
     CAST(json_extract(e.data, '$.jaccard_similarity') AS DOUBLE) AS jaccard_similarity
 FROM events e
 LEFT JOIN run_metadata rm USING (run_id, mode)
 WHERE e.kind = 'stage_a.shadow_compare.end'
-  AND CAST(json_extract(e.data, '$.silent_miss_count') AS BIGINT) > 0
+  AND (
+    json_extract_string(e.data, '$.disposition') = 'genuine-mismatch'
+    OR (
+        json_extract(e.data, '$.disposition') IS NULL
+        AND CAST(json_extract(e.data, '$.silent_miss_count') AS BIGINT) > 0
+    )
+  )
 """
 
 _SILENT_MISS_EPISODES_COLUMNS: tuple[str, ...] = (
-    "run_id", "task_id", "mode", "step_idx", "ts",
+    "run_id", "task_id", "mode", "step_idx", "ts", "disposition",
     "silent_miss_count", "hallucination_count", "jaccard_similarity",
 )
 
