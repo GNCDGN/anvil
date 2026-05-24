@@ -1161,6 +1161,106 @@ class TestPhase1cHistoricalBaseline(_PlannerEventsBase):
         self.assertEqual(ce["baseline_source"], "identity")
 
 
+class TestPhase2cProviderSelectedPaths(unittest.TestCase):
+    """v3 Phase 2c Step 2 (V3P2C-2, Q-A4 discharge): HistoricalBaselineProvider
+    reads `selected_paths` directly (Phase 2a+ baseline DBs, rich-context-ready),
+    falling back to `paths_returned`-reconstruction for legacy DBs that predate
+    Phase 2a recording. Empty-context behaviour identical on both paths."""
+
+    def _make_db(self, rows):
+        # rows: list of (run_id, step_idx, data_dict) — the test controls the
+        # exact `data` shape (with/without selected_paths) to exercise both
+        # the Phase 2a+ direct-read path and the Phase 1a/1b legacy fallback.
+        import duckdb
+        path = Path(tempfile.mkdtemp()) / "baseline.duckdb"
+        con = duckdb.connect(str(path))
+        con.execute(
+            "CREATE TABLE events (run_id VARCHAR, mode VARCHAR, "
+            "step_idx BIGINT, kind VARCHAR, data JSON)")
+        for (run_id, step_idx, data) in rows:
+            con.execute(
+                "INSERT INTO events VALUES (?, 'real', ?, "
+                "'planner.stage_a.parsed', ?)",
+                [run_id, step_idx, json.dumps(data)])
+        con.close()
+        return path
+
+    def test_empty_context_phase2a_path_returns_empty(self) -> None:
+        # Phase 2a+ baseline: selected_paths=[] recorded → returns [] directly.
+        db = self._make_db([("T1-doc-edit-real", 0,
+                             {"step_idx": 0, "paths_returned": 0,
+                              "selected_paths": []})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.lookup("T1-doc-edit", 0), [])
+
+    def test_empty_context_legacy_path_returns_empty(self) -> None:
+        # Legacy DB (Phase 1a/1b): no selected_paths key, paths_returned=0 →
+        # fallback reconstruction → [] (behaviour identical to pre-switch).
+        db = self._make_db([("T1-doc-edit-real", 0,
+                             {"step_idx": 0, "paths_returned": 0})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.lookup("T1-doc-edit", 0), [])
+
+    def test_rich_context_phase2a_path_returns_list_order_preserved(self) -> None:
+        # The forward-readiness proof: a non-empty selected_paths reconstructs
+        # EXACTLY (content + order), which the legacy count path cannot do.
+        sel = ["docs/c.md", "docs/a.md", "docs/b.md"]  # deliberately unsorted
+        db = self._make_db([("T2-two-step-real", 0,
+                             {"step_idx": 0, "paths_returned": 3,
+                              "selected_paths": sel})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.lookup("T2-two-step", 0), sel)  # content + order
+
+    def test_rich_context_legacy_path_returns_none(self) -> None:
+        # Legacy DB, paths_returned>0, no selected_paths → None (can't
+        # reconstruct a list from a count — the failure mode the switch fixes;
+        # caller falls back to the parallel-Opus baseline).
+        db = self._make_db([("T2-two-step-real", 0,
+                             {"step_idx": 0, "paths_returned": 3})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertIsNone(prov.lookup("T2-two-step", 0))
+
+    def test_selected_paths_json_null_falls_back_empty(self) -> None:
+        # Defensive (partial-migration): selected_paths recorded as JSON null →
+        # falls back to paths_returned reconstruction (0 → []).
+        db = self._make_db([("T1-doc-edit-real", 0,
+                             {"step_idx": 0, "paths_returned": 0,
+                              "selected_paths": None})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.lookup("T1-doc-edit", 0), [])
+
+    def test_selected_paths_json_null_nonzero_falls_back_none(self) -> None:
+        # Defensive: selected_paths JSON null + paths_returned>0 → fall back →
+        # None (can't reconstruct from count).
+        db = self._make_db([("T2-two-step-real", 0,
+                             {"step_idx": 0, "paths_returned": 3,
+                              "selected_paths": None})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertIsNone(prov.lookup("T2-two-step", 0))
+
+    def test_phase2a_path_preferred_over_count_mismatch(self) -> None:
+        # selected_paths is authoritative when present: a (hypothetical) row
+        # where the count disagrees still returns the recorded list, not a
+        # count-based reconstruction.
+        db = self._make_db([("T3-out-of-scope-real", 1,
+                             {"step_idx": 1, "paths_returned": 0,
+                              "selected_paths": ["x/y.md"]})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.lookup("T3-out-of-scope", 1), ["x/y.md"])
+
+    def test_missing_row_and_bad_db_still_none(self) -> None:
+        # Regression: the never-raise contract holds through the switch.
+        db = self._make_db([("T1-doc-edit-real", 0,
+                             {"step_idx": 0, "paths_returned": 0,
+                              "selected_paths": []})])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertIsNone(prov.lookup("T9-absent", 0))      # missing row
+        self.assertIsNone(prov.lookup("T1-doc-edit", 5))    # missing step
+        self.assertIsNone(
+            planner_mod.HistoricalBaselineProvider("/no/such.duckdb").lookup("X", 0))
+        self.assertIsNone(planner_mod.HistoricalBaselineProvider(None).lookup("X", 0))
+
+
 class TestSelectedPathsAndRawResponseRecording(_PlannerEventsBase):
     """v3 Phase 2a Step 2 (V3P2A-2): planner.stage_a.parsed records the parsed
     selection LIST (selected_paths — comparator-ready, not just the count), the

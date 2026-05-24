@@ -1263,11 +1263,13 @@ def _split_user_for_brief_cache(user_text: str) -> "list[dict] | str":
 # Stage A selection; Phase 1b ran a live parallel Opus call per canary
 # (option-a, ~$0.083 each). Option-(b) looks that selection up from a prior
 # real sweep instead, dropping the parallel cost. The recorded
-# planner.stage_a.parsed carries paths_returned (a COUNT), not the path list
-# (Step3C-F1) — so the baseline is reconstructed: paths_returned == 0 → ∅
-# (the empty-context corpus, where Opus selects nothing); paths_returned > 0
-# → None (can't reconstruct the set → caller falls back to the parallel call,
-# Step3C-F3 marks recording selected_paths as the Phase 2 prerequisite).
+# planner.stage_a.parsed originally carried paths_returned (a COUNT) only
+# (Step3C-F1) — so the V3P1C-3 baseline was reconstructed: paths_returned == 0
+# → ∅; paths_returned > 0 → None (can't reconstruct the set from a count).
+# v3 Phase 2a (V3P2A-2) discharged Step3C-F3 by recording selected_paths (the
+# list); v3 Phase 2c (V3P2C-2, Q-A4) switches lookup() to read selected_paths
+# directly (rich-context-ready), keeping the count reconstruction only as the
+# legacy fallback for pre-Phase-2a baseline DBs (e.g. the Phase 1b exit-sweep).
 _BASELINE_MODE_SUFFIXES = ("-mock", "-real", "-unknown")
 
 
@@ -1297,12 +1299,20 @@ class HistoricalBaselineProvider:
         self._db_path = Path(db_path) if db_path else None
 
     def lookup(self, task_id: str, step_idx: int) -> "list[str] | None":
-        """Return the reconstructed baseline selection for (task_id, step_idx),
-        or None if it can't be reconstructed (→ caller uses the parallel call).
+        """Return the recorded baseline selection for (task_id, step_idx), or
+        None if it can't be determined (→ caller uses the parallel call).
 
-        Reconstruction (Step3C-F1): the recorded `planner.stage_a.parsed`
-        carries `paths_returned` only. 0 → [] (∅, exact for empty-context);
-        > 0 → None (the path list isn't recorded — Phase 2 must emit it)."""
+        v3 Phase 2c Step 2 (V3P2C-2, Q-A4 discharge): prefer `selected_paths` —
+        the selection LIST recorded on every `planner.stage_a.parsed` event
+        since Phase 2a (V3P2A-2). Read directly, so a non-empty baseline
+        reconstructs EXACTLY (rich-context-ready for Phase 2d), not just ∅
+        inferred from a count. Fall back to the legacy `paths_returned`
+        reconstruction (Step3C-F1: 0 → []; > 0 → None) for baseline DBs that
+        predate Phase 2a recording — the default `ANVIL_HISTORICAL_BASELINE_DB`
+        still points at the Phase 1b exit-sweep, which carries `paths_returned`
+        but not `selected_paths`. Empty-context behaviour is identical on both
+        paths (both → []); the switch is forward-readiness, not a behaviour
+        change on the empty-context corpus. Never raises."""
         if not self._db_path or not self._db_path.is_file():
             return None
         try:
@@ -1310,18 +1320,31 @@ class HistoricalBaselineProvider:
             con = duckdb.connect(str(self._db_path), read_only=True)
             try:
                 row = con.execute(
-                    "SELECT CAST(json_extract(data, '$.paths_returned') AS BIGINT) "
+                    "SELECT json_extract(data, '$.selected_paths'), "
+                    "CAST(json_extract(data, '$.paths_returned') AS BIGINT) "
                     "FROM events WHERE kind = 'planner.stage_a.parsed' "
                     "AND run_id = ? AND mode = 'real' AND step_idx = ? LIMIT 1",
                     [f"{task_id}-real", step_idx],
                 ).fetchone()
             finally:
                 con.close()
-            if row is None or row[0] is None:
+            if row is None:
                 return None
-            if row[0] == 0:
+            selected_paths_json, paths_returned = row[0], row[1]
+            # Phase 2a+ baseline: selected_paths recorded directly (V3P2A-2).
+            # json_extract returns the JSON array text ('[]' or '["a/b.md",…]')
+            # for a recorded list, or SQL NULL (→ Python None) on a legacy DB
+            # whose `parsed` events lack the key.
+            if selected_paths_json is not None:
+                parsed = json.loads(selected_paths_json)
+                if isinstance(parsed, list):
+                    return parsed  # [] or non-empty — exact, rich-context-ready
+                # Defensive (partial-migration / a JSON-null value): fall through
+                # to the legacy count reconstruction below.
+            # Legacy fallback — Phase 1a/1b DBs predate selected_paths recording.
+            if paths_returned == 0:
                 return []
-            return None  # paths_returned > 0: selection set not recorded
+            return None  # rich-context legacy: can't reconstruct a list from a count
         except Exception:  # noqa: BLE001 — never-raise contract
             return None
 
