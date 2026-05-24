@@ -1188,22 +1188,48 @@ _STEP0_REAL_STAGE_EVENTS = [
 ]
 
 
-def _uncached_user_prompt_equiv(input_tokens, cache_read, cache_creation):
-    """Cache-invariant user-prompt token total (Step1C-F1): the system prompt
-    moves between input_tokens and cache_read/creation, so adding them back
-    and subtracting it isolates the user prompt."""
+_MODEL_ID = {  # fixture short label → full model id the accessors expect
+    "opus": "claude-opus-4-7",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+# v3 Phase 2a Step 1 (Q-A5): the 9 Haiku Stage A rows from the Phase 1c Step 4
+# EXIT sweep (all-6 broadened canary → all Stage A ran Haiku; cr=cc=0 — Haiku
+# doesn't cache, Step3.5C-F3). The Opus slope (1.64) gives 0/9 here (overshoot
+# 21–33%); the Haiku-native slope (1.18) + shared intercept (407) + Haiku
+# system constant (2590) gives 9/9 (R²=0.994). Step 4 re-grades a fresh N=9.
+# (stage, model, block_sum, input_tokens, cache_read, cache_creation)
+_PHASE1C_EXIT_HAIKU_STAGE_A = [
+    ("A", "haiku", 488, 3550, 0, 0),    # T1
+    ("A", "haiku", 702, 3818, 0, 0),    # T2 s0
+    ("A", "haiku", 1159, 4365, 0, 0),   # T2 s1
+    ("A", "haiku", 891, 4099, 0, 0),    # T3
+    ("A", "haiku", 738, 3810, 0, 0),    # T4
+    ("A", "haiku", 818, 3962, 0, 0),    # T5 s0
+    ("A", "haiku", 1253, 4473, 0, 0),   # T5 s1
+    ("A", "haiku", 1778, 5087, 0, 0),   # T5 s2
+    ("A", "haiku", 723, 3910, 0, 0),    # T6
+]
+
+
+def _uncached_user_prompt_equiv(model, input_tokens, cache_read, cache_creation):
+    """Cache-invariant user-prompt token total (Step1C-F1): the per-model
+    system prompt moves between input_tokens and cache_read/creation, so adding
+    them back and subtracting it isolates the user prompt. v3 Phase 2a Step 1
+    (Q-A5): the system constant is per-model."""
     return (input_tokens + cache_read + cache_creation
-            - events.PLANNER_SYSTEM_PROMPT_TOKENS)
+            - events.planner_system_prompt_tokens(_MODEL_ID[model]))
 
 
-def _affine_predict(block_sum):
+def _affine_predict(model, block_sum):
+    """Affine prediction at the per-model SLOPE + shared intercept (Q-A5)."""
     return (events.PLANNER_USER_TEMPLATE_TOKENS
-            + block_sum * events.BLOCK_TOKEN_INFLATION_FACTOR)
+            + block_sum * events.block_token_inflation_factor(_MODEL_ID[model]))
 
 
 def _abs_pct_err(stage, model, bsum, inp, cr, cc):
-    equiv = _uncached_user_prompt_equiv(inp, cr, cc)
-    return abs(_affine_predict(bsum) - equiv) / equiv * 100.0
+    equiv = _uncached_user_prompt_equiv(model, inp, cr, cc)
+    return abs(_affine_predict(model, bsum) - equiv) / equiv * 100.0
 
 
 class TestCriterion3SumCheckReframe(unittest.TestCase):
@@ -1211,29 +1237,59 @@ class TestCriterion3SumCheckReframe(unittest.TestCase):
     AFFINE, cache-invariant relation (Step1C-F1):
 
         uncached_user_prompt_equiv ≈ PLANNER_USER_TEMPLATE_TOKENS
-            + block_sum × BLOCK_TOKEN_INFLATION_FACTOR
+            + block_sum × block_token_inflation_factor(model)
 
-    Graded real-only on Opus rows (Step1C-F2). The brief's original
-    pure-multiplicative form is refuted by the Step 0 data (0/17 within ±5%
-    at factor 1.64); the affine form holds (R²≈0.991, 15/17 within ±5%)."""
+    v3 Phase 2a Step 1 (V3P2A-1, Q-A5): graded PER-MODEL and the Opus-only
+    filter (Step1C-F2) is RETIRED. The system constant AND the slope are
+    per-model (Opus 3479/1.64, Haiku 2590/1.18); the intercept (407) is shared.
+    Opus rows hold at slope 1.64 (≥15/17, R²≥0.99); the 9 Haiku exit-sweep rows
+    hold at slope 1.18 (9/9) but 0/9 at the Opus slope — the slope is genuinely
+    per-model, not just the system constant."""
 
     OPUS = [r for r in _STEP0_REAL_STAGE_EVENTS if r[1] == "opus"]
 
-    def test_inflation_and_template_constants_present(self) -> None:
-        # Test 1 (Q8.1): both reframe constants present + documented values.
-        self.assertEqual(events.BLOCK_TOKEN_INFLATION_FACTOR, 1.64)
+    def test_per_model_constants_and_accessors(self) -> None:
+        # Per-model mappings + accessors return the documented values.
+        self.assertEqual(
+            events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL["claude-opus-4-7"], 3479)
+        self.assertEqual(
+            events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL[
+                "claude-haiku-4-5-20251001"], 2590)
+        self.assertEqual(
+            events.BLOCK_TOKEN_INFLATION_FACTOR_BY_MODEL["claude-opus-4-7"], 1.64)
+        self.assertEqual(
+            events.BLOCK_TOKEN_INFLATION_FACTOR_BY_MODEL[
+                "claude-haiku-4-5-20251001"], 1.18)
         self.assertEqual(events.PLANNER_USER_TEMPLATE_TOKENS, 407)
-        self.assertEqual(events.PLANNER_SYSTEM_PROMPT_TOKENS, 3479)
+        self.assertEqual(
+            events.planner_system_prompt_tokens("claude-opus-4-7"), 3479)
+        self.assertEqual(
+            events.planner_system_prompt_tokens("claude-haiku-4-5-20251001"), 2590)
+        self.assertEqual(
+            events.block_token_inflation_factor("claude-opus-4-7"), 1.64)
+        self.assertEqual(
+            events.block_token_inflation_factor("claude-haiku-4-5-20251001"), 1.18)
+
+    def test_unknown_model_falls_back_to_opus_and_registers(self) -> None:
+        # Unknown model → Opus values (conservative) + registered for surfacing
+        # (mirrors unknown_cost_models, V3P1C-4). Known models do NOT register.
+        unknown = "claude-future-99-sumcheck-probe"
+        self.assertEqual(events.planner_system_prompt_tokens(unknown), 3479)
+        self.assertEqual(events.block_token_inflation_factor(unknown), 1.64)
+        self.assertIn(unknown, events.unknown_token_models())
+        self.assertNotIn("claude-opus-4-7", events.unknown_token_models())
+        self.assertNotIn(
+            "claude-haiku-4-5-20251001", events.unknown_token_models())
 
     def test_affine_relation_stage_a_opus(self) -> None:
-        # Test 2 (Q8.2): Stage A Opus rows hold the affine relation.
+        # Opus Stage A rows hold the affine relation at the Opus slope (1.64).
         errs = [_abs_pct_err(*r) for r in self.OPUS if r[0] == "A"]
         self.assertLessEqual(max(errs), 10.0)               # no row off by >10%
         self.assertLessEqual(sum(errs) / len(errs), 5.0)     # mean within ±5%
         self.assertGreaterEqual(sum(1 for e in errs if e <= 5.0), 7)  # ≥7/8
 
     def test_affine_relation_stage_b_opus_and_overall(self) -> None:
-        # Test 3 (Q8.3 + Q-NEW binding grade): Stage B + overall R²/±5%.
+        # Opus Stage B + overall R²/±5% at the Opus slope.
         errs = [_abs_pct_err(*r) for r in self.OPUS if r[0] == "B"]
         self.assertLessEqual(max(errs), 10.0)
         self.assertLessEqual(sum(errs) / len(errs), 5.0)
@@ -1241,39 +1297,72 @@ class TestCriterion3SumCheckReframe(unittest.TestCase):
         # Binding grade: ≥15/17 within ±5% AND R² ≥ 0.99 over all Opus rows.
         all_errs = [_abs_pct_err(*r) for r in self.OPUS]
         self.assertGreaterEqual(sum(1 for e in all_errs if e <= 5.0), 15)
-        ys = [_uncached_user_prompt_equiv(i, cr, cc)
-              for (_, _, b, i, cr, cc) in self.OPUS]
+        ys = [_uncached_user_prompt_equiv(m, i, cr, cc)
+              for (_, m, b, i, cr, cc) in self.OPUS]
         ybar = sum(ys) / len(ys)
         ss_tot = sum((y - ybar) ** 2 for y in ys)
-        ss_res = sum((_uncached_user_prompt_equiv(i, cr, cc) - _affine_predict(b)) ** 2
-                     for (_, _, b, i, cr, cc) in self.OPUS)
+        ss_res = sum((_uncached_user_prompt_equiv(m, i, cr, cc)
+                      - _affine_predict(m, b)) ** 2
+                     for (_, m, b, i, cr, cc) in self.OPUS)
         self.assertGreaterEqual(1 - ss_res / ss_tot, 0.99)
 
+    def test_affine_relation_haiku_at_native_slope(self) -> None:
+        # v3 Phase 2a Step 1 (Q-A5): the 9 Haiku exit-sweep rows hold the affine
+        # relation at the Haiku-native slope (1.18) + shared intercept — 9/9
+        # within ±5%, R² ≥ 0.99 (the Haiku-native fit).
+        errs = [_abs_pct_err(*r) for r in _PHASE1C_EXIT_HAIKU_STAGE_A]
+        self.assertEqual(sum(1 for e in errs if e <= 5.0), 9)  # 9/9
+        self.assertLessEqual(max(errs), 5.0)
+        ys = [_uncached_user_prompt_equiv(m, i, cr, cc)
+              for (_, m, b, i, cr, cc) in _PHASE1C_EXIT_HAIKU_STAGE_A]
+        ybar = sum(ys) / len(ys)
+        ss_tot = sum((y - ybar) ** 2 for y in ys)
+        ss_res = sum((_uncached_user_prompt_equiv(m, i, cr, cc)
+                      - _affine_predict(m, b)) ** 2
+                     for (_, m, b, i, cr, cc) in _PHASE1C_EXIT_HAIKU_STAGE_A)
+        self.assertGreaterEqual(1 - ss_res / ss_tot, 0.99)
+
+    def test_haiku_rows_need_native_slope_not_opus_slope(self) -> None:
+        # v3 Phase 2a Step 1 (Q-A5 — load-bearing): the slope is genuinely
+        # per-model, not just the system constant. Applying the OPUS slope
+        # (1.64) to the Haiku rows (with the correct Haiku system constant)
+        # gives 0/9 — all overshoot >15%. This is why BLOCK_TOKEN_INFLATION_
+        # FACTOR is a per-model mapping, not a single shared 1.64.
+        opus_factor = events.block_token_inflation_factor("claude-opus-4-7")
+        haiku_sys = events.planner_system_prompt_tokens(
+            "claude-haiku-4-5-20251001")
+
+        def opus_slope_err(bsum, inp):
+            equiv = inp - haiku_sys
+            pred = events.PLANNER_USER_TEMPLATE_TOKENS + bsum * opus_factor
+            return abs(pred - equiv) / equiv * 100.0
+
+        errs = [opus_slope_err(r[2], r[3]) for r in _PHASE1C_EXIT_HAIKU_STAGE_A]
+        self.assertEqual(sum(1 for e in errs if e <= 5.0), 0)  # 0/9 at Opus slope
+        self.assertGreater(min(errs), 15.0)
+
     def test_cache_invariant_across_creation_and_read(self) -> None:
-        # Test 4 (Q8.4 / Q5 a-b): a creation-call, a read-call, and an
-        # uncached call with the SAME user prompt all yield the same equiv.
+        # A creation-call, a read-call, and an uncached call with the SAME user
+        # prompt all yield the same equiv (per-model accessor).
         user = 900
-        sys = events.PLANNER_SYSTEM_PROMPT_TOKENS
-        creation = _uncached_user_prompt_equiv(user, 0, sys)     # first call
-        read = _uncached_user_prompt_equiv(user, sys, 0)         # later call
-        uncached = _uncached_user_prompt_equiv(user + sys, 0, 0)  # no caching
+        sys = events.planner_system_prompt_tokens("claude-opus-4-7")
+        creation = _uncached_user_prompt_equiv("opus", user, 0, sys)     # first
+        read = _uncached_user_prompt_equiv("opus", user, sys, 0)         # later
+        uncached = _uncached_user_prompt_equiv("opus", user + sys, 0, 0)  # none
         self.assertEqual(creation, user)
         self.assertEqual(read, user)
         self.assertEqual(uncached, user)
 
-    def test_non_opus_rows_excluded_from_sumcheck(self) -> None:
-        # Test 5 (Q8.5, Step1C-F2 — load-bearing for Phase 2): the Haiku
-        # canary row breaks the relation (different tokeniser; the 3479
-        # system count is Opus-specific), so the sum-check MUST filter Opus.
+    def test_haiku_row_fits_at_per_model_params_retiring_opus_filter(self) -> None:
+        # v3 Phase 2a Step 1 (Q-A5): Phase 1c FILTERED the Haiku row out of the
+        # sum-check (Step1C-F2) because the Opus 3479 constant made its equiv
+        # nonsense (≈71 → ~1600% error). With the per-model system constant
+        # (2590) AND per-model slope (1.18) the SAME row now fits within ±5% —
+        # the Opus-only filter is discharged.
         haiku = next(r for r in _STEP0_REAL_STAGE_EVENTS if r[1] == "haiku")
-        self.assertGreater(_abs_pct_err(*haiku), 100.0)    # wildly off (≈1600%)
-        with_haiku = [_abs_pct_err(*r) for r in _STEP0_REAL_STAGE_EVENTS]
-        opus_only = [_abs_pct_err(*r) for r in self.OPUS]
-        # Including the Haiku row drags the hit-rate below 90%; Opus-only ≥85%.
-        self.assertLess(
-            sum(1 for e in with_haiku if e <= 5.0) / len(with_haiku), 0.90)
-        self.assertGreaterEqual(
-            sum(1 for e in opus_only if e <= 5.0) / len(opus_only), 0.85)
+        bad_equiv = haiku[3] + haiku[4] + haiku[5] - 3479  # old Opus-constant
+        self.assertLess(bad_equiv, 200)                    # the footgun
+        self.assertLessEqual(_abs_pct_err(*haiku), 5.0)    # fits per-model now
 
 
 # v3 Phase 1c Step 2 — narrowed planner-side caching of the brief block.
@@ -1373,12 +1462,12 @@ class TestBriefBlockCaching(_PlannerEventsBase):
     def test_affine_invariant_survives_brief_caching(self) -> None:
         # Q10.8 (Q5): caching moves ~brief tokens from input_tokens to
         # cache_read; the cache-invariant equiv (and the affine relation) is
-        # unchanged with the SAME constants (1.64, 407, 3479).
+        # unchanged with the same per-model constants (Opus 1.64/407/3479 here).
         opus = [r for r in _STEP0_REAL_STAGE_EVENTS if r[1] == "opus"]
         moved = 700  # ~brief tokens that move input_tokens → cache_read post-caching
         for (stage, model, bsum, inp, cr, cc) in opus:
-            pre = _uncached_user_prompt_equiv(inp, cr, cc)
-            post = _uncached_user_prompt_equiv(inp - moved, cr + moved, cc)
+            pre = _uncached_user_prompt_equiv(model, inp, cr, cc)
+            post = _uncached_user_prompt_equiv(model, inp - moved, cr + moved, cc)
             self.assertEqual(pre, post)  # equiv invariant to the token movement
             self.assertEqual(
                 _abs_pct_err(stage, model, bsum, inp, cr, cc),

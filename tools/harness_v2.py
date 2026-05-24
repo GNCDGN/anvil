@@ -43,6 +43,18 @@ import duckdb
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
+# v3 Phase 2a Step 1 (V3P2A-1): the per-model Planner system-prompt token
+# mapping lives canonically in anvil.events; the cache_diagnostics view's
+# per-model uncached_user_prompt_equiv CASE generates from it (single source
+# of truth — replacing the prior hardcoded `- 3479` literal). harness_v2 runs
+# both as a module (tests) and as a script (`python tools/harness_v2.py`); the
+# script path puts tools/ on sys.path[0], not the repo root, so anvil isn't
+# importable without this shim — the same idiom calibration_runner.py uses.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from anvil.events import PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL  # noqa: E402
+
 # Module-scope capture — tests patch via this seam for failure injection.
 _real_write = Path.write_text
 
@@ -95,6 +107,21 @@ def _cost_usd_case_sql() -> str:
             COALESCE(CAST(json_extract(e.data, '$.cache_read_input_tokens') AS BIGINT), 0) * ({_rate_case('cache_read')})
         ) / 1000000.0
     END"""
+
+
+def _system_prompt_tokens_case_sql() -> str:
+    """Build a SQL CASE mapping the event's model → its Planner system-prompt
+    token count, defaulting to Opus for unknown models. Subtracted in the
+    cache_diagnostics uncached_user_prompt_equiv. Single source of truth:
+    anvil.events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL (v3 Phase 2a Step 1,
+    Q-A5 — the system constant is per-model: Opus 3479, Haiku 2590)."""
+    whens = " ".join(
+        f"WHEN '{model}' THEN {tokens}"
+        for model, tokens in PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL.items()
+    )
+    default = PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL["claude-opus-4-7"]
+    return (f"CASE json_extract_string(e.data, '$.model') "
+            f"{whens} ELSE {default} END")
 
 
 def unknown_cost_models(con) -> list[str]:
@@ -796,12 +823,14 @@ _SILENT_MISS_EPISODES_COLUMNS: tuple[str, ...] = (
 # seconds_since_cache_creation is DOUBLE (null on cache_creation calls and
 # before any creation). candidate_block_sizes_sum sums the four canonical
 # blocks. v3 Phase 1c Step 1 (Step1C-F1): the criterion-3 sum-check is the
-# AFFINE relation block_sum × BLOCK_TOKEN_INFLATION_FACTOR (1.64) +
+# AFFINE relation block_sum × block_token_inflation_factor(model) +
 # PLANNER_USER_TEMPLATE_TOKENS (407) ≈ uncached_user_prompt_equiv, where the
 # equiv column (added here) is cache-invariant: input_tokens + cache_read +
-# cache_creation − 3479 (the system prompt, V2P4-4). 3479 is Opus-specific
-# (Step1C-F2) — the `model` column lets consumers grade Opus rows only.
-# task_id via the run_metadata join (operations-view pattern).
+# cache_creation − the per-model system prompt. v3 Phase 2a Step 1 (V3P2A-1,
+# Q-A5): the system constant is PER-MODEL (Opus 3479, Haiku 2590) via an
+# injected CASE — the `model` column lets consumers grade BOTH models at their
+# native slope (Opus 1.64, Haiku 1.18); the Phase 1c Opus-only filter is
+# retired. task_id via the run_metadata join (operations-view pattern).
 _CACHE_DIAGNOSTICS_VIEW_SQL = """
 CREATE OR REPLACE VIEW cache_diagnostics AS
 SELECT
@@ -831,15 +860,17 @@ SELECT
     CAST(json_extract(e.data, '$.cache_creation_input_tokens') AS BIGINT)
         AS cache_creation_input_tokens,
     -- v3 Phase 1c Step 1 (Step1C-F1): cache-invariant uncached-user-prompt
-    -- token equivalent. PLANNER_SYSTEM_PROMPT_TOKENS=3479 (V2P4-4) moves
-    -- between input_tokens and cache_read/creation, so adding them back and
-    -- subtracting the system prompt isolates the user-prompt total. NOTE:
-    -- 3479 is Opus-specific (Step1C-F2) — interpret on Opus rows (model col).
+    -- token equivalent. The Planner system prompt moves between input_tokens
+    -- and cache_read/creation, so adding them back and subtracting it isolates
+    -- the user-prompt total. v3 Phase 2a Step 1 (V3P2A-1, Q-A5): the system
+    -- constant is PER-MODEL (Opus 3479, Haiku 2590) via the injected CASE
+    -- below — so the equiv is honest for BOTH models, not Opus-only. The CASE
+    -- generates from anvil.events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL.
     (
         CAST(json_extract(e.data, '$.input_tokens') AS BIGINT)
       + COALESCE(CAST(json_extract(e.data, '$.cache_read_input_tokens') AS BIGINT), 0)
       + COALESCE(CAST(json_extract(e.data, '$.cache_creation_input_tokens') AS BIGINT), 0)
-      - 3479
+      - (__SYSTEM_PROMPT_TOKENS_CASE__)
     ) AS uncached_user_prompt_equiv
 FROM events e
 LEFT JOIN run_metadata rm USING (run_id, mode)
@@ -849,6 +880,12 @@ WHERE e.kind IN (
     'planner.stage_c.api_end'
 )
 """
+
+# v3 Phase 2a Step 1 (V3P2A-1): inject the per-model system-prompt CASE
+# (anvil.events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL is the single source of
+# truth; mirrors the __COST_USD_CASE__ injection for the operations view).
+_CACHE_DIAGNOSTICS_VIEW_SQL = _CACHE_DIAGNOSTICS_VIEW_SQL.replace(
+    "__SYSTEM_PROMPT_TOKENS_CASE__", _system_prompt_tokens_case_sql())
 
 _CACHE_DIAGNOSTICS_COLUMNS: tuple[str, ...] = (
     "run_id", "task_id", "mode", "step_idx", "stage",

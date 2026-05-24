@@ -17,6 +17,7 @@ from unittest import mock
 from openpyxl import load_workbook
 
 from tools import harness_v2
+from anvil import events
 
 
 _FIX_ROOT = Path(__file__).resolve().parent.parent / "tools" / "fixtures" / "v2-phase-1"
@@ -1100,6 +1101,68 @@ class TestCacheDiagnosticsView(_HarnessTestBase):
         # equiv = input_tokens + cache_read + cache_creation - 3479 = 1500
         self.assertEqual(row[3], 1500)
 
+    def test_uncached_user_prompt_equiv_per_model_haiku(self) -> None:
+        # v3 Phase 2a Step 1 (V3P2A-1, Q-A5): the per-model CASE subtracts the
+        # HAIKU system constant (2590), not the Opus 3479. A Haiku Stage A row
+        # (cr=cc=0 — Haiku doesn't cache, Step3.5C-F3): equiv = 3550 - 2590 =
+        # 960. (At the old Opus-only 3479 it would be a nonsense 71 — the
+        # Step1C-F2 footgun this step fixes.)
+        run_id = "T12-haiku-equiv"
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        blocks = {"brief": 400, "state": 88, "vault_files": 0, "prior_step": 0}
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-haiku-4-5-20251001",
+                        "input_tokens": 3550,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "vault_index_hit": False,
+                        "candidate_user_block_sizes": blocks,
+                        "seconds_since_cache_creation": None, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+        row = self.con.execute(
+            "SELECT model, uncached_user_prompt_equiv "
+            "FROM cache_diagnostics WHERE run_id='T12-haiku-equiv' AND stage='A'"
+        ).fetchone()
+        self.assertEqual(row[0], "claude-haiku-4-5-20251001")
+        self.assertEqual(row[1], 3550 - 2590)   # 960, per-model (NOT 3550-3479)
+
+    def test_uncached_user_prompt_equiv_unknown_model_opus_fallback(self) -> None:
+        # Unknown model → the CASE ELSE branch (Opus 3479, conservative).
+        run_id = "T13-unknown-equiv"
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        blocks = {"brief": 400, "state": 0, "vault_files": 0, "prior_step": 0}
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-future-9", "input_tokens": 4000,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "vault_index_hit": False,
+                        "candidate_user_block_sizes": blocks,
+                        "seconds_since_cache_creation": None, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+        equiv = self.con.execute(
+            "SELECT uncached_user_prompt_equiv FROM cache_diagnostics "
+            "WHERE run_id='T13-unknown-equiv' AND stage='A'"
+        ).fetchone()[0]
+        self.assertEqual(equiv, 4000 - 3479)   # Opus fallback (ELSE branch)
+
     def test_brief_cache_read_pattern_surfaces(self) -> None:
         # v3 Phase 1c Step 2 (Q10.9): the brief cache pattern — cache_creation
         # on step 0 (read=0), cache_read>0 on step 1 (the [system+brief] prefix
@@ -1157,6 +1220,33 @@ class TestCacheDiagnosticsView(_HarnessTestBase):
             "ORDER BY stage"
         ).fetchall()
         self.assertEqual([r[0] for r in rows], ["A", "B"])
+
+
+class TestPerModelSystemPromptTokensSingleSource(unittest.TestCase):
+    """v3 Phase 2a Step 1 (V3P2A-1): the cache_diagnostics per-model
+    system-prompt CASE generates from anvil.events.PLANNER_SYSTEM_PROMPT_
+    TOKENS_BY_MODEL — the single source of truth. harness_v2 IMPORTS the
+    mapping (not a re-hardcoded literal), so the two cannot drift.
+
+    Step-0 audit nuance: exam_harness does NOT consume the token constants
+    (only MODEL_RATES), so the genuine anti-drift mirror is events ↔
+    harness_v2, not the brief-assumed harness_v2 ↔ exam_harness."""
+
+    def test_harness_imports_events_mapping_no_drift(self) -> None:
+        # Same object — single source of truth, structurally drift-proof.
+        self.assertIs(
+            harness_v2.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL,
+            events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL)
+        self.assertEqual(
+            events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL,
+            {"claude-opus-4-7": 3479, "claude-haiku-4-5-20251001": 2590})
+
+    def test_case_sql_covers_every_model_with_opus_default(self) -> None:
+        sql = harness_v2._system_prompt_tokens_case_sql()
+        for model, tokens in events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL.items():
+            self.assertIn(f"WHEN '{model}' THEN {tokens}", sql)
+        opus = events.PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL["claude-opus-4-7"]
+        self.assertIn(f"ELSE {opus} END", sql)
 
 
 class TestPerStageRouteActual(_HarnessTestBase):

@@ -413,49 +413,99 @@ def emit_stage_a_shadow_compare(
 #       cache_creation calls themselves and before any creation is seen.
 # ---------------------------------------------------------------------------
 
-# v2 Phase 4 measured the Planner system prompt at 3,479 tokens via
-# cache_creation_input_tokens (V2P4-4). The criterion-3 sum-check (V3P0-6)
-# subtracts this from the cache-invariant uncached-user-prompt-equivalent
-# (see below). NOTE: this count is Opus-specific — the Haiku canary (Phase
-# 1b) tokenises the same prompt differently, so the sum-check is graded on
-# Opus rows only (Step1C-F2).
-PLANNER_SYSTEM_PROMPT_TOKENS = 3479
-
-# v3 Phase 1c Step 1 (V3P0-6 reframe, Step1C-F1). The criterion-3 sum-check
-# is AFFINE, not pure-multiplicative. The four candidate_user_block_sizes
-# blocks (brief/state/vault_files/prior_step) are chars/4 estimates that
-# deliberately EXCLUDE the fixed user-prompt template scaffolding (V3P0-6),
-# so the honest, cache-invariant relation is:
+# ---------------------------------------------------------------------------
+# Per-model Planner token constants (v3 Phase 2a Step 1, V3P2A-1).
+#
+# The criterion-3 sum-check relates the chars-based candidate_user_block_sizes
+# decomposition to the API's real token counts via the AFFINE, cache-invariant
+# relation (Step1C-F1):
 #
 #   uncached_user_prompt_equiv ≈ PLANNER_USER_TEMPLATE_TOKENS
-#       + block_sum × BLOCK_TOKEN_INFLATION_FACTOR
+#       + block_sum × block_token_inflation_factor(model)
 #
 #   uncached_user_prompt_equiv = input_tokens + cache_read_input_tokens
-#       + cache_creation_input_tokens − PLANNER_SYSTEM_PROMPT_TOKENS
+#       + cache_creation_input_tokens − planner_system_prompt_tokens(model)
 #
 # Cache-invariant: the cached system prompt moves between input_tokens and
 # cache_read/creation, but the sum preserves the user-prompt total — so the
-# relation survives Phase 1c Step 2's user-block caching. The brief specified
-# pure-multiplicative (block_sum × factor ≈ input_tokens − 3479); the Phase
-# 1c Step 0 real-mode Opus data refuted it (0/17 within ±5% at factor 1.64),
-# and the affine form holds (R²=0.991, 15/17 within ±5%). The residual the
-# brief treated as multiplicative drift is the fixed template intercept.
+# relation survives Phase 1c Step 2's user-block caching.
+#
+# BOTH the system-prompt constant AND the inflation factor (the affine SLOPE)
+# are PER-MODEL; the template intercept (PLANNER_USER_TEMPLATE_TOKENS) is
+# SHARED. Phase 2a Step 0 Q-A5 measured this directly: applying the Opus slope
+# (1.64) to the 9 Haiku Stage A rows of the Phase 1c exit-sweep gave 0/9 within
+# ±5% (overshoot 21–33%), but a Haiku-native fit held 9/9 (R²=0.994) at slope
+# 1.18 with the SAME intercept (~408 ≈ 407). The slope encodes chars/token
+# density, which is model-specific (Opus ~3.0, Haiku ~4.0 chars/token on the
+# dense JSON-structured prompt); the intercept is the fixed template
+# scaffolding, which tokenises near-identically across models. So the affine
+# FORM generalises across models; only the slope is per-model. This retired
+# the Phase 1c Opus-only sum-check filter (Step1C-F2 carry-forward).
+#
+# Provenance:
+#   Opus system 3479  — V2P4-4 (cache_creation_input_tokens; count_tokens 3477, Δ2)
+#   Haiku system 2590 — Anthropic count_tokens API, Phase 2a Step 0 Q-A1
+#                       (method validated against the Opus 3477 count)
+#   Opus slope 1.64   — 4/2.44 (V3P0-6 density); Phase 1c Step 0 affine fit
+#   Haiku slope 1.18  — Phase 1c exit-sweep Haiku Stage A fit (N=9, R²=0.994),
+#                       Q-A5. Step 4 grades a fresh N=9 from the Phase 2a exit
+#                       sweep, so the provenance carries forward.
+#   template 407      — Phase 1c Step 0 affine intercept (shared, both models)
+#
+# Unknown models fall back to the Opus values (conservative) and register in
+# unknown_token_models() — mirrors harness_v2.unknown_cost_models() (V3P1C-4),
+# so a Phase 2 new model surfaces explicitly rather than silently defaulting.
+# ---------------------------------------------------------------------------
 
-# chars/4 → real-token inflation. events._estimate_tokens assumes 4
-# chars/token; the real tokeniser runs ~2.44 chars/token on the Planner's
-# dense JSON-structured prompts (V3P0-6 observation), so a chars/4 estimate
-# undercounts true tokens by 4/2.44 ≈ 1.64. Matches the Step 0 affine slope
-# (1.588) within 0.05; the residual is the template intercept below, not
-# slope drift (so we use the principled 1.64, not the 1.95 that fitting a
-# pure-multiplicative form to affine data produces).
-BLOCK_TOKEN_INFLATION_FACTOR = 1.64
+_DEFAULT_TOKEN_MODEL = "claude-opus-4-7"
+
+PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL: dict[str, int] = {
+    "claude-opus-4-7": 3479,
+    "claude-haiku-4-5-20251001": 2590,
+}
+
+BLOCK_TOKEN_INFLATION_FACTOR_BY_MODEL: dict[str, float] = {
+    "claude-opus-4-7": 1.64,
+    "claude-haiku-4-5-20251001": 1.18,
+}
 
 # Fixed user-prompt template scaffolding (instructions / headers / schema
-# reminder / formatting) that wraps the four content blocks and is excluded
-# from candidate_user_block_sizes (V3P0-6) — the user-side analogue of
-# PLANNER_SYSTEM_PROMPT_TOKENS. Derived from the Phase 1c Step 0 affine fit
-# intercept (~407 tokens with slope fixed at 1.64; Step1C-F1).
+# reminder / formatting) wrapping the four content blocks, excluded from
+# candidate_user_block_sizes (V3P0-6). SHARED across models (Q-A5: the
+# intercept generalises; only the slope is per-model).
 PLANNER_USER_TEMPLATE_TOKENS = 407
+
+_unknown_token_models: set[str] = set()
+
+
+def unknown_token_models() -> set[str]:
+    """Models passed to the per-model token accessors that were absent from
+    the mappings (they fell back to the Opus values). Mirrors
+    harness_v2.unknown_cost_models() (V3P1C-4): surfaces cross-model gaps for
+    explicit registration instead of silently defaulting."""
+    return set(_unknown_token_models)
+
+
+def planner_system_prompt_tokens(model: str) -> int:
+    """Per-model Planner system-prompt token count (the quantity subtracted in
+    the cache-invariant uncached_user_prompt_equiv). Unknown model → the Opus
+    value (conservative) + registered in unknown_token_models()."""
+    tokens = PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL.get(model)
+    if tokens is None:
+        _unknown_token_models.add(model)
+        return PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL[_DEFAULT_TOKEN_MODEL]
+    return tokens
+
+
+def block_token_inflation_factor(model: str) -> float:
+    """Per-model chars/4 → real-token inflation (the affine SLOPE). Unknown
+    model → the Opus value (conservative) + registered in
+    unknown_token_models()."""
+    factor = BLOCK_TOKEN_INFLATION_FACTOR_BY_MODEL.get(model)
+    if factor is None:
+        _unknown_token_models.add(model)
+        return BLOCK_TOKEN_INFLATION_FACTOR_BY_MODEL[_DEFAULT_TOKEN_MODEL]
+    return factor
 
 
 def _estimate_tokens(text: str) -> int:
