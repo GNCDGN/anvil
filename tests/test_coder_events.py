@@ -217,12 +217,16 @@ class TestCoderEvents(_CoderEventsBase):
 
 
 class TestCoderRoutingObservability(_CoderEventsBase):
-    """v3 Phase 0 Step 1 (V3P0-1): coder.subprocess.end carries the five
-    routing fields. route_actual is the envelope's model, or "unknown"
-    when the subprocess emits no JSON envelope (every mock-mode row)."""
+    """v3 Phase 0 Step 1 (V3P0-1) + Phase 2b Step 1 (fix): coder.subprocess.end
+    carries the five routing fields. route_actual is the model the CLI ran,
+    derived from the envelope's modelUsage key; "no-envelope" when there's no
+    JSON envelope (every mock-mode row, by construction — Finding M); "unknown"
+    only when an envelope parsed but the model wasn't derivable (diagnostic)."""
 
-    def test_non_json_stdout_route_actual_unknown(self) -> None:
-        # Non-JSON stdout (the MockedCoder shape) → no envelope → "unknown".
+    def test_non_json_stdout_route_actual_no_envelope(self) -> None:
+        # Non-JSON stdout (the MockedCoder shape) → env is None → "no-envelope"
+        # (structural: no JSON envelope to derive a model from — Finding M),
+        # distinct from "unknown" (envelope present, model not derivable).
         def fake_run(cmd, **kw):
             if cmd[:2] == ["git", "-C"]:
                 return _real_run(cmd, **kw)
@@ -236,8 +240,8 @@ class TestCoderRoutingObservability(_CoderEventsBase):
         end = next(e for e in self._events()
                    if e["kind"] == "coder.subprocess.end")
         d = end["data"]
-        self.assertEqual(d["route_actual"], "unknown")
-        self.assertEqual(d["route_candidate"], "unknown")
+        self.assertEqual(d["route_actual"], "no-envelope")
+        self.assertEqual(d["route_candidate"], "no-envelope")
         self.assertFalse(d["route_fallback_fired"])
         self.assertEqual(d["policy_version"], "v3-phase-0-passive")
         fs = d["features_seen"]
@@ -251,9 +255,16 @@ class TestCoderRoutingObservability(_CoderEventsBase):
     def test_json_envelope_route_actual_is_model(self) -> None:
         # A real-shaped JSON envelope carries model + usage → route_actual
         # is that model, observed token count is the three-line sum.
+        # v3 Phase 2b Step 1: the real envelope has NO top-level `model` key —
+        # the model is the KEY of `modelUsage` (the V3P0-1 root cause).
+        # route_actual now derives from there (max-costUSD key).
         envelope = json.dumps({
             "result": "done",
-            "model": "claude-sonnet-4-6",
+            "modelUsage": {
+                "claude-sonnet-4-6": {
+                    "costUSD": 0.012, "inputTokens": 100, "outputTokens": 20,
+                },
+            },
             "total_cost_usd": 0.012,
             "usage": {
                 "input_tokens": 100,
@@ -282,6 +293,31 @@ class TestCoderRoutingObservability(_CoderEventsBase):
         # observed_prompt_token_count = 100 + 30 + 5 = 135.
         self.assertEqual(d["features_seen"]["observed_prompt_token_count"], 135)
         self.assertEqual(d["features_seen"]["stage"], "coder")
+
+    def test_json_envelope_no_modelusage_route_actual_unknown(self) -> None:
+        # Envelope parses (has "result") but has no derivable modelUsage →
+        # route_actual="unknown" (the DIAGNOSTIC branch: envelope present, model
+        # not derivable — a real-mode signal post-Phase-2b, distinct from the
+        # structural "no-envelope"). Finding M three-way split.
+        envelope = json.dumps({
+            "result": "done", "modelUsage": {},
+            "total_cost_usd": 0.0, "usage": {},
+        })
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["git", "-C"]:
+                return _real_run(cmd, **kw)
+            (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            return _proc(0, envelope, "")
+
+        with mock.patch.object(coder.subprocess, "run", side_effect=fake_run):
+            self.coder.execute_step(
+                _plan(files_to_touch=["a.py"]), _brief(self.repo)
+            )
+        d = next(e for e in self._events()
+                 if e["kind"] == "coder.subprocess.end")["data"]
+        self.assertEqual(d["route_actual"], "unknown")
+        self.assertEqual(d["route_candidate"], "unknown")
 
 
 if __name__ == "__main__":

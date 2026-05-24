@@ -303,6 +303,38 @@ def _format_plan(plan_dict: dict) -> str:
     return "\n".join(out)
 
 
+def _derive_coder_model(env: dict | None) -> str | None:
+    """Derive the Coder model from the CLI envelope's `modelUsage` dict.
+
+    v3 Phase 2b Step 1 (V3P0-1 fix): the `claude --output-format json` envelope
+    has no top-level `model` key — the model is the *key* of `modelUsage`. So
+    the Phase 0 `env.get("model")` always returned None, and route_actual was
+    "unknown" on every Coder call since Phase 0. This derives it correctly.
+
+    Returns the max-`costUSD` key (the model that did the most billable work in
+    a multi-model session — Q-B1 locked semantics; a single-model envelope has
+    one key, so it returns that key). Returns None for empty/missing
+    `modelUsage` and for `env is None`. Defensive on malformed entries: a
+    missing `costUSD` is treated as 0.0 (deterministic). Ties resolve to the
+    first max key by Python's stable `max` (insertion order) — stable but
+    implementation-defined; no Phase 2a/2b corpus exercises a multi-model
+    session, so the multi-key path is unit-tested synthetically only.
+
+    The None return is distinguished from envelope-absent at the caller: `env
+    is None` means there was no JSON envelope to parse (MockedCoder's
+    plain-text path, or a subprocess that died before producing stdout) →
+    route_actual="no-envelope"; `env` present but `modelUsage` empty/missing →
+    route_actual="unknown", a real-mode diagnostic signal post-Phase-2b. See
+    Finding M (Step 0 notes).
+    """
+    if env is None:
+        return None
+    model_usage = env.get("modelUsage", {})
+    if not model_usage:
+        return None
+    return max(model_usage.keys(), key=lambda m: model_usage[m].get("costUSD", 0.0))
+
+
 class Coder:
     """Wraps `claude --print` as the Phase 2 Coder agent.
 
@@ -471,10 +503,16 @@ class Coder:
         # JSON support) so mock-mode runs correctly record no Coder cost.
         coder_usage = None
         coder_total_cost_usd = None
-        # v3 Phase 0 Step 1 (V3P0-1): the actual model the claude -p
-        # subprocess ran, read from the JSON envelope's `model` field.
-        # Stays None on the fallback paths (mock mode emits no JSON
-        # envelope, error cases) → the emit records "unknown" there.
+        # v3 Phase 0 Step 1 (V3P0-1) + Phase 2b Step 1 (V3P0-1 fix): the actual
+        # model the claude -p subprocess ran. Phase 0 read the (nonexistent)
+        # top-level `model` key → always None; Phase 2b derives it from the
+        # envelope's `modelUsage` (the model is the KEY — see
+        # _derive_coder_model). `env` is initialised to None here so the emit
+        # site can reference it on the exception paths (timeout / binary-not-
+        # found) where the inner parse never runs — env None there →
+        # route_actual="no-envelope" (structural), distinct from "unknown"
+        # (envelope present, model not derivable). See Finding M.
+        env = None
         coder_model = None
         try:
             proc = self._real_run(cmd, prompt, str(repo))
@@ -493,7 +531,7 @@ class Coder:
                 stdout = env.get("result") or ""
                 coder_usage = env.get("usage")
                 coder_total_cost_usd = env.get("total_cost_usd")
-                coder_model = env.get("model")
+                coder_model = _derive_coder_model(env)
             else:
                 stdout = raw_stdout
         except subprocess.TimeoutExpired as e:
@@ -523,6 +561,21 @@ class Coder:
             exit_code = -3
         duration_s = time.monotonic() - start
 
+        # v3 Phase 2b Step 1 (V3P0-1 fix + Finding M): three-way route_actual,
+        # distinguishing structural envelope-absence from diagnostic failure:
+        #   env is None             → "no-envelope" (no JSON envelope to parse:
+        #                              MockedCoder's plain text, or a subprocess
+        #                              that died before producing stdout)
+        #   env present, model None → "unknown" (envelope parsed but model not
+        #                              derivable — a real-mode diagnostic signal)
+        #   else                    → the derived model (V3P0-1 retired, real path)
+        if env is None:
+            coder_route_actual = "no-envelope"
+        elif coder_model is None:
+            coder_route_actual = "unknown"
+        else:
+            coder_route_actual = coder_model
+
         _events.emit(
             "coder.subprocess.end",
             {
@@ -548,12 +601,14 @@ class Coder:
                     (coder_usage or {}).get("cache_creation_input_tokens"),
                 "cache_read_input_tokens":
                     (coder_usage or {}).get("cache_read_input_tokens"),
-                # v3 Phase 0 Step 1 (V3P0-1): routing observability for the
-                # Coder. route_actual is the subprocess's actual model from
-                # the envelope, or "unknown" when no envelope is present
-                # (every mock-mode row, by construction). observed prompt
-                # size is the sum of the three usage token lines; the
-                # context size is the count of plan paths the step targets.
+                # v3 Phase 0 Step 1 (V3P0-1) + Phase 2b Step 1 (fix): routing
+                # observability for the Coder. route_actual is the model the
+                # CLI ran, derived from the envelope's modelUsage key (Q-B1
+                # max-costUSD); "no-envelope" when there's no JSON envelope
+                # (mock path / dead subprocess), "unknown" when the envelope
+                # parsed but the model wasn't derivable (real-mode diagnostic).
+                # observed prompt size is the sum of the three usage token
+                # lines; context size is the count of plan paths the step targets.
                 **_events.routing_observability(
                     stage="coder",
                     step_idx=step_idx_evt,
@@ -563,7 +618,7 @@ class Coder:
                         + ((coder_usage or {}).get("cache_read_input_tokens") or 0)
                     ),
                     context_paths_count=len(plan_files),
-                    route_actual=(coder_model or "unknown"),
+                    route_actual=coder_route_actual,
                 ),
             },
             step_idx=step_idx_evt,

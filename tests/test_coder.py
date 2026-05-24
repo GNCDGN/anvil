@@ -553,5 +553,55 @@ class CoderInstrumentationTests(unittest.TestCase):
         self.assertIsNone(end["total_cost_usd"])
 
 
+class TestDeriveCoderModel(unittest.TestCase):
+    """v3 Phase 2b Step 1 (V3P0-1 fix, Q-B1): _derive_coder_model picks the
+    max-costUSD key from the envelope's modelUsage (the model is the KEY, not a
+    top-level field). Single-model envelopes have one key; the multi-key path
+    is synthetic — no Phase 2a/2b corpus exercises a multi-model Coder session."""
+
+    def test_single_key_envelope(self) -> None:
+        env = {"modelUsage": {"claude-haiku-4-5-20251001": {"costUSD": 0.037}}}
+        self.assertEqual(
+            coder._derive_coder_model(env), "claude-haiku-4-5-20251001")
+
+    def test_multi_key_returns_max_cost(self) -> None:
+        env = {"modelUsage": {
+            "claude-haiku-4-5-20251001": {"costUSD": 0.05},
+            "claude-opus-4-7": {"costUSD": 0.10},
+        }}
+        self.assertEqual(coder._derive_coder_model(env), "claude-opus-4-7")
+
+    def test_tied_cost_is_deterministic(self) -> None:
+        # Tie → Python's max returns the FIRST max by insertion order
+        # (stable-but-implementation-defined; documented in the helper). Assert
+        # determinism + first-max, not a semantic guarantee on which model wins.
+        env = {"modelUsage": {
+            "model-a": {"costUSD": 0.05}, "model-b": {"costUSD": 0.05}}}
+        r1 = coder._derive_coder_model(env)
+        self.assertEqual(r1, coder._derive_coder_model(env))   # deterministic
+        self.assertEqual(r1, "model-a")                        # first-max
+
+    def test_empty_modelusage_returns_none(self) -> None:
+        self.assertIsNone(coder._derive_coder_model({"modelUsage": {}}))
+
+    def test_missing_modelusage_returns_none(self) -> None:
+        self.assertIsNone(coder._derive_coder_model({}))
+
+    def test_missing_costusd_defaults_zero(self) -> None:
+        # A single entry without costUSD → 0.0 default; still returns its key.
+        self.assertEqual(
+            coder._derive_coder_model({"modelUsage": {"some-model": {}}}),
+            "some-model")
+
+    def test_missing_costusd_loses_to_priced_key(self) -> None:
+        env = {"modelUsage": {"unpriced": {}, "priced": {"costUSD": 0.01}}}
+        self.assertEqual(coder._derive_coder_model(env), "priced")
+
+    def test_env_none_returns_none(self) -> None:
+        # Mock path / dead subprocess: no JSON envelope → env is None → None
+        # (the caller maps this to "no-envelope", distinct from "unknown").
+        self.assertIsNone(coder._derive_coder_model(None))
+
+
 if __name__ == "__main__":
     unittest.main()
