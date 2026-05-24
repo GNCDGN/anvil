@@ -74,6 +74,13 @@ TASK_LABELS = {
     # _reconcile_paths fall-through fix (V2P2-4) — a step that creates a
     # strictly-new file must reach the Coder, not escalate at preflight.
     "T6": "write-new",
+    # v3 Phase 3 sub-build 3a: rich-context calibration tasks (--tasks opt-in).
+    "T7": "rich-clear",
+    "T8": "rich-twin",
+    "T9": "rich-scoped",
+    "T10": "rich-scoped-twin",
+    "T11": "rich-dependency",
+    "T12": "rich-distractor",
 }
 
 # Per-task auto-reply for AUTO_REPLY_FOR_CALIBRATION:
@@ -88,6 +95,14 @@ AUTO_REPLIES = {
     "T5": "go",
     # T6 write-new: a clean create, proceed.
     "T6": "go",
+    # v3 Phase 3 3a: rich-context tasks are clean edits; the disposition
+    # signal lives in the Stage A selection, not control flow — all proceed.
+    "T7": "go",
+    "T8": "go",
+    "T9": "go",
+    "T10": "go",
+    "T11": "go",
+    "T12": "go",
 }
 
 # Pre-estimated real-mode cost per task (USD, 1.3× safety margin applied
@@ -101,6 +116,14 @@ ESTIMATES_USD = {
     "T4": 1.25,
     "T5": 3.75,
     "T6": 1.25,  # 1 Stage A + 1 Stage B + 1 Coder; T1-sized single-step.
+    # v3 Phase 3 3a: conservative pre-check guard (1.3x margin), NOT the
+    # actual (~$0.17/task). Exit gate grades against ~$1.02 ± noise actuals.
+    "T7": 1.25,
+    "T8": 1.25,
+    "T9": 1.25,
+    "T10": 1.25,
+    "T11": 1.25,
+    "T12": 1.25,
 }
 
 ANVIL_REPO = Path(__file__).resolve().parent.parent
@@ -152,6 +175,117 @@ SEED_FILES: dict[str, tuple[tuple[str, str], ...]] = {
     # seed their planned files as placeholders.
     "T6": (
         ("README.md", "# T6 write-new target\n"),
+    ),
+    # v3 Phase 3 sub-build 3a: rich-context calibration tasks T7-T12. Each
+    # seeds the file(s) its brief's scope.files names so preflight finds
+    # them; the designed edit is a single clean change per the brief Goal +
+    # the vault context note. Seeds use # comments (no docstrings) so they
+    # nest in these triple-quoted values without a """ conflict.
+    "T7": (
+        ("config.py", """\
+# Runtime configuration constants.
+
+LOG_LEVEL = "info"
+TIMEOUT_SECONDS = 30
+MAX_RETRIES = 3
+CACHE_TTL_SECONDS = 300
+"""),
+    ),
+    "T8": (
+        ("parser.py", """\
+# Contact record parser.
+
+
+def parse_record(record):
+    # Parse a raw record dict into a normalised contact dict.
+    parsed = {}
+    parsed["name"] = record.get("name")
+    parsed["phone"] = record.get("phone")
+    return parsed
+"""),
+    ),
+    "T9": (
+        ("service.py", """\
+# Order domain services.
+
+
+class OrderService:
+    def __init__(self):
+        self._orders = {}
+
+    def create(self, items):
+        order_id = len(self._orders) + 1
+        self._orders[order_id] = {"id": order_id, "items": items, "state": "new"}
+        return self._orders[order_id]
+
+    def get(self, order_id):
+        return self._orders[order_id]
+
+    def mark_paid(self, order_id):
+        self._orders[order_id]["state"] = "paid"
+        return self._orders[order_id]
+"""),
+    ),
+    "T10": (
+        ("cli.py", """\
+# Command-line interface handlers.
+
+
+def cmd_list(args):
+    print("list")
+
+
+def cmd_show(args):
+    print("show")
+
+
+def cmd_status(args):
+    raise NotImplementedError("status handler not implemented")
+"""),
+    ),
+    "T11": (
+        ("core.py", """\
+# Aggregate computation.
+
+
+def compute(values):
+    # Reduce a list of floats to their mean.
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+"""),
+        ("caller.py", """\
+# Reporting caller for compute().
+
+from core import compute
+
+
+def summarise(rows):
+    # Build the figure list and report the aggregate.
+    values = [float(r) for r in rows]
+    return compute(values)
+"""),
+    ),
+    "T12": (
+        ("auth_token.py", """\
+# Access-token helpers.
+
+
+def refresh_token(token):
+    # Issue a new access token from a valid refresh token.
+    _validate(token)
+    expires_in = 900
+    return {"access_token": _mint(token), "expires_in": expires_in}
+
+
+def _validate(token):
+    if not token:
+        raise ValueError("invalid refresh token")
+
+
+def _mint(token):
+    return "access-" + token
+"""),
     ),
 }
 
