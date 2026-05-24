@@ -138,6 +138,24 @@ class TestMockedPlannerCallAnthropic(_MockedTestBase):
         self.assertEqual(ends[0]["data"]["output_tokens"], 115)
         self.assertTrue(ends[0]["data"]["ok"])
 
+    def test_plan_step_records_selected_paths_and_raw_response(self) -> None:
+        # v3 Phase 2a Step 2 (V3P2A-2 / Step2-2a-F1): MockedPlanner overrides
+        # ONLY _call_anthropic and inherits plan_step, so the parsed emit
+        # carries the three new fields from the fixture's parse — no mocked.py
+        # change needed (the parallel-wire is the shared emit, not a mock copy).
+        os.environ["MOCKED_TASK_ID"] = "T1"
+        p = MockedPlanner(model="claude-opus-4-7")
+        brief, state = _brief_and_state("T1")
+        p.plan_step(brief, state, 0)
+        parsed = next(e for e in self._events()
+                      if e["kind"] == "planner.stage_a.parsed")["data"]
+        self.assertIsInstance(parsed["selected_paths"], list)
+        self.assertEqual(parsed["selected_paths"], [])   # empty-context fixture
+        self.assertEqual(parsed["paths_returned"], len(parsed["selected_paths"]))
+        self.assertIsInstance(parsed["raw_response_text"], str)
+        self.assertGreater(len(parsed["raw_response_text"]), 0)  # the fixture text
+        self.assertFalse(parsed["truncated"])
+
     def test_stage_b_emits_correct_kind(self) -> None:
         os.environ["MOCKED_TASK_ID"] = "T2"
         p = MockedPlanner(model="claude-opus-4-7")

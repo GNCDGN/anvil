@@ -1161,6 +1161,120 @@ class TestPhase1cHistoricalBaseline(_PlannerEventsBase):
         self.assertEqual(ce["baseline_source"], "identity")
 
 
+class TestSelectedPathsAndRawResponseRecording(_PlannerEventsBase):
+    """v3 Phase 2a Step 2 (V3P2A-2): planner.stage_a.parsed records the parsed
+    selection LIST (selected_paths — comparator-ready, not just the count), the
+    model's pre-parser response (raw_response_text, truncated to
+    RAW_RESPONSE_MAX_CHARS), and a truncated flag. Additive on the existing kind
+    (VALID_KINDS stays 51). paths_returned is retained and equals
+    len(selected_paths)."""
+
+    def _parsed_after_stage_a(self, stage_a_text, *, vault_index=None):
+        # Inject a synthetic vault_index (keyed by path; the parser only checks
+        # membership) so a selection can be non-empty without files on disk —
+        # _load_files is never-raise on missing files, and the parsed emit
+        # fires before Stage B anyway.
+        if vault_index is not None:
+            self.planner._vault_index_cache["planner-events-test"] = vault_index
+        side = _make_fake({"A": [stage_a_text], "B": [_STAGE_B_VALID]})
+        with mock.patch.object(
+            Planner, "_call_anthropic", autospec=True, side_effect=side,
+        ):
+            self.planner.plan_step(self.brief, self.state, 0)
+        return next(e for e in self._events_for()
+                    if e["kind"] == "planner.stage_a.parsed")["data"]
+
+    def test_selected_paths_records_parser_postfilter_content(self) -> None:
+        # 3 in-index + 1 out-of-index + 1 duplicate → selected_paths is the 3
+        # in-index entries, deduplicated, order preserved (parser contract).
+        vidx = {"docs/a.md": {}, "docs/b.md": {}, "docs/c.md": {}}
+        text = "docs/c.md\ndocs/a.md\ndocs/b.md\nX/not-in-index.md\ndocs/c.md\n"
+        d = self._parsed_after_stage_a(text, vault_index=vidx)
+        self.assertEqual(d["selected_paths"], ["docs/c.md", "docs/a.md", "docs/b.md"])
+        self.assertEqual(d["paths_returned"], 3)
+        self.assertEqual(d["paths_returned"], len(d["selected_paths"]))  # invariant
+        self.assertEqual(d["raw_response_text"], text)   # original, untruncated
+        self.assertFalse(d["truncated"])
+
+    def test_selected_paths_equals_parser_output(self) -> None:
+        # selected_paths matches _parse_stage_a_response exactly (the recorded
+        # list IS the parser's post-filter output, criterion 1).
+        vidx = {"docs/a.md": {}, "docs/b.md": {}}
+        text = "docs/b.md\ndocs/a.md\nZ/drop.md\n"
+        expected = planner_mod._parse_stage_a_response(text, vidx)
+        d = self._parsed_after_stage_a(text, vault_index=vidx)
+        self.assertEqual(d["selected_paths"], expected)
+
+    def test_empty_selection_records_empty_list_not_null(self) -> None:
+        # Out-of-index paths → selected_paths == [] (a list, never null/omitted).
+        vidx = {"docs/a.md": {}}
+        text = "X/nope-1.md\nY/nope-2.md\n"
+        d = self._parsed_after_stage_a(text, vault_index=vidx)
+        self.assertEqual(d["selected_paths"], [])
+        self.assertIsNotNone(d["selected_paths"])
+        self.assertEqual(d["paths_returned"], 0)
+        self.assertFalse(d["truncated"])
+
+    def test_empty_raw_response_invariants_hold(self) -> None:
+        # The model returned nothing: raw_response_text == "", selected == [],
+        # paths_returned == 0, truncated False — every invariant holds.
+        d = self._parsed_after_stage_a("")
+        self.assertEqual(d["selected_paths"], [])
+        self.assertEqual(d["paths_returned"], 0)
+        self.assertEqual(d["raw_response_text"], "")
+        self.assertFalse(d["truncated"])
+
+    def test_raw_response_truncated_over_limit(self) -> None:
+        text = "z" * (events.RAW_RESPONSE_MAX_CHARS + 5000)
+        d = self._parsed_after_stage_a(text)
+        self.assertTrue(d["truncated"])
+        self.assertEqual(len(d["raw_response_text"]), events.RAW_RESPONSE_MAX_CHARS)
+        self.assertEqual(d["raw_response_text"], text[:events.RAW_RESPONSE_MAX_CHARS])
+        self.assertEqual(d["selected_paths"], [])   # selection still recorded
+        self.assertEqual(d["paths_returned"], 0)
+
+
+class TestRawResponseTruncationHelper(unittest.TestCase):
+    """v3 Phase 2a Step 2 (V3P2A-2): the _truncate_raw_response contract +
+    RAW_RESPONSE_MAX_CHARS. Truncation slices the DECODED Python string, so it
+    cuts on a character boundary — never a split UTF-8 codepoint (Q-A2)."""
+
+    def test_limit_constant(self) -> None:
+        self.assertEqual(events.RAW_RESPONSE_MAX_CHARS, 16384)
+
+    def test_under_limit_unchanged(self) -> None:
+        text = "a/b.md\nc/d.md"
+        self.assertEqual(events._truncate_raw_response(text), (text, False))
+
+    def test_exactly_at_limit_not_truncated(self) -> None:
+        text = "z" * events.RAW_RESPONSE_MAX_CHARS
+        out, trunc = events._truncate_raw_response(text)
+        self.assertEqual(out, text)
+        self.assertFalse(trunc)
+
+    def test_one_over_limit_truncated(self) -> None:
+        text = "z" * (events.RAW_RESPONSE_MAX_CHARS + 1)
+        out, trunc = events._truncate_raw_response(text)
+        self.assertEqual(len(out), events.RAW_RESPONSE_MAX_CHARS)
+        self.assertTrue(trunc)
+        self.assertEqual(out, text[:events.RAW_RESPONSE_MAX_CHARS])
+
+    def test_empty_and_none(self) -> None:
+        self.assertEqual(events._truncate_raw_response(""), ("", False))
+        self.assertEqual(events._truncate_raw_response(None), ("", False))
+
+    def test_multibyte_char_boundary_safe(self) -> None:
+        # Multibyte codepoints past the limit: slicing the decoded string keeps
+        # exactly N codepoints, each intact (re-encodes to valid UTF-8) — never
+        # a split 2-byte 'é'.
+        text = "é" * (events.RAW_RESPONSE_MAX_CHARS + 100)
+        out, trunc = events._truncate_raw_response(text)
+        self.assertTrue(trunc)
+        self.assertEqual(len(out), events.RAW_RESPONSE_MAX_CHARS)
+        self.assertEqual(out, "é" * events.RAW_RESPONSE_MAX_CHARS)
+        out.encode("utf-8")  # must not raise — every codepoint intact
+
+
 # v3 Phase 1c Step 1 (criterion-3 sum-check reframe). The affine relation is
 # validated against the ACTUAL Phase 1c Step 0 real-mode Opus Stage A/B
 # events, captured inline because state/ is gitignored so the transient

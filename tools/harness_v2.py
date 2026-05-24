@@ -336,6 +336,9 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     # v3 Phase 0 Step 4 (V3P0-6): cache_diagnostics reads the events
     # table + run_metadata; the three cache-family lines per Planner stage.
     con.execute(_CACHE_DIAGNOSTICS_VIEW_SQL)
+    # v3 Phase 2a Step 2 (V3P2A-2): stage_a_selections exposes the recorded
+    # selection list + raw response for the Phase 2c rich-context comparator.
+    con.execute(_STAGE_A_SELECTIONS_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +896,42 @@ _CACHE_DIAGNOSTICS_COLUMNS: tuple[str, ...] = (
     "seconds_since_cache_creation", "candidate_block_sizes_sum",
     "input_tokens", "model", "cache_read_input_tokens",
     "cache_creation_input_tokens", "uncached_user_prompt_equiv",
+)
+
+
+# v3 Phase 2a Step 2 (V3P2A-2): stage_a_selections.
+#
+# Exposes the Step 2 recording substrate per Stage A parse: the selection LIST
+# (selected_paths — the in-index, deduplicated paths Stage B loads, recorded so
+# a Phase 2c comparator can grade Haiku vs Opus on selection CONTENT, not just
+# count) plus the model's pre-parser response (raw_response_text + truncated).
+# These live in the events.data JSON — the schemaless event payload, same store
+# as candidate_user_block_sizes — so the ingest path needs no per-field column
+# (the round-trip is automatic). This view projects them via json_extract;
+# selected_paths round-trips as a JSON array (content + order preserved).
+# paths_returned is retained and equals len(selected_paths) (Step 2 invariant).
+_STAGE_A_SELECTIONS_VIEW_SQL = """
+CREATE OR REPLACE VIEW stage_a_selections AS
+SELECT
+    e.run_id,
+    rm.task_id,
+    e.mode,
+    e.step_idx,
+    CAST(json_extract(e.data, '$.paths_returned') AS BIGINT) AS paths_returned,
+    json_extract(e.data, '$.selected_paths') AS selected_paths,
+    json_extract_string(e.data, '$.raw_response_text') AS raw_response_text,
+    CAST(json_extract(e.data, '$.truncated') AS BOOLEAN) AS truncated,
+    CAST(json_extract(e.data, '$.paths_dropped_as_hallucinated') AS BIGINT)
+        AS paths_dropped_as_hallucinated
+FROM events e
+LEFT JOIN run_metadata rm USING (run_id, mode)
+WHERE e.kind = 'planner.stage_a.parsed'
+"""
+
+_STAGE_A_SELECTIONS_COLUMNS: tuple[str, ...] = (
+    "run_id", "task_id", "mode", "step_idx", "paths_returned",
+    "selected_paths", "raw_response_text", "truncated",
+    "paths_dropped_as_hallucinated",
 )
 
 

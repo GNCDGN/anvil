@@ -508,6 +508,29 @@ def block_token_inflation_factor(model: str) -> float:
     return factor
 
 
+# v3 Phase 2a Step 2 (V3P2A-2): raw Stage A response recording. The model's
+# pre-parser response is recorded on planner.stage_a.parsed as raw_response_text
+# (+ a truncated:bool flag), so a future rich-context comparator (Phase 2c) can
+# grade on the model's INTENT, not just the parser's post-filter result. Q-A2:
+# the empirical max Stage A response on the empty-context corpus is ~720 chars
+# (mock) / ~280 (real); 16384 clears that ~22× while bounding per-event payload
+# at ~16KB for the rich-context future. The cap protects the cache_diagnostics
+# / per_task_comparison join surfaces and the DuckDB ingest path (R2).
+RAW_RESPONSE_MAX_CHARS = 16384
+
+
+def _truncate_raw_response(text: str) -> tuple[str, bool]:
+    """Truncate a raw model response to RAW_RESPONSE_MAX_CHARS for recording.
+
+    Returns (recorded_text, truncated). The slice is on the DECODED Python
+    string (`text[:N]`), so it cuts on a character boundary and can never split
+    a UTF-8 codepoint — UTF-8 safety by construction. `truncated` is True iff
+    the original exceeded the limit; when False the recorded text is identical
+    to the input. Single source of truth for the truncation contract."""
+    text = text or ""
+    return text[:RAW_RESPONSE_MAX_CHARS], len(text) > RAW_RESPONSE_MAX_CHARS
+
+
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars/token (the standard heuristic).
 

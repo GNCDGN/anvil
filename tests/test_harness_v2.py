@@ -1249,6 +1249,83 @@ class TestPerModelSystemPromptTokensSingleSource(unittest.TestCase):
         self.assertIn(f"ELSE {opus} END", sql)
 
 
+class TestStageASelectionsView(_HarnessTestBase):
+    """v3 Phase 2a Step 2 (V3P2A-2): stage_a_selections exposes the recorded
+    selection list + raw response. selected_paths/raw_response_text/truncated
+    live in the events.data JSON (no per-field ingest column — same store as
+    candidate_user_block_sizes); the view projects them. The list round-trips
+    as a JSON array: content AND order preserved."""
+
+    def _ingest_parsed(self, run_id, *, selected, raw, truncated, dropped=0):
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.parsed",
+                       {"step_idx": 0, "paths_returned": len(selected),
+                        "paths_dropped_as_hallucinated": dropped,
+                        "selected_paths": selected,
+                        "raw_response_text": raw, "truncated": truncated},
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+    def test_selected_paths_roundtrip_content_and_order(self) -> None:
+        sel = ["docs/c.md", "docs/a.md", "docs/b.md"]  # deliberately not sorted
+        self._ingest_parsed("T20-sel", selected=sel,
+                            raw="docs/c.md\ndocs/a.md\ndocs/b.md", truncated=False)
+        row = self.con.execute(
+            "SELECT selected_paths, paths_returned FROM stage_a_selections "
+            "WHERE run_id='T20-sel'").fetchone()
+        self.assertEqual(json.loads(row[0]), sel)   # content AND order preserved
+        self.assertEqual(row[1], 3)
+
+    def test_empty_selection_roundtrips_as_empty_list(self) -> None:
+        self._ingest_parsed("T21-empty", selected=[], raw="", truncated=False)
+        row = self.con.execute(
+            "SELECT selected_paths, paths_returned FROM stage_a_selections "
+            "WHERE run_id='T21-empty'").fetchone()
+        self.assertEqual(json.loads(row[0]), [])     # [] not null
+        self.assertEqual(row[1], 0)
+
+    def test_raw_response_and_truncated_false_roundtrip(self) -> None:
+        self._ingest_parsed("T22-raw", selected=[], raw="the model said this",
+                            truncated=False)
+        row = self.con.execute(
+            "SELECT raw_response_text, truncated FROM stage_a_selections "
+            "WHERE run_id='T22-raw'").fetchone()
+        self.assertEqual(row[0], "the model said this")
+        self.assertIs(row[1], False)
+
+    def test_truncated_flag_true_roundtrips(self) -> None:
+        self._ingest_parsed("T23-trunc", selected=[], raw="z" * 16384,
+                            truncated=True)
+        row = self.con.execute(
+            "SELECT truncated, length(raw_response_text) FROM stage_a_selections "
+            "WHERE run_id='T23-trunc'").fetchone()
+        self.assertIs(row[0], True)
+        self.assertEqual(row[1], 16384)
+
+    def test_paths_returned_equals_selected_len_at_view(self) -> None:
+        self._ingest_parsed("T24-inv", selected=["a.md", "b.md"],
+                            raw="a.md\nb.md", truncated=False)
+        row = self.con.execute(
+            "SELECT paths_returned, json_array_length(selected_paths) "
+            "FROM stage_a_selections WHERE run_id='T24-inv'").fetchone()
+        self.assertEqual(row[0], row[1])   # back-compat invariant at the view
+
+    def test_columns_match_declared_tuple(self) -> None:
+        self._ingest_parsed("T25-cols", selected=["a.md"], raw="a.md",
+                            truncated=False)
+        row = self.con.execute(
+            "SELECT * FROM stage_a_selections WHERE run_id='T25-cols'").fetchone()
+        self.assertEqual(len(row), len(harness_v2._STAGE_A_SELECTIONS_COLUMNS))
+
+
 class TestPerStageRouteActual(_HarnessTestBase):
     """v3 Phase 1a Step 1: the operations view surfaces route_actual
     distinctly per stage now that a Planner can route Stage C to a

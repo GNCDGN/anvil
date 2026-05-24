@@ -270,12 +270,26 @@ class Planner:
             ln.strip() for ln in stage_a_resp.splitlines() if ln.strip()
         ]
         dropped = max(0, len(raw_lines) - len(selected))
+        # v3 Phase 2a Step 2 (V3P2A-2): record the parsed selection LIST
+        # (selected_paths — comparator-ready, not just the count) and the
+        # model's pre-parser response (raw_response_text, truncated to
+        # RAW_RESPONSE_MAX_CHARS + a truncated flag). selected_paths is always a
+        # list ([] when empty, never null — Q-A4); paths_returned (the count) is
+        # retained for back-compat and equals len(selected_paths). The same emit
+        # runs on the mock path (MockedPlanner overrides only _call_anthropic
+        # and inherits plan_step), so the fields carry the mock fixture's parsed
+        # selection + text — no mocked.py change needed (Step2-2a-F1).
+        raw_response_text, raw_truncated = _events._truncate_raw_response(
+            stage_a_resp)
         _events.emit(
             "planner.stage_a.parsed",
             {
                 "step_idx": step_idx,
                 "paths_returned": len(selected),
                 "paths_dropped_as_hallucinated": dropped,
+                "selected_paths": list(selected),
+                "raw_response_text": raw_response_text,
+                "truncated": raw_truncated,
             },
             step_idx=step_idx,
         )
