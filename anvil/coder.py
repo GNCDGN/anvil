@@ -503,6 +503,18 @@ class Coder:
         # JSON support) so mock-mode runs correctly record no Coder cost.
         coder_usage = None
         coder_total_cost_usd = None
+        # v3 Phase 2b Step 2: additional envelope fields (Q-B2 — all on
+        # coder.subprocess.end.data, no new kind). Defaults are mock-safe: on
+        # the env-is-None path (mock / dead subprocess) they record as
+        # {}/None/[] (honest "no envelope to read"), populated from the envelope
+        # only in the result branch below. usage.iterations stays inside
+        # coder_usage (Q-B4) — surfaced by the coder_envelope view, not re-emitted.
+        coder_model_usage = {}
+        coder_num_turns = None
+        coder_is_error = None
+        coder_stop_reason = None
+        coder_subtype = None
+        coder_permission_denials = []
         # v3 Phase 0 Step 1 (V3P0-1) + Phase 2b Step 1 (V3P0-1 fix): the actual
         # model the claude -p subprocess ran. Phase 0 read the (nonexistent)
         # top-level `model` key → always None; Phase 2b derives it from the
@@ -532,6 +544,15 @@ class Coder:
                 coder_usage = env.get("usage")
                 coder_total_cost_usd = env.get("total_cost_usd")
                 coder_model = _derive_coder_model(env)
+                # v3 Phase 2b Step 2: defensive .get — the envelope is
+                # CLI-version-dependent (captured on CLI 2.1.150); a future
+                # version omitting a field falls back to the mock-safe default.
+                coder_model_usage = env.get("modelUsage", {}) or {}
+                coder_num_turns = env.get("num_turns")
+                coder_is_error = env.get("is_error", False)
+                coder_stop_reason = env.get("stop_reason")
+                coder_subtype = env.get("subtype")
+                coder_permission_denials = env.get("permission_denials", []) or []
             else:
                 stdout = raw_stdout
         except subprocess.TimeoutExpired as e:
@@ -601,6 +622,17 @@ class Coder:
                     (coder_usage or {}).get("cache_creation_input_tokens"),
                 "cache_read_input_tokens":
                     (coder_usage or {}).get("cache_read_input_tokens"),
+                # v3 Phase 2b Step 2: five additional envelope fields (Q-B2 —
+                # all on .data, no new kind). Q-B3: model_usage carries per-model
+                # costUSD as ADDITIONAL attribution; total_cost_usd above stays
+                # the operations-view cost-CASE source (V2P5-1 preserved). All
+                # null/empty on the mock/no-envelope path.
+                "model_usage": coder_model_usage,
+                "num_turns": coder_num_turns,
+                "is_error": coder_is_error,
+                "stop_reason": coder_stop_reason,
+                "subtype": coder_subtype,
+                "permission_denials": coder_permission_denials,
                 # v3 Phase 0 Step 1 (V3P0-1) + Phase 2b Step 1 (fix): routing
                 # observability for the Coder. route_actual is the model the
                 # CLI ran, derived from the envelope's modelUsage key (Q-B1

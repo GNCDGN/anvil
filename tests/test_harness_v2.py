@@ -1326,6 +1326,126 @@ class TestStageASelectionsView(_HarnessTestBase):
         self.assertEqual(len(row), len(harness_v2._STAGE_A_SELECTIONS_COLUMNS))
 
 
+class TestCoderEnvelopeView(_HarnessTestBase):
+    """v3 Phase 2b Step 2 (V3P2B-2): coder_envelope projects the Coder envelope
+    fields from coder.subprocess.end.data (no ingest plumbing — schemaless JSON,
+    Q-B2). per_model_cost_json carries per-model costUSD (Q-B3); total_cost_usd
+    stays the cost-CASE source. Mock rows project NULL/0 (no envelope)."""
+
+    def _ingest_coder(self, run_id, *, data, mode="real"):
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "coder.subprocess.end", data,
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text(mode + "\n", encoding="utf-8")
+        harness_v2.ingest(self.con, run_dir)
+
+    def _real_coder_data(self, **over):
+        d = {
+            "step_idx": 0, "exit_code": 0, "route_actual": "claude-opus-4-7[1m]",
+            "total_cost_usd": 0.14688775,
+            "model_usage": {"claude-opus-4-7[1m]": {"costUSD": 0.14688775}},
+            "num_turns": 1, "is_error": False, "stop_reason": "end_turn",
+            "subtype": "success", "permission_denials": [],
+            "usage": {"input_tokens": 8, "iterations": [{"output_tokens": 10}]},
+        }
+        d.update(over)
+        return d
+
+    def test_view_projects_fields(self) -> None:
+        self._ingest_coder("T30-coder", data=self._real_coder_data())
+        row = self.con.execute(
+            "SELECT coder_model, total_cost_usd, num_turns, is_error, "
+            "stop_reason, subtype, permission_denials_count, iterations_count "
+            "FROM coder_envelope WHERE run_id='T30-coder'").fetchone()
+        self.assertEqual(row[0], "claude-opus-4-7[1m]")   # the V3P0-1-fixed model
+        self.assertAlmostEqual(row[1], 0.14688775)
+        self.assertEqual(row[2], 1)                        # num_turns
+        self.assertIs(row[3], False)                       # is_error
+        self.assertEqual(row[4], "end_turn")
+        self.assertEqual(row[5], "success")
+        self.assertEqual(row[6], 0)                        # permission_denials_count
+        self.assertEqual(row[7], 1)                        # iterations_count
+
+    def test_per_model_cost_invariant_single_model(self) -> None:
+        self._ingest_coder("T31-cost", data=self._real_coder_data())
+        pm, total = self.con.execute(
+            "SELECT per_model_cost_json, total_cost_usd FROM coder_envelope "
+            "WHERE run_id='T31-cost'").fetchone()
+        summed = sum(v["costUSD"] for v in json.loads(pm).values())
+        self.assertLess(abs(summed - total), 1e-6)         # Q-B3 invariant
+
+    def test_per_model_cost_invariant_multi_model_synthetic(self) -> None:
+        # Synthetic multi-model (no corpus exercises it): total == sum costUSD.
+        data = self._real_coder_data(
+            total_cost_usd=0.15,
+            model_usage={"claude-haiku-4-5-20251001": {"costUSD": 0.05},
+                         "claude-opus-4-7[1m]": {"costUSD": 0.10}})
+        self._ingest_coder("T32-multi", data=data)
+        pm, total = self.con.execute(
+            "SELECT per_model_cost_json, total_cost_usd FROM coder_envelope "
+            "WHERE run_id='T32-multi'").fetchone()
+        summed = sum(v["costUSD"] for v in json.loads(pm).values())
+        self.assertAlmostEqual(summed, total)
+        self.assertAlmostEqual(total, 0.15)
+
+    def test_permission_denials_count(self) -> None:
+        data = self._real_coder_data(
+            permission_denials=[{"tool": "Bash"}, {"tool": "Write"}])
+        self._ingest_coder("T33-denials", data=data)
+        cnt = self.con.execute(
+            "SELECT permission_denials_count FROM coder_envelope "
+            "WHERE run_id='T33-denials'").fetchone()[0]
+        self.assertEqual(cnt, 2)
+
+    def test_iterations_count_from_usage(self) -> None:
+        data = self._real_coder_data(
+            usage={"input_tokens": 8, "iterations": [{"o": 1}, {"o": 2}, {"o": 3}]})
+        self._ingest_coder("T34-iters", data=data)
+        cnt = self.con.execute(
+            "SELECT iterations_count FROM coder_envelope "
+            "WHERE run_id='T34-iters'").fetchone()[0]
+        self.assertEqual(cnt, 3)
+
+    def test_mock_row_projects_nulls(self) -> None:
+        # Mock/no-envelope: model_usage={}, num_turns/is_error None → view shows
+        # NULL num_turns/is_error, 0 denials, NULL iterations (no usage blob).
+        data = {"step_idx": 0, "exit_code": 0, "route_actual": "no-envelope",
+                "total_cost_usd": None, "model_usage": {}, "num_turns": None,
+                "is_error": None, "stop_reason": None, "subtype": None,
+                "permission_denials": [], "usage": None}
+        self._ingest_coder("T35-mock", data=data, mode="mock")
+        row = self.con.execute(
+            "SELECT coder_model, num_turns, is_error, permission_denials_count, "
+            "iterations_count FROM coder_envelope WHERE run_id='T35-mock'").fetchone()
+        self.assertEqual(row[0], "no-envelope")
+        self.assertIsNone(row[1])                          # num_turns NULL
+        self.assertIsNone(row[2])                          # is_error NULL
+        self.assertEqual(row[3], 0)                        # [] → 0 denials
+        self.assertIsNone(row[4])                          # no usage → NULL iters
+
+    def test_operations_coder_cost_unchanged_total_cost_usd(self) -> None:
+        # Q-B3 / criterion 2: the operations view's coder cost is still the
+        # CLI-reported total_cost_usd (V2P5-1 preserved — no cost-CASE change).
+        self._ingest_coder("T37-opcost", data=self._real_coder_data())
+        cost = self.con.execute(
+            "SELECT cost_usd FROM operations WHERE run_id='T37-opcost' "
+            "AND operation_kind='coder.subprocess.end'").fetchone()[0]
+        self.assertAlmostEqual(cost, 0.14688775)
+
+    def test_columns_match_declared_tuple(self) -> None:
+        self._ingest_coder("T36-cols", data=self._real_coder_data())
+        row = self.con.execute(
+            "SELECT * FROM coder_envelope WHERE run_id='T36-cols'").fetchone()
+        self.assertEqual(len(row), len(harness_v2._CODER_ENVELOPE_COLUMNS))
+
+
 class TestPerStageRouteActual(_HarnessTestBase):
     """v3 Phase 1a Step 1: the operations view surfaces route_actual
     distinctly per stage now that a Planner can route Stage C to a

@@ -320,5 +320,104 @@ class TestCoderRoutingObservability(_CoderEventsBase):
         self.assertEqual(d["route_candidate"], "unknown")
 
 
+class TestCoderEnvelopeFields(_CoderEventsBase):
+    """v3 Phase 2b Step 2 (V3P2B-2): coder.subprocess.end.data carries five
+    additional envelope fields (model_usage, num_turns, is_error, stop_reason,
+    subtype, permission_denials), all on the existing kind (Q-B2). Defensive
+    null-handling: envelope-omitted fields and the mock/no-envelope path."""
+
+    def _run_with_envelope(self, env_dict):
+        envelope = json.dumps(env_dict)
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["git", "-C"]:
+                return _real_run(cmd, **kw)
+            (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            return _proc(0, envelope, "")
+
+        with mock.patch.object(coder.subprocess, "run", side_effect=fake_run):
+            self.coder.execute_step(
+                _plan(files_to_touch=["a.py"]), _brief(self.repo)
+            )
+        return next(e for e in self._events()
+                    if e["kind"] == "coder.subprocess.end")["data"]
+
+    def test_all_five_fields_captured(self) -> None:
+        d = self._run_with_envelope({
+            "result": "done",
+            "modelUsage": {"claude-opus-4-7[1m]": {"costUSD": 0.15}},
+            "num_turns": 3,
+            "is_error": False,
+            "stop_reason": "end_turn",
+            "subtype": "success",
+            "permission_denials": [{"tool": "Bash"}],
+            "total_cost_usd": 0.15,
+            "usage": {"input_tokens": 8, "iterations": [{"output_tokens": 10}]},
+        })
+        self.assertEqual(d["model_usage"], {"claude-opus-4-7[1m]": {"costUSD": 0.15}})
+        self.assertEqual(d["num_turns"], 3)
+        self.assertIs(d["is_error"], False)
+        self.assertEqual(d["stop_reason"], "end_turn")
+        self.assertEqual(d["subtype"], "success")
+        self.assertEqual(d["permission_denials"], [{"tool": "Bash"}])
+
+    def test_envelope_omitting_fields_uses_defensive_defaults(self) -> None:
+        # Envelope present (has "result") but omits the five fields → mock-safe
+        # defaults: {} / None / False (is_error) / [] (denials).
+        d = self._run_with_envelope({"result": "done", "total_cost_usd": 0.0})
+        self.assertEqual(d["model_usage"], {})
+        self.assertIsNone(d["num_turns"])
+        self.assertIs(d["is_error"], False)   # envelope present → False, not None
+        self.assertIsNone(d["stop_reason"])
+        self.assertIsNone(d["subtype"])
+        self.assertEqual(d["permission_denials"], [])
+
+    def test_mock_path_no_envelope_fields_are_null(self) -> None:
+        # Non-JSON stdout (mock) → env is None → the no-envelope defaults:
+        # is_error is None (distinct from envelope-present False), not a bug.
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["git", "-C"]:
+                return _real_run(cmd, **kw)
+            (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            return _proc(0, "[anvil-coder] mocked execution\n", "")
+
+        with mock.patch.object(coder.subprocess, "run", side_effect=fake_run):
+            self.coder.execute_step(
+                _plan(files_to_touch=["a.py"]), _brief(self.repo)
+            )
+        d = next(e for e in self._events()
+                 if e["kind"] == "coder.subprocess.end")["data"]
+        self.assertEqual(d["model_usage"], {})
+        self.assertIsNone(d["num_turns"])
+        self.assertIsNone(d["is_error"])      # no envelope → None, not False
+        self.assertIsNone(d["stop_reason"])
+        self.assertEqual(d["permission_denials"], [])
+
+    def test_total_cost_matches_sum_modelusage_single_model(self) -> None:
+        # Q-B3 invariant: single-model total_cost_usd == sum(modelUsage costUSD).
+        d = self._run_with_envelope({
+            "result": "done",
+            "modelUsage": {"claude-opus-4-7[1m]": {"costUSD": 0.14688775}},
+            "total_cost_usd": 0.14688775,
+            "usage": {},
+        })
+        total = d["total_cost_usd"]
+        summed = sum(v.get("costUSD", 0.0) for v in d["model_usage"].values())
+        self.assertLess(abs(total - summed), 1e-6)
+
+    def test_is_error_true_recorded(self) -> None:
+        # An error envelope (is_error True) is recorded honestly — the CLI's
+        # own error semantics, distinct from the exit-code inference.
+        d = self._run_with_envelope({
+            "result": "", "is_error": True, "stop_reason": "max_tokens",
+            "subtype": "error_max_turns", "total_cost_usd": 0.02,
+            "modelUsage": {"claude-opus-4-7[1m]": {"costUSD": 0.02}},
+            "usage": {},
+        })
+        self.assertIs(d["is_error"], True)
+        self.assertEqual(d["stop_reason"], "max_tokens")
+        self.assertEqual(d["subtype"], "error_max_turns")
+
+
 if __name__ == "__main__":
     unittest.main()

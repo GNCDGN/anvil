@@ -339,6 +339,10 @@ def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     # v3 Phase 2a Step 2 (V3P2A-2): stage_a_selections exposes the recorded
     # selection list + raw response for the Phase 2c rich-context comparator.
     con.execute(_STAGE_A_SELECTIONS_VIEW_SQL)
+    # v3 Phase 2b Step 2 (V3P2B-2): coder_envelope projects the Coder envelope
+    # fields (per-model cost, turns, error state, denials, iteration count) for
+    # the first per-model Coder cost attribution in v3.
+    con.execute(_CODER_ENVELOPE_VIEW_SQL)
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +936,49 @@ _STAGE_A_SELECTIONS_COLUMNS: tuple[str, ...] = (
     "run_id", "task_id", "mode", "step_idx", "paths_returned",
     "selected_paths", "raw_response_text", "truncated",
     "paths_dropped_as_hallucinated",
+)
+
+
+# v3 Phase 2b Step 2 (V3P2B-2): coder_envelope.
+#
+# Projects the Coder envelope fields recorded on coder.subprocess.end.data
+# (V3P0-1 fix + the five envelope captures). Same schemaless-JSON store as
+# stage_a_selections — the fields live in events.data, projected here via
+# json_extract; no ingest plumbing (Q-B2). `coder_model` is the V3P0-1-fixed
+# route_actual (the actual model, or "no-envelope"/"unknown"). `total_cost_usd`
+# stays the operations-view cost-CASE source (V2P5-1 preserved); per_model_cost_
+# json is ADDITIONAL per-model attribution from modelUsage[m].costUSD (Q-B3) —
+# the first per-model Coder cost decomposition in v3. iterations_count derives
+# from the nested usage.iterations (already in the blob since Phase 2a — Q-B4),
+# surfaced here without re-emit. Mock-mode rows project NULL/0 (no envelope).
+_CODER_ENVELOPE_VIEW_SQL = """
+CREATE OR REPLACE VIEW coder_envelope AS
+SELECT
+    e.run_id,
+    rm.task_id,
+    e.mode,
+    e.step_idx,
+    json_extract_string(e.data, '$.route_actual') AS coder_model,
+    CAST(json_extract(e.data, '$.total_cost_usd') AS DOUBLE) AS total_cost_usd,
+    json_extract(e.data, '$.model_usage') AS per_model_cost_json,
+    CAST(json_extract(e.data, '$.num_turns') AS BIGINT) AS num_turns,
+    CAST(json_extract(e.data, '$.is_error') AS BOOLEAN) AS is_error,
+    json_extract_string(e.data, '$.stop_reason') AS stop_reason,
+    json_extract_string(e.data, '$.subtype') AS subtype,
+    json_array_length(json_extract(e.data, '$.permission_denials'))
+        AS permission_denials_count,
+    json_extract(e.data, '$.permission_denials') AS permission_denials_json,
+    json_array_length(json_extract(e.data, '$.usage.iterations'))
+        AS iterations_count
+FROM events e
+LEFT JOIN run_metadata rm USING (run_id, mode)
+WHERE e.kind = 'coder.subprocess.end'
+"""
+
+_CODER_ENVELOPE_COLUMNS: tuple[str, ...] = (
+    "run_id", "task_id", "mode", "step_idx", "coder_model", "total_cost_usd",
+    "per_model_cost_json", "num_turns", "is_error", "stop_reason", "subtype",
+    "permission_denials_count", "permission_denials_json", "iterations_count",
 )
 
 
