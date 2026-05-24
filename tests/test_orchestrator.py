@@ -326,6 +326,78 @@ class TestOrchestrator(unittest.TestCase):
             self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_CANARY,
                              f"{task} should be canaried under the broadened allowlist")
 
+    def test_empty_canary_allowlist_bootstraps_shadow_on_every_task(self) -> None:
+        # v3 Phase 2d Step 1: the bootstrap mechanism. ANVIL_CALIBRATION_DB set
+        # + ANVIL_CANARY_TASKS="" (empty allowlist) → no task matches → EVERY
+        # task takes the shadow branch → Opus Stage A. This is the documented
+        # recipe for an all-Opus baseline corpus; no new env var. Empty string,
+        # whitespace-only, and unset ANVIL_CANARY_TASKS all parse to the empty
+        # allowlist and must behave identically.
+        from anvil.policy import PHASE_1B_STAGE_A_SHADOW
+        orch = self._orch([])
+        tasks = ["T1-doc-edit", "T2-two-step", "T3-out-of-scope",
+                 "T4-judgment-escalation", "T5-deploy", "T6-write-new",
+                 "some-unknown-task", ""]
+        for canary in ("", "   ", " , "):
+            for task in tasks:
+                with mock.patch.dict(os.environ, {
+                    "ANVIL_CALIBRATION_DB": "/tmp/anvil-cal-nonexistent.duckdb",
+                    "ANVIL_CANARY_TASKS": canary,
+                    "ANVIL_CURRENT_TASK": task,
+                }):
+                    policy = orch._build_routing_policy()
+                self.assertEqual(
+                    policy.policy_version, PHASE_1B_STAGE_A_SHADOW,
+                    f"empty canary ({canary!r}) must shadow task {task!r}")
+        # Unset ANVIL_CANARY_TASKS is the empty allowlist too.
+        with mock.patch.dict(os.environ, {
+            "ANVIL_CALIBRATION_DB": "/tmp/anvil-cal-nonexistent.duckdb",
+            "ANVIL_CURRENT_TASK": "T1-doc-edit",
+        }):
+            os.environ.pop("ANVIL_CANARY_TASKS", None)
+            policy = orch._build_routing_policy()
+        self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_SHADOW)
+
+    def test_bootstrap_config_runs_opus_stage_a_recommends_haiku(self) -> None:
+        # v3 Phase 2d Step 1: end-to-end through the shell — a calibrated DB +
+        # empty canary yields a shadow policy whose Stage A decision RUNS Opus
+        # (route_actual) while RECORDING the Haiku recommendation
+        # (route_candidate). This is what makes the bootstrap produce Opus Stage
+        # A baselines (the unit-level shadow invariant lives in test_policy.py;
+        # here we exercise the orchestrator shell + a real calibrated DB +
+        # the empty-canary path together, hermetically).
+        import duckdb
+        from anvil.policy import PHASE_1B_STAGE_A_SHADOW
+        orch = self._orch([])
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "calibrated.duckdb"
+            con = duckdb.connect(str(db))
+            con.execute("CREATE TABLE shadow_decisions(run_id VARCHAR, mode "
+                        "VARCHAR, step_idx INTEGER, stage VARCHAR, "
+                        "shadow_decision_basis JSON)")
+            con.execute("CREATE TABLE events(run_id VARCHAR, mode VARCHAR, "
+                        "step_idx INTEGER, kind VARCHAR, data JSON)")
+            for rid in ("T1", "T2", "T3"):
+                con.execute("INSERT INTO shadow_decisions VALUES "
+                            "(?, 'real', 0, 'A', ?)",
+                            [rid, '{"context_paths_count": 0, "stage": "A"}'])
+                con.execute("INSERT INTO events VALUES "
+                            "(?, 'real', 0, 'planner.stage_a.parsed', ?)",
+                            [rid, '{"paths_returned": 0}'])
+            con.close()
+            with mock.patch.dict(os.environ, {
+                "ANVIL_CALIBRATION_DB": str(db),
+                "ANVIL_CANARY_TASKS": "",
+                "ANVIL_CURRENT_TASK": "T1-doc-edit",
+            }):
+                policy = orch._build_routing_policy()
+            self.assertEqual(policy.policy_version, PHASE_1B_STAGE_A_SHADOW)
+            dec = policy.decide_route(
+                "A", {"context_paths_count": 0}, fallback_model="claude-opus-4-7")
+            self.assertEqual(dec.route_actual, "claude-opus-4-7")  # API runs Opus
+            self.assertEqual(dec.route_candidate, "claude-haiku-4-5-20251001")
+            self.assertNotEqual(dec.route_actual, dec.route_candidate)
+
     def test_move_brief_updates_state_brief_path_for_resume(self) -> None:
         """Step 10 hotfix: after inbox→active move, state.brief_path must
         point at the active/ file (persisted), so resume() re-parses a path

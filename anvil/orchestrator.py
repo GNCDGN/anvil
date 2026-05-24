@@ -201,6 +201,21 @@ class Orchestrator:
         - set, but the task is not allowlisted → PHASE_1B_STAGE_A_SHADOW
           (route_candidate diverges, the API still runs Opus).
 
+        v3 Phase 2d (bootstrap mechanism — Step 1, option (ii)): the recipe for
+        producing an all-Opus Stage A baseline corpus is `ANVIL_CALIBRATION_DB`
+        set + `ANVIL_CANARY_TASKS=""` (empty allowlist). With an empty allowlist
+        no task matches, so EVERY task takes the shadow branch → Opus Stage A
+        with `selected_paths` recorded. No new env var — the shadow branch
+        already runs Opus; the empty allowlist is the only knob. The live
+        bootstrap sweep and the `ANVIL_HISTORICAL_BASELINE_DB` repoint are
+        deferred to Phase 2d2 (on T1-T6's uniformly empty-context corpus the
+        Opus baseline is `[]`, indistinguishable from the existing canary
+        sweep; the spend is deferred until corpus extension makes it carry
+        information). Phase 2d2 also writes the rich-context derivation:
+        `RoutingCalibration.from_db` currently derives the empty-context gate
+        only (it reads `paths_returned`, not `selected_paths`). See the Phase 2d
+        brief and the v3 planning context (Revision L).
+
         `RoutingCalibration.from_db` is never-raise (a missing/broken DB →
         empty corpus → degraded predicate), so a misconfigured path can never
         block the build — it just recommends Opus everywhere.

@@ -24,10 +24,38 @@ _EXIT_SWEEP_DB = (
     / "state" / "v3-phase-1a" / "exit-sweep.duckdb"
 )
 
+_PHASE_1B_DB = (
+    Path(__file__).resolve().parent.parent
+    / "state" / "v3-phase-1b" / "exit-sweep.duckdb"
+)
+
 
 def _samples(*pairs):
     """Build calibration samples from (context_paths_count, paths_returned) pairs."""
     return [{"context_paths_count": c, "paths_returned": p} for c, p in pairs]
+
+
+def _write_synthetic_stage_a_db(path, *, with_selected_paths: bool, n: int = 3):
+    """Build a minimal DuckDB with the (shadow_decisions ⋈ planner.stage_a.parsed)
+    shape `RoutingCalibration.from_db` joins, holding `n` empty-context Stage A
+    rows. `with_selected_paths=True` marks it Phase-2a+ (events.data carries a
+    `selected_paths` key); False is the legacy 1a/1b shape. The join reads only
+    `paths_returned`, so the two schemas must derive an identical predicate."""
+    import duckdb
+    con = duckdb.connect(str(path))
+    con.execute("CREATE TABLE shadow_decisions(run_id VARCHAR, mode VARCHAR, "
+                "step_idx INTEGER, stage VARCHAR, shadow_decision_basis JSON)")
+    con.execute("CREATE TABLE events(run_id VARCHAR, mode VARCHAR, "
+                "step_idx INTEGER, kind VARCHAR, data JSON)")
+    data = ('{"paths_returned": 0, "selected_paths": []}' if with_selected_paths
+            else '{"paths_returned": 0}')
+    for i in range(n):
+        rid = f"T{i + 1}"
+        con.execute("INSERT INTO shadow_decisions VALUES (?, 'real', 0, 'A', ?)",
+                    [rid, '{"context_paths_count": 0, "stage": "A"}'])
+        con.execute("INSERT INTO events VALUES "
+                    "(?, 'real', 0, 'planner.stage_a.parsed', ?)", [rid, data])
+    con.close()
 
 
 class TestRoutingCalibrationDerivation(unittest.TestCase):
@@ -161,6 +189,59 @@ class TestCalibrationFromConnection(unittest.TestCase):
         self.assertEqual(
             cal.policy({"context_paths_count": 0}).recommended_model,
             PHASE_1A_PLACEHOLDER_MODEL)
+
+
+class TestFromDbSchemaParity(unittest.TestCase):
+    """v3 Phase 2d Step 1 (Q-D2 verification): `from_db` derives the same
+    empty-context constant from a legacy DB (Phase 1a/1b, no `selected_paths`)
+    and a Phase-2a+ DB (with `selected_paths`). The derivation reads
+    `paths_returned` only, so the Phase-2a+ schema is a no-op for the existing
+    pipeline — confirming it is stable to extend from. The rich-context
+    derivation that WOULD read `selected_paths` is Phase 2d2's new logic."""
+
+    @unittest.skipUnless(
+        _PHASE_1B_DB.is_file(),
+        f"integration fixture {_PHASE_1B_DB} not present",
+    )
+    def test_from_db_real_phase1b_derives_production_constant(self) -> None:
+        # The current production calibration source: Phase 1b exit-sweep →
+        # empty-context calibrated, every empty-context call returned 0 paths.
+        cal = RoutingCalibration.from_db(_PHASE_1B_DB)
+        ps = cal.predicate_state
+        self.assertTrue(ps["empty_context_calibrated"])
+        self.assertGreater(ps["n_empty_context_samples"], 0)
+        self.assertEqual(ps["n_empty_context_samples"], ps["n_empty_context_zero_paths"])
+        rec = cal.policy({"context_paths_count": 0})
+        self.assertEqual(rec.recommended_model, CHEAP_STAGE_A_MODEL)
+        self.assertEqual(rec.confidence_band, "high")
+
+    def test_from_db_synthetic_phase2a_parity_on_empty_context(self) -> None:
+        # A synthetic Phase-2a+ DB (selected_paths recorded, all empty-context)
+        # derives the SAME constant as the legacy production source: calibrated,
+        # Haiku-high. Behaviour parity across schema versions.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "phase2a.duckdb"
+            _write_synthetic_stage_a_db(db, with_selected_paths=True)
+            cal = RoutingCalibration.from_db(db)
+            self.assertTrue(cal.predicate_state["empty_context_calibrated"])
+            rec = cal.policy({"context_paths_count": 0})
+            self.assertEqual(rec.recommended_model, CHEAP_STAGE_A_MODEL)
+            self.assertEqual(rec.confidence_band, "high")
+
+    def test_from_db_schema_agnostic_to_selected_paths(self) -> None:
+        # The substantive parity: legacy and Phase-2a+ DBs with identical
+        # empty-context rows derive identical predicate_state — from_db ignores
+        # selected_paths entirely (Q-D2: rich-context derivation is new logic).
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            legacy = Path(d) / "legacy.duckdb"
+            phase2a = Path(d) / "phase2a.duckdb"
+            _write_synthetic_stage_a_db(legacy, with_selected_paths=False)
+            _write_synthetic_stage_a_db(phase2a, with_selected_paths=True)
+            self.assertEqual(
+                RoutingCalibration.from_db(legacy).predicate_state,
+                RoutingCalibration.from_db(phase2a).predicate_state)
 
 
 if __name__ == "__main__":
