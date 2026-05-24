@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -361,6 +362,26 @@ class Coder:
         self.claude_binary = Path(claude_binary)
         self.timeout = int(timeout)
         self.system_prompt = system_prompt
+        # v3 Phase 2e Step 1 (Q-E4): optional Coder model-routing override.
+        # When ANVIL_CODER_MODEL is set, execute_step inserts `--model <value>`
+        # into the claude CLI argv; unset → no --model flag → the CLI default
+        # (claude-opus-4-7[1m]), the pre-2e behaviour. Validated once here
+        # (construction == startup) so a malformed value fails fast before any
+        # sweep spend, not mid-step. The check is format-only — a single
+        # CLI-safe token with no leading '-' (which the CLI would misparse as a
+        # flag) and no internal whitespace. We deliberately do NOT maintain a
+        # model allowlist: a genuinely-unknown but well-formed name is left for
+        # the CLI itself to reject (avoids the V3P1C-4 stale-list hazard).
+        raw_coder_model = os.environ.get("ANVIL_CODER_MODEL", "").strip()
+        if raw_coder_model and (
+            raw_coder_model.startswith("-")
+            or any(c.isspace() for c in raw_coder_model)
+        ):
+            raise ValueError(
+                f"ANVIL_CODER_MODEL is malformed: {raw_coder_model!r} — must be "
+                "a single CLI-safe model token (no leading '-', no whitespace)"
+            )
+        self._coder_model = raw_coder_model or None
 
     def _real_run(self, cmd, prompt, target_repo_path):
         """Invoke the Claude subprocess. Extracted from execute_step
@@ -464,6 +485,11 @@ class Coder:
             "--output-format", "json",
             "--permission-mode", "dontAsk",
         ]
+        # v3 Phase 2e Step 1 (Q-E4): route to an overridden model when set
+        # (validated at construction). Unset → no --model → CLI default.
+        coder_model = getattr(self, "_coder_model", None)
+        if coder_model:
+            cmd.extend(["--model", coder_model])
         if allow_list:
             cmd.extend(["--allowedTools", ",".join(allow_list)])
         if deny_list:

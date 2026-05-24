@@ -24,6 +24,7 @@ extractor) because the helper is the orchestrator's parsing contract.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -601,6 +602,97 @@ class TestDeriveCoderModel(unittest.TestCase):
         # Mock path / dead subprocess: no JSON envelope → env is None → None
         # (the caller maps this to "no-envelope", distinct from "unknown").
         self.assertIsNone(coder._derive_coder_model(None))
+
+
+class CoderModelOverrideTests(unittest.TestCase):
+    """v3 Phase 2e Step 1 (Q-E4): the ANVIL_CODER_MODEL routing override.
+
+    Unset → no `--model` flag (the pre-2e default — CLI runs Opus 4.7[1m]).
+    Set to a valid token → `--model <value>` inserted into the claude argv.
+    Malformed → fail fast at construction (== startup), not mid-sweep.
+    Format-only validation (no model allowlist — V3P1C-4 stale-list hazard).
+    """
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="anvil-test-coder-model-"))
+        self.repo = self._tmp / "repo"
+        _init_repo(self.repo, {"a.py": "# original\n"})
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _capture_argv(self, coder_obj):
+        """Run a clean step under a captured subprocess.run; return the
+        claude argv the Coder assembled."""
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            if cmd[0:2] == ["git", "-C"]:
+                return _real_run(cmd, **kw)
+            captured["cmd"] = list(cmd)
+            (self.repo / "a.py").write_text("# edited\n", encoding="utf-8")
+            return _proc_result(0, "Done.", "")
+
+        plan = _make_plan(files_to_touch=["a.py"], operations=["write"])
+        brief = _make_brief(self.repo)
+        with mock.patch.object(coder.subprocess, "run", side_effect=fake_run):
+            coder_obj.execute_step(plan, brief)
+        return captured["cmd"]
+
+    def test_unset_inserts_no_model_flag(self):
+        # The production default: no override → no --model → CLI's Opus 4.7[1m].
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ANVIL_CODER_MODEL", None)
+            argv = self._capture_argv(_make_coder())
+        self.assertNotIn("--model", argv)
+        # The base flags are still present (no behaviour change).
+        self.assertIn("--print", argv)
+        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+
+    def test_empty_string_treated_as_unset(self):
+        # Mirrors ANVIL_CANARY_TASKS="" → empty: a blank/whitespace value is
+        # not an override and must NOT raise (it is the unset case).
+        for blank in ("", "   "):
+            with mock.patch.dict(os.environ, {"ANVIL_CODER_MODEL": blank}):
+                argv = self._capture_argv(_make_coder())
+            self.assertNotIn("--model", argv, f"blank {blank!r} should be unset")
+
+    def test_set_full_name_inserts_model_flag(self):
+        with mock.patch.dict(
+            os.environ, {"ANVIL_CODER_MODEL": "claude-haiku-4-5-20251001"}
+        ):
+            argv = self._capture_argv(_make_coder())
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1],
+                         "claude-haiku-4-5-20251001")
+
+    def test_set_alias_inserts_model_flag(self):
+        # Aliases (no "claude-" prefix, no dashes) are valid CLI input — the
+        # validation must not be over-strict and reject them.
+        with mock.patch.dict(os.environ, {"ANVIL_CODER_MODEL": "haiku"}):
+            argv = self._capture_argv(_make_coder())
+        self.assertEqual(argv[argv.index("--model") + 1], "haiku")
+
+    def test_set_value_is_stripped(self):
+        # Surrounding whitespace is stripped (a valid token remains valid).
+        with mock.patch.dict(
+            os.environ, {"ANVIL_CODER_MODEL": "  claude-haiku-4-5  "}
+        ):
+            argv = self._capture_argv(_make_coder())
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-haiku-4-5")
+
+    def test_leading_dash_fails_fast_at_construction(self):
+        # A flag-like value the CLI would misparse → ValueError at construction
+        # (startup), before any sweep spend. NOT mid-step.
+        with mock.patch.dict(os.environ, {"ANVIL_CODER_MODEL": "--dangerous"}):
+            with self.assertRaises(ValueError):
+                _make_coder()
+
+    def test_internal_whitespace_fails_fast_at_construction(self):
+        # A multi-token garbage value → ValueError at construction.
+        with mock.patch.dict(os.environ, {"ANVIL_CODER_MODEL": "claude haiku"}):
+            with self.assertRaises(ValueError):
+                _make_coder()
 
 
 if __name__ == "__main__":
