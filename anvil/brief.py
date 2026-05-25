@@ -30,6 +30,12 @@ _VALID_OPERATIONS = {"read", "write", "smoke-test", "commit", "shell"}
 # is accepted-with-warning, never rejected. Single source of truth so future
 # operations can be added cleanly.
 LLM_CALLING_OPERATIONS = frozenset({"read", "write", "shell"})
+# v4 Phase 1b Step 1 (Q-B3): the per-step `issues:` connector-scope axis. A
+# separate axis from _VALID_OPERATIONS (Coder tool grants) and from `model:`
+# (Planner routing) — a step may declare any combination, validated
+# independently (rule 14). `write` permits reads at the connector wrapper; the
+# brief field itself is one of these two literals (or absent → None).
+ISSUES_SCOPES = frozenset({"read", "write"})
 _REQUIRED_FRONTMATTER = (
     "brief_version",
     "project",
@@ -56,6 +62,12 @@ class Step(BaseModel):
     # Planner/subtask call sites in Step 3. brief_version stays 1 — this is a
     # backwards-compatible addition, not a migration.
     model: str | None = None
+    # v4 Phase 1b Step 1 (Q-B3): optional per-step GitHub Issues connector scope
+    # (opt-in; absent → None → the step declares no issues access). Validated in
+    # validate_or_reject rule 14 against ISSUES_SCOPES; enforced at the connector
+    # wrapper (integrations.github_issues) at call time. Orthogonal to model: and
+    # scope.operations — a step may declare any combination. brief_version stays 1.
+    issues: str | None = None
 
 
 class EndToEndTest(BaseModel):
@@ -171,6 +183,15 @@ def _parse_steps(steps_section: str) -> list[Step]:
             if (raw_model and raw_model.lower() not in ("null", "none"))
             else None
         )
+        # v4 Phase 1b Step 1 (Q-B3): per-step `issues:` connector scope. Same
+        # defensive contract as model: empty ("") and the literal "null"/"none"
+        # are treated as absent (None); an absent field already yields None.
+        raw_issues = _field(block, "issues")
+        issues = (
+            raw_issues
+            if (raw_issues and raw_issues.lower() not in ("null", "none"))
+            else None
+        )
         steps.append(
             Step(
                 number=number,
@@ -182,6 +203,7 @@ def _parse_steps(steps_section: str) -> list[Step]:
                 commit_message_hint=_field(block, "commit_message_hint"),
                 notes=_field(block, "notes"),
                 model=model,
+                issues=issues,
             )
         )
     return steps
@@ -532,6 +554,20 @@ def validate_or_reject(
                     f"alias {sorted(MODEL_ALIASES)} or version string "
                     f"{sorted(MODEL_RATES)}"
                 )
+
+    # 14. v4 Phase 1b Step 1 (Q-B3): per-step `issues:` connector scope must be
+    # a known scope (ISSUES_SCOPES) or absent. A separate axis from rule 13's
+    # model: (Planner routing) and from scope.operations (rule 8, Coder tool
+    # grants) — validated independently, so a step may carry any combination.
+    # Fixed value set; no import needed (unlike rule 13). Unknown values reject
+    # before any agent runs — an invalid scope must never reach the connector
+    # wrapper, which enforces the declared scope at call time.
+    for s in brief.steps:
+        if s.issues is not None and s.issues not in ISSUES_SCOPES:
+            e.append(
+                f"step {s.number} ({s.name}): issues {s.issues!r} is not a "
+                f"valid scope {sorted(ISSUES_SCOPES)}"
+            )
 
     if e:
         raise BriefValidationError(e)

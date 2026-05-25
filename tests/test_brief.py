@@ -476,6 +476,122 @@ Exercise the per-step model field.
                     f"{b.parent.name} step {step.number}: model must be None "
                     f"(Step 2 must not populate it), got {step.model!r}",
                 )
-        # Success: every parsed brief had model=None on every step. Briefs that
-        # fail to parse are pre-existing drift, not a Step 2 regression.
+                # v4 Phase 1b Step 1: the new issues: field must also default to
+                # None on every existing brief (backwards-compat — the field is
+                # opt-in; no existing brief declares it).
+                self.assertIsNone(
+                    step.issues,
+                    f"{b.parent.name} step {step.number}: issues must be None "
+                    f"(opt-in field; no existing brief declares it), got "
+                    f"{step.issues!r}",
+                )
+        # Success: every parsed brief had model=None AND issues=None on every
+        # step. Briefs that fail to parse are pre-existing drift, not a regression.
         self.assertGreater(parsed, 0, f"no briefs parsed; failures={parse_failed}")
+
+
+class TestStepIssuesField(unittest.TestCase):
+    """v4 Phase 1b Step 1 (Q-B3): per-step `issues:` connector-scope field —
+    parse, validate (rule 14), defensive empty/null/none handling, and the
+    Q-B3 coexistence rule: model: and issues: validate independently on the
+    same step, and the model: Q-A4 warning keys on scope.operations, NOT on
+    issues: presence."""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-issues-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-issues-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, operations: str = "read",
+               issues_line: str = "", model_line: str = ""):
+        extra = "\n".join(x for x in (model_line, issues_line) if x)
+        body = f"""---
+brief_version: 1
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: no
+---
+
+## Goal
+
+Exercise the per-step issues field.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** {operations}
+- **smoke:** `echo hi`
+- **confirm:** explicit
+{extra}
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    # --- parsing + validation -----------------------------------------------
+    def test_read_parses_and_validates(self) -> None:
+        brief, fm = self._parse(issues_line="- **issues:** read")
+        self.assertEqual(brief.steps[0].issues, "read")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_write_parses_and_validates(self) -> None:
+        brief, fm = self._parse(
+            operations="write", issues_line="- **issues:** write")
+        self.assertEqual(brief.steps[0].issues, "write")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_unknown_value_rejected(self) -> None:
+        for bad in ("delete", "edit", "merge"):
+            with self.subTest(value=bad):
+                brief, fm = self._parse(issues_line=f"- **issues:** {bad}")
+                with self.assertRaises(BriefValidationError) as ctx:
+                    validate_or_reject(brief, fm)
+                self.assertIn(f"issues '{bad}'", " ".join(ctx.exception.errors))
+
+    def test_missing_is_none_and_validates(self) -> None:
+        brief, fm = self._parse(issues_line="")
+        self.assertIsNone(brief.steps[0].issues)
+        validate_or_reject(brief, fm)  # no raise
+
+    # --- defensive edge cases (mirror model:'s null/none/empty handling) -----
+    def test_blank_values_treated_as_absent(self) -> None:
+        for line in ("- **issues:** ", "- **issues:** null", "- **issues:** none"):
+            with self.subTest(line=line):
+                brief, fm = self._parse(issues_line=line)
+                self.assertIsNone(brief.steps[0].issues)
+                validate_or_reject(brief, fm)  # no raise
+
+    # --- Q-B3 coexistence: model: + issues: on the same step ----------------
+    def test_model_and_issues_coexist(self) -> None:
+        brief, fm = self._parse(
+            operations="write",
+            model_line="- **model:** haiku",
+            issues_line="- **issues:** write",
+        )
+        self.assertEqual(brief.steps[0].model, "haiku")
+        self.assertEqual(brief.steps[0].issues, "write")
+        validate_or_reject(brief, fm)  # both validate independently
+
+    def test_model_warning_independent_of_issues(self) -> None:
+        # A non-LLM step (smoke-test/commit) carrying BOTH model: and issues:
+        # write must still emit the Q-A4 model-on-non-llm-step warning — the
+        # issues: declaration does not suppress it (the model: warning keys on
+        # scope.operations ∩ LLM_CALLING_OPERATIONS, not on issues: presence).
+        brief, fm = self._parse(
+            operations="smoke-test, commit",
+            model_line="- **model:** haiku",
+            issues_line="- **issues:** write",
+        )
+        validate_or_reject(brief, fm)  # no raise (warning, not error)
+        self.assertIn(
+            "model-on-non-llm-step",
+            [w.get("kind") for w in brief.parse_warnings],
+        )
