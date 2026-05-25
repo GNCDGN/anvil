@@ -28,11 +28,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # --- Pricing. v3 Phase 1c Step 3.5 (Step3.5C-F2): per-model rates imported
-# from harness_v2 (the mirror invariant — single source of truth, no drift).
-# Verified against Anthropic's pricing page on 2026-05-26: Opus 4.7
-# $5/$25/$6.25/$0.50, Haiku 4.5 $1/$5/$1.25/$0.10 (in/out/5m-write/read per
-# Mtok). Replaces the prior stale Opus-4.1 constants ($15/$75). ---
-from tools.harness_v2 import MODEL_RATES, DEFAULT_MODEL_RATES  # noqa: E402
+# from the canonical source (the mirror invariant — single source of truth, no
+# drift). v4 Phase 1a housekeeping moved MODEL_RATES from tools/harness_v2.py to
+# anvil/events.py; re-pointed here (importing from events drops exam_harness's
+# transitive harness_v2 → duckdb/openpyxl dependency too). Verified against
+# Anthropic's pricing page on 2026-05-26: Opus 4.7 $5/$25/$6.25/$0.50, Haiku
+# 4.5 $1/$5/$1.25/$0.10 (in/out/5m-write/read per Mtok). ---
+from anvil.events import MODEL_RATES, DEFAULT_MODEL_RATES  # noqa: E402
 BUDGET_USD = 20.0
 
 

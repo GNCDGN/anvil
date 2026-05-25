@@ -53,31 +53,23 @@ from openpyxl.styles import Font
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from anvil.events import PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL  # noqa: E402
+from anvil.events import (  # noqa: E402
+    DEFAULT_MODEL_RATES,
+    MODEL_RATES,
+    PLANNER_SYSTEM_PROMPT_TOKENS_BY_MODEL,
+)
 
 # Module-scope capture — tests patch via this seam for failure injection.
 _real_write = Path.write_text
 
-# ---------------------------------------------------------------------------
-# Cost rates — per-model, USD per million tokens. Verified against Anthropic's
-# pricing page (platform.claude.com/docs/en/docs/about-claude/pricing,
-# fetched 2026-05-26). v3 Phase 1c Step 3.5 (Step3.5C-F1): replaces the prior
-# single rate table ($15/$75/$18.75/$1.50) — those were Opus 4.1's rates,
-# STALE for the live Opus 4.7 planner model ($5/$25/$6.25/$0.50), and were
-# also (wrongly) applied to the Haiku 4.5 canary. Cache: 5m-write = 1.25x
-# input, read = 0.1x input. Mirrored in tools/exam_harness.py via import so
-# the two harnesses can't drift. Unknown models fall back to Opus 4.7 rates
-# (conservative overcharge); unknown_cost_models() surfaces any for
-# explicit registration (a Phase 2 new-model addition shows up there).
-# ---------------------------------------------------------------------------
-
-MODEL_RATES: dict[str, dict[str, float]] = {
-    "claude-opus-4-7": {
-        "input": 5.0, "output": 25.0, "cache_create": 6.25, "cache_read": 0.50},
-    "claude-haiku-4-5-20251001": {
-        "input": 1.0, "output": 5.0, "cache_create": 1.25, "cache_read": 0.10},
-}
-DEFAULT_MODEL_RATES = MODEL_RATES["claude-opus-4-7"]
+# Cost rates (MODEL_RATES) and DEFAULT_MODEL_RATES are imported from
+# anvil.events above. v4 Phase 1a housekeeping lifted them there (the canonical
+# per-model-data home, V3P2A) so the lightweight model-selection seam
+# (anvil/routing.py) imports the rate table without dragging this module's
+# duckdb/openpyxl imports into its graph. The V3P1C-4 mirror invariant still
+# holds — harness_v2, exam_harness, and routing all see the one events-owned
+# constant, no drift. The SQL/DB-coupled helpers below (_rate_case,
+# _cost_usd_case_sql, unknown_cost_models) stay here and reference the imports.
 
 
 def _rate_case(component: str) -> str:

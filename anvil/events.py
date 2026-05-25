@@ -573,6 +573,36 @@ def planner_system_prompt_tokens(model: str) -> int:
     return tokens
 
 
+# ---------------------------------------------------------------------------
+# Cost rates — per-model, USD per million tokens. Verified against Anthropic's
+# pricing page (platform.claude.com/docs/en/docs/about-claude/pricing, fetched
+# 2026-05-26): Opus 4.7 $5/$25/$6.25/$0.50, Haiku 4.5 $1/$5/$1.25/$0.10
+# (input / output / 5m-cache-write / cache-read per Mtok). v3 Phase 1c Step 3.5
+# (Step3.5C-F1) replaced the stale Opus-4.1 rates ($15/$75/$18.75/$1.50). Cache:
+# 5m-write = 1.25x input, read = 0.1x input.
+#
+# v4 Phase 1a housekeeping: lifted here from tools/harness_v2.py. events.py is
+# already the canonical per-model-data home (PLANNER_SYSTEM_PROMPT_TOKENS_BY_
+# MODEL above, V3P2A); hosting MODEL_RATES here lets the lightweight
+# model-selection seam (anvil/routing.py) import the canonical rate table
+# without dragging harness_v2's duckdb/openpyxl imports into its — and Step 3's
+# planner — graph. harness_v2 and exam_harness now import MODEL_RATES from here:
+# the V3P1C-4 mirror invariant (one constant, no drift across both harnesses +
+# the seam). The SQL/DB-coupled helpers stay in harness_v2 — _rate_case and
+# _cost_usd_case_sql generate DuckDB view SQL, unknown_cost_models(con) queries
+# a DuckDB connection — none are constant-definitions. Unknown models fall back
+# to the Opus 4.7 rates (conservative overcharge).
+# ---------------------------------------------------------------------------
+
+MODEL_RATES: dict[str, dict[str, float]] = {
+    "claude-opus-4-7": {
+        "input": 5.0, "output": 25.0, "cache_create": 6.25, "cache_read": 0.50},
+    "claude-haiku-4-5-20251001": {
+        "input": 1.0, "output": 5.0, "cache_create": 1.25, "cache_read": 0.10},
+}
+DEFAULT_MODEL_RATES = MODEL_RATES["claude-opus-4-7"]
+
+
 def block_token_inflation_factor(model: str) -> float:
     """Per-model chars/4 → real-token inflation (the affine SLOPE). Unknown
     model → the Opus value (conservative) + registered in

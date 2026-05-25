@@ -36,14 +36,14 @@ import os
 
 import anthropic
 
-# Q-A1 disposition (Step 0 notes Q-A1-F1): MODEL_RATES in tools/harness_v2.py
-# is the existing single source of truth for "which models exist" (V3P1C-4).
-# routing.py validates its alias targets against it at module load (below).
-# Both anvil/ and tools/ are packages; tests and the orchestrator run from the
-# repo root, so this import resolves cleanly. (Step 1 finding: this pulls
-# harness_v2's module-level duckdb/openpyxl imports into routing's — and hence
-# Step 3's planner — import graph; acceptable for Phase 1a, flagged for Step 2.)
-from tools.harness_v2 import MODEL_RATES
+# Q-A1 disposition (Step 0 notes Q-A1-F1): MODEL_RATES is the single source of
+# truth for "which models exist" (V3P1C-4). routing.py validates its alias
+# targets against it at module load (below). v4 Phase 1a housekeeping lifted
+# MODEL_RATES from tools/harness_v2.py to anvil/events.py (the canonical
+# per-model-data home), resolving the Step 1 finding: importing it here no
+# longer pulls harness_v2's duckdb/openpyxl into routing's — or Step 3's
+# planner — import graph.
+from anvil.events import MODEL_RATES
 
 log = logging.getLogger("anvil.routing")
 
@@ -73,7 +73,7 @@ _unregistered_alias_targets = [
 assert not _unregistered_alias_targets, (
     "MODEL_ALIASES targets absent from MODEL_RATES "
     f"{sorted(MODEL_RATES)}: {_unregistered_alias_targets}. "
-    "Register the model in tools/harness_v2.py MODEL_RATES, or fix the alias."
+    "Register the model in anvil/events.py MODEL_RATES, or fix the alias."
 )
 
 # Lazily-constructed, cached shared client. Constructed once on first use, not
