@@ -485,7 +485,15 @@ Exercise the per-step model field.
                     f"(opt-in field; no existing brief declares it), got "
                     f"{step.issues!r}",
                 )
-        # Success: every parsed brief had model=None AND issues=None on every
+                # v4 Phase 1b Step 2: likewise the new sentry: field defaults to
+                # None on every existing brief.
+                self.assertIsNone(
+                    step.sentry,
+                    f"{b.parent.name} step {step.number}: sentry must be None "
+                    f"(opt-in field; no existing brief declares it), got "
+                    f"{step.sentry!r}",
+                )
+        # Success: every parsed brief had model/issues/sentry = None on every
         # step. Briefs that fail to parse are pre-existing drift, not a regression.
         self.assertGreater(parsed, 0, f"no briefs parsed; failures={parse_failed}")
 
@@ -595,3 +603,91 @@ Exercise the per-step issues field.
             "model-on-non-llm-step",
             [w.get("kind") for w in brief.parse_warnings],
         )
+
+
+class TestStepSentryField(unittest.TestCase):
+    """v4 Phase 1b Step 2 (Q-B3): per-step `sentry:` connector-scope field —
+    parse, validate (rule 15: read-only), defensive empty/null/none handling,
+    and the Q-B3 triple-coexistence rule (model: + issues: + sentry: validate
+    independently on the same step)."""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-sentry-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-sentry-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, operations: str = "read", model_line: str = "",
+               issues_line: str = "", sentry_line: str = ""):
+        extra = "\n".join(
+            x for x in (model_line, issues_line, sentry_line) if x)
+        body = f"""---
+brief_version: 1
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: no
+---
+
+## Goal
+
+Exercise the per-step sentry field.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** {operations}
+- **smoke:** `echo hi`
+- **confirm:** explicit
+{extra}
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    # --- parsing + validation -----------------------------------------------
+    def test_read_parses_and_validates(self) -> None:
+        brief, fm = self._parse(sentry_line="- **sentry:** read")
+        self.assertEqual(brief.steps[0].sentry, "read")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_unknown_value_rejected(self) -> None:
+        # 'write' is invalid for the read-only Sentry connector (rule 15).
+        for bad in ("write", "edit", "delete"):
+            with self.subTest(value=bad):
+                brief, fm = self._parse(sentry_line=f"- **sentry:** {bad}")
+                with self.assertRaises(BriefValidationError) as ctx:
+                    validate_or_reject(brief, fm)
+                self.assertIn(f"sentry '{bad}'", " ".join(ctx.exception.errors))
+
+    def test_missing_is_none_and_validates(self) -> None:
+        brief, fm = self._parse(sentry_line="")
+        self.assertIsNone(brief.steps[0].sentry)
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_blank_values_treated_as_absent(self) -> None:
+        for line in ("- **sentry:** ", "- **sentry:** null", "- **sentry:** none"):
+            with self.subTest(line=line):
+                brief, fm = self._parse(sentry_line=line)
+                self.assertIsNone(brief.steps[0].sentry)
+                validate_or_reject(brief, fm)  # no raise
+
+    # --- Q-B3 triple-coexistence: model: + issues: + sentry: ----------------
+    def test_model_issues_sentry_coexist(self) -> None:
+        brief, fm = self._parse(
+            operations="write",
+            model_line="- **model:** haiku",
+            issues_line="- **issues:** write",
+            sentry_line="- **sentry:** read",
+        )
+        step = brief.steps[0]
+        self.assertEqual(step.model, "haiku")
+        self.assertEqual(step.issues, "write")
+        self.assertEqual(step.sentry, "read")
+        validate_or_reject(brief, fm)  # all three validate independently

@@ -36,6 +36,11 @@ LLM_CALLING_OPERATIONS = frozenset({"read", "write", "shell"})
 # independently (rule 14). `write` permits reads at the connector wrapper; the
 # brief field itself is one of these two literals (or absent → None).
 ISSUES_SCOPES = frozenset({"read", "write"})
+# v4 Phase 1b Step 2 (Q-B3): the per-step `sentry:` connector-scope axis. The
+# Sentry connector is read-only (no write methods), so `read` is the only valid
+# scope; validated in rule 15. Like ISSUES_SCOPES, a separate axis from model:
+# and scope.operations — validated independently.
+SENTRY_SCOPES = frozenset({"read"})
 _REQUIRED_FRONTMATTER = (
     "brief_version",
     "project",
@@ -68,6 +73,11 @@ class Step(BaseModel):
     # wrapper (integrations.github_issues) at call time. Orthogonal to model: and
     # scope.operations — a step may declare any combination. brief_version stays 1.
     issues: str | None = None
+    # v4 Phase 1b Step 2 (Q-B3): optional per-step Sentry connector scope
+    # (opt-in; absent → None). Validated in rule 15 against SENTRY_SCOPES
+    # ({"read"} — the connector is read-only); enforced at the connector wrapper
+    # (integrations.sentry). Orthogonal to model:, issues:, and scope.operations.
+    sentry: str | None = None
 
 
 class EndToEndTest(BaseModel):
@@ -192,6 +202,14 @@ def _parse_steps(steps_section: str) -> list[Step]:
             if (raw_issues and raw_issues.lower() not in ("null", "none"))
             else None
         )
+        # v4 Phase 1b Step 2 (Q-B3): per-step `sentry:` connector scope. Same
+        # defensive contract as model: / issues:.
+        raw_sentry = _field(block, "sentry")
+        sentry = (
+            raw_sentry
+            if (raw_sentry and raw_sentry.lower() not in ("null", "none"))
+            else None
+        )
         steps.append(
             Step(
                 number=number,
@@ -204,6 +222,7 @@ def _parse_steps(steps_section: str) -> list[Step]:
                 notes=_field(block, "notes"),
                 model=model,
                 issues=issues,
+                sentry=sentry,
             )
         )
     return steps
@@ -391,7 +410,9 @@ def parse_brief(path: Path) -> Brief:
 
 
 # ---------------------------------------------------------------------------
-# Validation — all 12 rules from implementation-notes Component 2
+# Validation — 15 rules. Rules 1-12 are implementation-notes Component 2; rule
+# 13 (per-step model:, v4 Phase 1a Step 2), rule 14 (issues:, v4 Phase 1b Step
+# 1), and rule 15 (sentry:, v4 Phase 1b Step 2) extend it backwards-compatibly.
 # ---------------------------------------------------------------------------
 
 def _is_git_repo(path: Path) -> bool:
@@ -567,6 +588,18 @@ def validate_or_reject(
             e.append(
                 f"step {s.number} ({s.name}): issues {s.issues!r} is not a "
                 f"valid scope {sorted(ISSUES_SCOPES)}"
+            )
+
+    # 15. v4 Phase 1b Step 2 (Q-B3): per-step `sentry:` connector scope must be
+    # a known scope (SENTRY_SCOPES = {"read"} — the connector is read-only) or
+    # absent. Same independent-axis discipline as rule 14; unknown values (incl.
+    # "write", which the read-only connector has no method for) reject before any
+    # agent runs.
+    for s in brief.steps:
+        if s.sentry is not None and s.sentry not in SENTRY_SCOPES:
+            e.append(
+                f"step {s.number} ({s.name}): sentry {s.sentry!r} is not a "
+                f"valid scope {sorted(SENTRY_SCOPES)}"
             )
 
     if e:
