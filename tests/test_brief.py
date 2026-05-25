@@ -344,3 +344,138 @@ class TestRule12ScriptDefensive(unittest.TestCase):
             "end_to_end_test.script does not exist",
             " ".join(ctx.exception.errors),
         )
+
+
+class TestStepModelField(unittest.TestCase):
+    """v4 Phase 1a Step 2: per-step `model:` field — parse, validate (rule 13),
+    the Q-A4 non-LLM-step warning, defensive empty/null handling, and the
+    existing-briefs backwards-compat guard (reframed criterion 2: every parsed
+    brief must have model=None on every step)."""
+
+    _BUILDS = Path(
+        "/Users/gencodoganay/vaults/second-brain/01-Projects/"
+        "code-workspace/anvil/builds"
+    )
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-model-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-model-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, operations: str = "read", model_line: str = ""):
+        body = f"""---
+brief_version: 1
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: no
+---
+
+## Goal
+
+Exercise the per-step model field.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** {operations}
+- **smoke:** `echo hi`
+- **confirm:** explicit
+{model_line}
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    # --- parsing + validation -----------------------------------------------
+    def test_valid_alias_parses_and_validates(self) -> None:
+        brief, fm = self._parse(model_line="- **model:** haiku")
+        self.assertEqual(brief.steps[0].model, "haiku")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_valid_version_string_parses_and_validates(self) -> None:
+        brief, fm = self._parse(
+            model_line="- **model:** claude-haiku-4-5-20251001")
+        self.assertEqual(brief.steps[0].model, "claude-haiku-4-5-20251001")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_unknown_model_rejected(self) -> None:
+        brief, fm = self._parse(model_line="- **model:** gpt-4")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("model 'gpt-4'", " ".join(ctx.exception.errors))
+
+    def test_sonnet_alias_rejected(self) -> None:
+        # Amendment 1 negative test: sonnet was dropped from MODEL_ALIASES.
+        brief, fm = self._parse(model_line="- **model:** sonnet")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("model 'sonnet'", " ".join(ctx.exception.errors))
+
+    def test_missing_model_is_none_and_validates(self) -> None:
+        brief, fm = self._parse(model_line="")
+        self.assertIsNone(brief.steps[0].model)
+        validate_or_reject(brief, fm)  # no raise
+
+    # --- defensive edge cases -----------------------------------------------
+    def test_empty_string_model_treated_as_absent(self) -> None:
+        brief, fm = self._parse(model_line="- **model:** ")
+        self.assertIsNone(brief.steps[0].model)
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_null_model_treated_as_absent(self) -> None:
+        brief, fm = self._parse(model_line="- **model:** null")
+        self.assertIsNone(brief.steps[0].model)
+        validate_or_reject(brief, fm)  # no raise
+
+    # --- Q-A4: model on a non-LLM-calling step ------------------------------
+    def test_model_on_non_llm_step_warns_and_validates(self) -> None:
+        brief, fm = self._parse(
+            operations="smoke-test, commit", model_line="- **model:** haiku")
+        # Field still parsed (not stripped); brief still validates (warning,
+        # not error)...
+        self.assertEqual(brief.steps[0].model, "haiku")
+        validate_or_reject(brief, fm)  # no raise
+        # ...and a Q-A4 warning is recorded on the brief.
+        self.assertIn(
+            "model-on-non-llm-step",
+            [w.get("kind") for w in brief.parse_warnings],
+        )
+
+    def test_model_on_llm_step_no_warning(self) -> None:
+        brief, _ = self._parse(
+            operations="write", model_line="- **model:** haiku")
+        self.assertNotIn(
+            "model-on-non-llm-step",
+            [w.get("kind") for w in brief.parse_warnings],
+        )
+
+    # --- reframed criterion 2: existing-briefs backwards-compat guard -------
+    def test_existing_briefs_model_field_none(self) -> None:
+        briefs = sorted(self._BUILDS.glob("*/brief.md"))
+        self.assertTrue(briefs, "no existing briefs found to guard")
+        parsed = 0
+        parse_failed: list[tuple[str, str]] = []
+        for b in briefs:
+            try:
+                brief, _ = parse_brief_raw(b)
+            except Exception as exc:  # pre-existing parse issue — out of scope
+                parse_failed.append((b.parent.name, type(exc).__name__))
+                continue
+            parsed += 1
+            for step in brief.steps:
+                self.assertIsNone(
+                    step.model,
+                    f"{b.parent.name} step {step.number}: model must be None "
+                    f"(Step 2 must not populate it), got {step.model!r}",
+                )
+        # Success: every parsed brief had model=None on every step. Briefs that
+        # fail to parse are pre-existing drift, not a Step 2 regression.
+        self.assertGreater(parsed, 0, f"no briefs parsed; failures={parse_failed}")

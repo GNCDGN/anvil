@@ -22,6 +22,14 @@ from pydantic import BaseModel
 from anvil.errors import BriefValidationError
 
 _VALID_OPERATIONS = {"read", "write", "smoke-test", "commit", "shell"}
+# v4 Phase 1a Step 2 (Q-A4): operations that engage the Coder LLM (Claude Code
+# receives these as tool grants — coder.py:178-190: read/write → read & edit
+# tools, shell → Bash; smoke-test/commit are orchestrator-owned and silently
+# dropped from the Coder grant set). A per-step `model:` only bears on steps
+# with at least one of these; declared on a purely orchestrator-owned step it
+# is accepted-with-warning, never rejected. Single source of truth so future
+# operations can be added cleanly.
+LLM_CALLING_OPERATIONS = frozenset({"read", "write", "shell"})
 _REQUIRED_FRONTMATTER = (
     "brief_version",
     "project",
@@ -42,6 +50,12 @@ class Step(BaseModel):
     confirm: Literal["explicit", "auto"]
     commit_message_hint: str | None = None
     notes: str | None = None
+    # v4 Phase 1a Step 2: optional per-step model selection (opt-in; absent →
+    # None → the v3 default model). Validated in validate_or_reject rule 13
+    # against routing.MODEL_ALIASES ∪ events.MODEL_RATES; consumed at the
+    # Planner/subtask call sites in Step 3. brief_version stays 1 — this is a
+    # backwards-compatible addition, not a migration.
+    model: str | None = None
 
 
 class EndToEndTest(BaseModel):
@@ -148,6 +162,15 @@ def _parse_steps(steps_section: str) -> list[Step]:
         name = parts[i + 1].strip()
         block = parts[i + 2]
         confirm = (_field(block, "confirm") or "").lower()
+        # v4 Phase 1a Step 2: optional per-step model. Empty ("") and the
+        # literal "null"/"none" are treated as absent (None) — the defensive
+        # contract; an absent field already yields None from _field.
+        raw_model = _field(block, "model")
+        model = (
+            raw_model
+            if (raw_model and raw_model.lower() not in ("null", "none"))
+            else None
+        )
         steps.append(
             Step(
                 number=number,
@@ -158,6 +181,7 @@ def _parse_steps(steps_section: str) -> list[Step]:
                 confirm=confirm if confirm in ("explicit", "auto") else "explicit",
                 commit_message_hint=_field(block, "commit_message_hint"),
                 notes=_field(block, "notes"),
+                model=model,
             )
         )
     return steps
@@ -245,6 +269,29 @@ def _compute_parse_warnings(brief: Brief) -> list[dict]:
     return warnings
 
 
+def _compute_model_warnings(brief: Brief) -> list[dict]:
+    """v4 Phase 1a Step 2 (Q-A4): a per-step `model:` selection only bears on
+    steps whose scope.operations engage the Coder LLM (read/write/shell, per
+    LLM_CALLING_OPERATIONS). Declared on a step that is purely orchestrator-
+    owned ops (smoke-test/commit), the field is accepted but does nothing, so
+    warn — never reject (the never-raises substrate). Repo-independent (unlike
+    _compute_parse_warnings); surfaces via the same _emit_parse_warnings
+    channel (stderr + the anvil logger / run log)."""
+    warnings: list[dict] = []
+    for step in brief.steps:
+        if step.model is None:
+            continue
+        if set(step.scope_operations) & LLM_CALLING_OPERATIONS:
+            continue
+        warnings.append({
+            "kind": "model-on-non-llm-step",
+            "step_number": step.number,
+            "model": step.model,
+            "operations": list(step.scope_operations),
+        })
+    return warnings
+
+
 def _emit_parse_warnings(warnings: list[dict]) -> None:
     """Emit each warning to stderr and to the anvil logger. Stderr
     line shape matches the brief's spec:
@@ -256,14 +303,23 @@ def _emit_parse_warnings(warnings: list[dict]) -> None:
     import logging
     log = logging.getLogger("anvil.brief")
     for w in warnings:
-        cm = w.get("closest_match")
-        cm_text = f"'{cm}'" if cm else "(none)"
-        line = (
-            f"[brief-warning] step {w['step_number']}: scope.files "
-            f"entry '{w['path']}' does not exist at target_repo_path; "
-            f"closest match: {cm_text}. Continuing; the Coder will "
-            "reconcile at execute time."
-        )
+        if w.get("kind") == "model-on-non-llm-step":
+            line = (
+                f"[brief-warning] step {w['step_number']}: model "
+                f"'{w['model']}' is declared but scope.operations "
+                f"{sorted(w['operations'])} include no LLM-calling operation "
+                "(read/write/shell); the model selection will not affect this "
+                "step's substantive work. Continuing; the brief still validates."
+            )
+        else:  # path-not-found
+            cm = w.get("closest_match")
+            cm_text = f"'{cm}'" if cm else "(none)"
+            line = (
+                f"[brief-warning] step {w['step_number']}: scope.files "
+                f"entry '{w['path']}' does not exist at target_repo_path; "
+                f"closest match: {cm_text}. Continuing; the Coder will "
+                "reconcile at execute time."
+            )
         print(line, file=sys.stderr)
         log.warning(line)
 
@@ -298,7 +354,7 @@ def parse_brief_raw(path: Path) -> tuple[Brief, dict]:
     # Phase 2 Step 6 (decision #18 layer 1): compute parse-time path
     # warnings and attach them to the Brief. Emit each to stderr +
     # logger so the build session sees them before Stage A runs.
-    warnings = _compute_parse_warnings(brief)
+    warnings = _compute_parse_warnings(brief) + _compute_model_warnings(brief)
     if warnings:
         brief = brief.model_copy(update={"parse_warnings": warnings})
         _emit_parse_warnings(warnings)
@@ -454,6 +510,28 @@ def validate_or_reject(
         sp = brief.end_to_end_test.script
         if not _script_exists(brief.target_repo_path, sp):
             e.append(f"end_to_end_test.script does not exist: {sp}")
+
+    # 13. v4 Phase 1a Step 2: per-step model: must be a known alias or a known
+    # version string. MODEL_ALIASES (anvil.routing) and MODEL_RATES
+    # (anvil.events) are the single sources of truth — no hardcoded list.
+    # Unknown names reject before any agent runs (design Part 6); Sonnet was
+    # dropped from MODEL_ALIASES (Amendment 1), so `sonnet` is unknown here.
+    # The model:-on-non-LLM-step case is a warning (Q-A4), not an error, and
+    # is handled at parse time (_compute_model_warnings). Imported locally to
+    # keep the pure-parse path free of routing/anthropic (brief.py's existing
+    # deferred-import idiom, e.g. _emit_parse_warnings' logging import).
+    declared = [(s, s.model) for s in brief.steps if s.model]
+    if declared:
+        from anvil.events import MODEL_RATES
+        from anvil.routing import MODEL_ALIASES
+        known = set(MODEL_ALIASES) | set(MODEL_RATES)
+        for s, m in declared:
+            if m not in known:
+                e.append(
+                    f"step {s.number} ({s.name}): model {m!r} is not a known "
+                    f"alias {sorted(MODEL_ALIASES)} or version string "
+                    f"{sorted(MODEL_RATES)}"
+                )
 
     if e:
         raise BriefValidationError(e)
