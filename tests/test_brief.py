@@ -15,6 +15,8 @@ from pathlib import Path
 
 from anvil.brief import (
     Brief,
+    EndToEndTest,
+    Step,
     parse_brief,
     parse_brief_raw,
     validate_or_reject,
@@ -279,3 +281,66 @@ vps_target_path: /home/test/test
         brief = parse_brief(p)
         validate_or_reject(brief)  # no exception
         self.assertEqual(brief.vps_target_path, "/home/test/test")
+
+
+class TestRule12ScriptDefensive(unittest.TestCase):
+    """v4 Phase 1a housekeeping: rule 12 must reject a non-path
+    end_to_end_test.script value cleanly (BriefValidationError), never crash
+    on os.stat. The 2026-05-20-anvil-v2-phase-1 brief carried a prose sentence
+    there, which raised OSError [Errno 63] File name too long before the
+    _script_exists guard."""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-rule12-"))
+        _git_init(self._repo)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+
+    def _brief_with_e2e_script(self, script: str) -> Brief:
+        # Otherwise-valid brief so rule 12 is the only violation: real git
+        # repo (setUp), one in-scope step, inline smoke (the space makes rule 9
+        # skip its own is_file path).
+        return Brief(
+            brief_version=1,
+            project="p",
+            build_name="b",
+            target_repo="r",
+            target_repo_path=self._repo,
+            vps_deploy="no",
+            steps=[
+                Step(
+                    number=1,
+                    name="s",
+                    scope_files=[],
+                    scope_operations=["read"],
+                    smoke="echo hi",
+                    confirm="explicit",
+                )
+            ],
+            end_to_end_test=EndToEndTest(script=script),
+        )
+
+    def test_prose_script_rejected_cleanly(self) -> None:
+        # Short prose value — the shape of the offending v2 Phase 1 brief.
+        brief = self._brief_with_e2e_script(
+            "(no script — this brief has vps_deploy: no; prose, not a path)"
+        )
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief)
+        self.assertIn(
+            "end_to_end_test.script does not exist",
+            " ".join(ctx.exception.errors),
+        )
+
+    def test_pathologically_long_script_rejected_not_crash(self) -> None:
+        # A single path component longer than NAME_MAX makes os.stat raise
+        # OSError [Errno 63]; without the _script_exists guard this crashed
+        # validate_or_reject instead of producing a clean rejection.
+        brief = self._brief_with_e2e_script("X" * 5000)
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief)
+        self.assertIn(
+            "end_to_end_test.script does not exist",
+            " ".join(ctx.exception.errors),
+        )

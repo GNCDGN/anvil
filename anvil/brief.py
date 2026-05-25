@@ -343,6 +343,28 @@ def _escapes(repo: Path, rel: str) -> bool:
         return True
 
 
+def _script_exists(repo: Path, script: str) -> bool:
+    """True if `script` resolves to an existing file — relative to `repo`, or
+    as an absolute / ~-expanded path. Never raises: a value that is not a
+    valid path (prose, an over-long single component → os.stat OSError
+    [Errno 63] File name too long, or an embedded NUL → ValueError) yields
+    False so the caller rejects it cleanly rather than crashing — the
+    reject-before-any-agent-runs / never-raises validator contract.
+    v4 Phase 1a housekeeping (surfaced by the 2026-05-20-anvil-v2-phase-1
+    brief, whose end_to_end_test.script was a prose sentence)."""
+    try:
+        if (repo / script).is_file():
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        if Path(script).expanduser().is_file():
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def validate_or_reject(
     brief: Brief, raw_frontmatter: dict | None = None,
     vault_root: Path | None = None,
@@ -425,13 +447,12 @@ def validate_or_reject(
             if _resolve_one(link, vault_root) is None:
                 e.append(f"context wiki-link does not resolve: [[{link}]]")
 
-    # 12. end_to_end_test.script exists if declared
+    # 12. end_to_end_test.script exists if declared. _script_exists is
+    # OSError/ValueError-tolerant: a non-path value (prose, over-long string,
+    # embedded NUL) becomes a clean rejection here, not a crash on os.stat.
     if brief.end_to_end_test is not None:
         sp = brief.end_to_end_test.script
-        if not (
-            (brief.target_repo_path / sp).is_file()
-            or Path(sp).expanduser().is_file()
-        ):
+        if not _script_exists(brief.target_repo_path, sp):
             e.append(f"end_to_end_test.script does not exist: {sp}")
 
     if e:
