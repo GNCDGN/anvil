@@ -18,6 +18,7 @@ from openpyxl import load_workbook
 
 from tools import harness_v2
 from anvil import events
+from anvil.calibration import CHEAP_STAGE_A_MODEL
 
 
 _FIX_ROOT = Path(__file__).resolve().parent.parent / "tools" / "fixtures" / "v2-phase-1"
@@ -1258,6 +1259,104 @@ class TestCacheDiagnosticsView(_HarnessTestBase):
             "ORDER BY stage"
         ).fetchall()
         self.assertEqual([r[0] for r in rows], ["A", "B"])
+
+    # --- v3 Phase 3 3b (β-iii): canary_baseline.api_end → stage='A' ---
+
+    def _ingest_shadow_step(self, run_id="T11-shadow-3b"):
+        # The realistic 3b step shape: a primary Opus Stage A call PLUS a
+        # parallel Haiku shadow call recorded under canary_baseline (β-ii/β-iii).
+        # The canary_baseline payload mirrors anvil/planner.py:_emit_canary_baseline
+        # exactly — model + token/cache fields, NO vault_index_hit / block sizes.
+        run_dir = self.tmp_path / run_id
+        run_dir.mkdir(exist_ok=True)
+        a_blocks = {"brief": 800, "state": 120, "vault_files": 60, "prior_step": 0}
+        evs = [
+            _event_row(0, "run.start", {}, run_id=run_id),
+            _event_row(10, "planner.stage_a.api_end",
+                       {"model": "claude-opus-4-7", "input_tokens": 1040,
+                        "vault_index_hit": True,
+                        "candidate_user_block_sizes": a_blocks,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 3479,
+                        "seconds_since_cache_creation": None, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(15, "planner.stage_a.canary_baseline.api_end",
+                       {"step_idx": 0, "model": CHEAP_STAGE_A_MODEL,
+                        "input_tokens": 900, "output_tokens": 30,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "duration_ms": 1200, "ok": True},
+                       run_id=run_id, step_idx=0),
+            _event_row(30, "run.end", {"drops": 0}, run_id=run_id),
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in evs) + "\n", encoding="utf-8")
+        (run_dir / "mode.txt").write_text("real\n", encoding="utf-8")
+        return harness_v2.ingest(self.con, run_dir)
+
+    def test_primary_stage_a_row_unchanged_by_extension(self) -> None:
+        # The existing planner.stage_a.api_end → 'A' mapping is intact: the Opus
+        # primary row still projects model + cache + block fields exactly.
+        self._ingest_shadow_step()
+        row = self.con.execute(
+            "SELECT model, vault_index_hit, candidate_block_sizes_sum, input_tokens "
+            "FROM cache_diagnostics WHERE run_id='T11-shadow-3b' AND stage='A' "
+            "AND model LIKE 'claude-opus%'"
+        ).fetchone()
+        self.assertEqual(row[0], "claude-opus-4-7")
+        self.assertIs(row[1], True)                 # vault_index_hit populated
+        self.assertEqual(row[2], 800 + 120 + 60 + 0)
+        self.assertEqual(row[3], 1040)
+
+    def test_canary_baseline_maps_to_stage_a_with_haiku_model(self) -> None:
+        # The new kind projects as a stage='A' row, model + cache fields populated.
+        self._ingest_shadow_step()
+        row = self.con.execute(
+            "SELECT model, cache_read_input_tokens, cache_creation_input_tokens, "
+            "       input_tokens "
+            "FROM cache_diagnostics WHERE run_id='T11-shadow-3b' AND stage='A' "
+            "AND model LIKE 'claude-haiku%'"
+        ).fetchone()
+        self.assertIsNotNone(row)                   # the row is present, stage='A'
+        self.assertEqual(row[0], CHEAP_STAGE_A_MODEL)
+        self.assertEqual(row[1], 0)                 # cr populated
+        self.assertEqual(row[2], 0)                 # cc populated
+        self.assertEqual(row[3], 900)
+
+    def test_canary_baseline_null_block_fields_not_filtered(self) -> None:
+        # vault_index_hit / block-size fields are NULL on the canary_baseline row
+        # (the payload lacks them) — the row must NOT be filtered out.
+        self._ingest_shadow_step()
+        row = self.con.execute(
+            "SELECT vault_index_hit, candidate_user_block_sizes, "
+            "       seconds_since_cache_creation, candidate_block_sizes_sum "
+            "FROM cache_diagnostics WHERE run_id='T11-shadow-3b' AND stage='A' "
+            "AND model LIKE 'claude-haiku%'"
+        ).fetchone()
+        self.assertIsNotNone(row)                   # present despite the nulls
+        self.assertIsNone(row[0])                   # vault_index_hit null
+        self.assertIsNone(row[1])                   # candidate_user_block_sizes null
+        self.assertIsNone(row[2])                   # seconds_since_cache_creation null
+        self.assertEqual(row[3], 0)                 # block sum COALESCEs to 0
+
+    def test_two_kinds_disambiguated_by_model(self) -> None:
+        # WHERE stage='A' returns BOTH kinds; cd.model discriminates them.
+        self._ingest_shadow_step()
+        both = self.con.execute(
+            "SELECT COUNT(*) FROM cache_diagnostics "
+            "WHERE run_id='T11-shadow-3b' AND stage='A'"
+        ).fetchone()[0]
+        self.assertEqual(both, 2)                   # Opus primary + Haiku shadow
+        haiku = self.con.execute(
+            "SELECT COUNT(*) FROM cache_diagnostics WHERE run_id='T11-shadow-3b' "
+            "AND stage='A' AND model LIKE 'claude-haiku%'"
+        ).fetchone()[0]
+        opus = self.con.execute(
+            "SELECT COUNT(*) FROM cache_diagnostics WHERE run_id='T11-shadow-3b' "
+            "AND stage='A' AND model LIKE 'claude-opus%'"
+        ).fetchone()[0]
+        self.assertEqual(haiku, 1)                  # the canary_baseline row only
+        self.assertEqual(opus, 1)                   # the primary row only
 
 
 class TestPerModelSystemPromptTokensSingleSource(unittest.TestCase):

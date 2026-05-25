@@ -1038,11 +1038,18 @@ class _FakeBaseline:
     """Test double for HistoricalBaselineProvider: returns a fixed lookup
     result (a list = hit, None = miss) regardless of (task_id, step_idx)."""
 
-    def __init__(self, result):
+    def __init__(self, result, corpus=frozenset()):
         self._result = result
+        self._corpus = corpus
 
     def lookup(self, task_id, step_idx):
         return self._result
+
+    def corpus_distinct_paths(self):
+        # v3 Phase 3 3b (β-i): the planner calls this on every plan_step. Default
+        # empty → corpus_baselines=None → the single-row K-check (today's
+        # behaviour), so these empty-context canary tests are unperturbed.
+        return self._corpus
 
 
 class TestPhase1cHistoricalBaseline(_PlannerEventsBase):
@@ -1259,6 +1266,237 @@ class TestPhase2cProviderSelectedPaths(unittest.TestCase):
         self.assertIsNone(
             planner_mod.HistoricalBaselineProvider("/no/such.duckdb").lookup("X", 0))
         self.assertIsNone(planner_mod.HistoricalBaselineProvider(None).lookup("X", 0))
+
+
+class TestCorpusDistinctPaths(unittest.TestCase):
+    """v3 Phase 3 3b (β-i, Rev B §B.2): HistoricalBaselineProvider.
+    corpus_distinct_paths() returns the cross-row baseline vocabulary — the
+    union of distinct real-mode selected_paths across the whole corpus — for the
+    comparator's K=2 distinctness check. Never raises; caches; empty on a
+    corpus-less DB."""
+
+    def _make_selections_db(self, rows):
+        # rows: list of (mode, selected_paths_list). Builds a stage_a_selections
+        # base table (the method queries FROM stage_a_selections — a base table
+        # serves identically to the harness view).
+        import duckdb
+        path = Path(tempfile.mkdtemp()) / "corpus.duckdb"
+        con = duckdb.connect(str(path))
+        con.execute(
+            "CREATE TABLE stage_a_selections (mode VARCHAR, selected_paths JSON)")
+        for (mode, sel) in rows:
+            con.execute("INSERT INTO stage_a_selections VALUES (?, ?)",
+                        [mode, json.dumps(sel)])
+        con.close()
+        return path
+
+    def test_returns_union_of_distinct_real_mode_paths(self) -> None:
+        # Single-path + multi-path real rows union into the vocabulary; a
+        # mock-mode row is excluded (mode='real' filter).
+        db = self._make_selections_db([
+            ("real", ["a.md"]),
+            ("real", ["b.md"]),
+            ("real", ["c.md", "d.md"]),  # multi-path row
+            ("real", ["a.md"]),           # duplicate path collapses
+            ("mock", ["z.md"]),           # excluded — mock mode
+        ])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.corpus_distinct_paths(),
+                         frozenset({"a.md", "b.md", "c.md", "d.md"}))
+
+    def test_result_is_cached(self) -> None:
+        db = self._make_selections_db([("real", ["a.md"]), ("real", ["b.md"])])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        first = prov.corpus_distinct_paths()
+        self.assertEqual(first, frozenset({"a.md", "b.md"}))
+        self.assertIs(prov.corpus_distinct_paths(), first)  # same object → cached
+
+    def test_empty_db_returns_empty_frozenset(self) -> None:
+        # Table present, zero rows → empty frozenset (not None).
+        db = self._make_selections_db([])
+        prov = planner_mod.HistoricalBaselineProvider(db)
+        self.assertEqual(prov.corpus_distinct_paths(), frozenset())
+
+    def test_corpusless_and_bad_db_never_raise(self) -> None:
+        # No stage_a_selections table (e.g. a Phase 1b exit-sweep / events-only
+        # DB), a missing file, and a None path all degrade to empty frozenset.
+        import duckdb
+        events_only = Path(tempfile.mkdtemp()) / "events-only.duckdb"
+        con = duckdb.connect(str(events_only))
+        con.execute("CREATE TABLE events (run_id VARCHAR)")
+        con.close()
+        self.assertEqual(
+            planner_mod.HistoricalBaselineProvider(events_only).corpus_distinct_paths(),
+            frozenset())
+        self.assertEqual(
+            planner_mod.HistoricalBaselineProvider("/no/such.duckdb").corpus_distinct_paths(),
+            frozenset())
+        self.assertEqual(
+            planner_mod.HistoricalBaselineProvider(None).corpus_distinct_paths(),
+            frozenset())
+
+
+class TestShadowExecuteHaiku(_PlannerEventsBase):
+    """v3 Phase 3 3b (β-ii): the confidence-independent shadow-execute-Haiku
+    branch. Runs Haiku Stage A in parallel during a real-mode rich-context
+    SHADOW step (opt-in), grades its selection against Opus with the INVERTED
+    orientation (routed=Haiku, baseline=Opus), and leaves route_actual=Opus."""
+
+    def _shadow_planner(self):
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        return Planner(
+            model="claude-opus-4-7",
+            policy=RoutingPolicy(PHASE_1B_STAGE_A_SHADOW, calibration=cal),
+        )
+
+    def _opt_in(self):
+        return mock.patch.dict(
+            os.environ, {"ANVIL_SHADOW_EXECUTE_HAIKU": "1"})
+
+    # --- trigger gating (§3.1) ---
+
+    def test_trigger_fires_real_shadow_richctx_optin(self) -> None:
+        events.begin_run("T11-rich-dependency-real")
+        p = self._shadow_planner()
+        p._current_context_paths_count = 4
+        with self._opt_in():
+            self.assertTrue(p._should_shadow_execute_haiku())
+
+    def test_trigger_off_when_optout(self) -> None:
+        events.begin_run("T11-rich-dependency-real")
+        p = self._shadow_planner()
+        p._current_context_paths_count = 4
+        # ANVIL_SHADOW_EXECUTE_HAIKU unset → dormant.
+        self.assertFalse(p._should_shadow_execute_haiku())
+
+    def test_trigger_off_on_empty_context(self) -> None:
+        events.begin_run("T1-doc-edit-real")
+        p = self._shadow_planner()
+        p._current_context_paths_count = 0  # empty-context = canary's scope
+        with self._opt_in():
+            self.assertFalse(p._should_shadow_execute_haiku())
+
+    def test_trigger_off_on_mock_mode(self) -> None:
+        events.begin_run("T11-rich-dependency-mock")  # not -real
+        p = self._shadow_planner()
+        p._current_context_paths_count = 4
+        with self._opt_in():
+            self.assertFalse(p._should_shadow_execute_haiku())
+
+    def test_trigger_off_under_canary_policy(self) -> None:
+        # The canary path runs its own baseline; shadow-execute is shadow-only.
+        events.begin_run("T11-rich-dependency-real")
+        cal = RoutingCalibration(
+            [{"context_paths_count": 0, "paths_returned": 0}]).policy
+        p = Planner(model="claude-opus-4-7",
+                    policy=RoutingPolicy(PHASE_1B_STAGE_A_CANARY, calibration=cal))
+        p._current_context_paths_count = 4
+        with self._opt_in():
+            self.assertFalse(p._should_shadow_execute_haiku())
+
+    # --- the helper (§3.2) ---
+
+    def test_helper_emits_canary_baseline_kind_with_haiku_model(self) -> None:
+        # On success: targets Haiku, emits CANARY_BASELINE_KIND (model=Haiku),
+        # returns the parsed selection.
+        path = "/v/note.md"
+        client, capture = _make_fake_client(
+            input_tokens=300, output_tokens=20, cache_creation=0,
+            cache_read=0, text=path)
+        p = self._shadow_planner()
+        p._client = client
+        sel = p._stage_a_shadow_execute_haiku("PROMPT", 0, {path: {}})
+        self.assertEqual(sel, [path])                      # parsed selection
+        self.assertEqual(capture["model"], CHEAP_STAGE_A_MODEL)  # API ran Haiku
+        ev = next(e for e in self._events_for()
+                  if e["kind"] == events.CANARY_BASELINE_KIND)["data"]
+        self.assertEqual(ev["model"], CHEAP_STAGE_A_MODEL)
+        self.assertTrue(ev["ok"])
+
+    def test_helper_never_raises_on_api_failure(self) -> None:
+        client = mock.MagicMock()
+        client.with_options.return_value = client
+        client.messages.stream.side_effect = RuntimeError("haiku boom")
+        p = self._shadow_planner()
+        p._client = client
+        sel = p._stage_a_shadow_execute_haiku("PROMPT", 0, {"/v/n.md": {}})
+        self.assertIsNone(sel)                              # → None, no raise
+        ev = next(e for e in self._events_for()
+                  if e["kind"] == events.CANARY_BASELINE_KIND)["data"]
+        self.assertFalse(ev["ok"])                          # ok=False recorded
+        self.assertEqual(ev["model"], CHEAP_STAGE_A_MODEL)
+
+    # --- plan_step integration (orientation + route_actual) ---
+
+    def _rich_brief_and_state(self):
+        # A rich-context brief: one absolute context_path file so plan_step
+        # computes context_paths_count=1 and _build_vault_index indexes it.
+        ctx_file = self.tmp_path / "ctx-note.md"
+        ctx_file.write_text("---\ntitle: ctx\n---\nbody\n", encoding="utf-8")
+        brief = Brief(
+            brief_version=1, project="anvil", build_name="rich-test",
+            target_repo="x", target_repo_path=Path("/tmp"), vps_deploy="no",
+            context_paths=[ctx_file],
+            steps=[Step(number=1, name="s", scope_files=["a.py"],
+                        scope_operations=["write"], smoke="echo x",
+                        confirm="explicit")],
+        )
+        state = init_state(brief, "2026-05-20T00:00:00", brief_path="/nonexistent")
+        return brief, state, str(ctx_file)
+
+    def test_plan_step_inverts_orientation_and_keeps_route_actual_opus(self) -> None:
+        events.begin_run("T11-rich-dependency-real")
+        brief, state, ctx_path = self._rich_brief_and_state()
+        # Opus (the primary Stage A via the fake client) selects the ctx file.
+        client, _ = _make_fake_client(
+            input_tokens=400, output_tokens=30, cache_creation=0,
+            cache_read=0, text=ctx_path)
+        p = self._shadow_planner()
+        p._client = client
+        # Stub the Haiku helper: record the call, return a DROP ([]), so the
+        # comparator sees routed=[] (Haiku) vs baseline=[ctx_path] (Opus).
+        calls = []
+        def _stub(prompt, step_idx, vault_index):
+            calls.append((prompt, step_idx))
+            return []
+        p._stage_a_shadow_execute_haiku = _stub
+        with self._opt_in():
+            p.plan_step(brief, state, 0)
+        self.assertEqual(len(calls), 1)  # helper was invoked
+        evs = self._events_for("T11-rich-dependency-real")
+        begin = next(e for e in evs
+                     if e["kind"] == "stage_a.shadow_compare.begin")["data"]
+        # Inverted orientation: routed = Haiku ([]), baseline = Opus ([ctx]).
+        self.assertEqual(begin["routed_paths"], [])
+        self.assertEqual(begin["baseline_paths"], [ctx_path])
+        self.assertEqual(begin["baseline_source"], "shadow-execute")
+        # route_actual stays Opus on the primary Stage A call.
+        a_end = next(e for e in evs
+                     if e["kind"] == "planner.stage_a.api_end")["data"]
+        self.assertEqual(a_end["route_actual"], "claude-opus-4-7")
+
+    def test_plan_step_haiku_none_falls_back_to_identity(self) -> None:
+        events.begin_run("T11-rich-dependency-real")
+        brief, state, ctx_path = self._rich_brief_and_state()
+        client, _ = _make_fake_client(
+            input_tokens=400, output_tokens=30, cache_creation=0,
+            cache_read=0, text=ctx_path)
+        p = self._shadow_planner()
+        p._client = client
+        p._stage_a_shadow_execute_haiku = lambda *a, **k: None  # Haiku miss
+        with self._opt_in():
+            p.plan_step(brief, state, 0)
+        begin = next(e for e in self._events_for("T11-rich-dependency-real")
+                     if e["kind"] == "stage_a.shadow_compare.begin")["data"]
+        # Identity comparison preserved: routed == baseline == Opus's selection.
+        self.assertEqual(begin["routed_paths"], [ctx_path])
+        self.assertEqual(begin["baseline_paths"], [ctx_path])
+        self.assertEqual(begin["baseline_source"], "identity")
+
+    def test_valid_kinds_unchanged(self) -> None:
+        from anvil.events import VALID_KINDS
+        self.assertEqual(len(VALID_KINDS), 51)  # Rev B §B.3: no new kind
 
 
 class TestSelectedPathsAndRawResponseRecording(_PlannerEventsBase):

@@ -630,6 +630,57 @@ class TestComparatorDisposition(_EventsTestBase):
         self.assertNotIn("stage_a.silent_miss.detected",
                          [r["kind"] for r in rows])
 
+    def test_emit_threads_corpus_baselines_lifts_single_path_to_genuine_match(
+            self) -> None:
+        # v3 Phase 3 3b (β-i, Rev B §B.1/B.2): the threading the planner relies
+        # on. The SAME single-path identity comparison is vacuous-uniform under
+        # the single-row default (corpus_baselines=None) but genuine-match when
+        # a diverse cross-row corpus is threaded through — proving
+        # emit_stage_a_shadow_compare carries corpus_baselines to the classifier
+        # (events.py:451). This is what lifts the single-path accept-shapes
+        # (T7/T8/T9/T10/T12) out of vacuous-uniform so 3c can calibrate them.
+        events.begin_run("r-default")
+        events.emit_stage_a_shadow_compare(
+            step_idx=0, routed_paths=["a"], baseline_paths=["a"])
+        events.end_run()
+        end_default = next(
+            r for r in self._read_events("r-default")
+            if r["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(end_default["disposition"], "vacuous-uniform")
+
+        events.begin_run("r-corpus")
+        events.emit_stage_a_shadow_compare(
+            step_idx=0, routed_paths=["a"], baseline_paths=["a"],
+            corpus_baselines=[["a", "b"]])  # cross-row vocab wrapped as one sel
+        events.end_run()
+        end_corpus = next(
+            r for r in self._read_events("r-corpus")
+            if r["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(end_corpus["disposition"], "genuine-match")
+        self.assertEqual(end_corpus["silent_miss_count"], 0)
+
+    def test_emit_corpus_baselines_with_drop_is_genuine_mismatch(self) -> None:
+        # v3 Phase 3 3b (β-i): the T11-shaped case. Opus selects 2 paths, Haiku
+        # drops one; the populated cross-row corpus passes K=2, so the drop is
+        # NOT excused as vacuous-uniform — it is graded genuine-mismatch and
+        # fires stage_a.silent_miss.detected. This is the reject-path evidence
+        # 3c consumes (and the one designed mismatch in the live 3b sweep).
+        events.begin_run("r-mismatch")
+        result = events.emit_stage_a_shadow_compare(
+            step_idx=0, routed_paths=["a"], baseline_paths=["a", "b"],
+            corpus_baselines=[["a", "b"]])  # K=2 satisfied
+        events.end_run()
+        self.assertEqual(result["silent_miss_count"], 1)  # "b" dropped
+        rows = self._read_events("r-mismatch")
+        end = next(r for r in rows
+                   if r["kind"] == "stage_a.shadow_compare.end")["data"]
+        self.assertEqual(end["disposition"],
+                         events.DISPOSITION_GENUINE_MISMATCH)
+        self.assertNotEqual(end["disposition"], events.DISPOSITION_GENUINE_MATCH)
+        detected = [r for r in rows
+                    if r["kind"] == "stage_a.silent_miss.detected"]
+        self.assertEqual(len(detected), 1)  # the mismatch fires the episode
+
 
 class TestCacheDiagnosticsHelpers(_EventsTestBase):
     """v3 Phase 0 Step 4 (V3P0-6): the token estimator, block-size

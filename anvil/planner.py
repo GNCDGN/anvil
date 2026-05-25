@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -32,8 +33,17 @@ from pydantic import BaseModel
 
 from anvil import events as _events
 from anvil.brief import Step
+from anvil.calibration import CHEAP_STAGE_A_MODEL
 from anvil.policy import PHASE_1A_PLACEHOLDER, PHASE_1B_STAGE_A_CANARY, RoutingPolicy
 from anvil.voice import load_voice_spec
+
+# v3 Phase 3 3b (β-ii): opt-in env var gating the shadow-execute-Haiku branch.
+# Dormant unless explicitly truthy — keeps every existing sweep (Phase 1b/2)
+# byte-identical if re-run, and lets the 3b collection sweep (Step 6) + tests
+# turn it on deterministically. Sibling to ANVIL_CANARY_TASKS="" (the 3a knob
+# that opts OUT of canary routing); this opts IN to shadow collection.
+_SHADOW_EXECUTE_ENV = "ANVIL_SHADOW_EXECUTE_HAIKU"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 log = logging.getLogger("anvil.planner")
 
@@ -333,11 +343,45 @@ class Planner:
         else:
             baseline_selected = selected
             baseline_source = "identity"
+        # v3 Phase 3 3b (β-i): supply the cross-row corpus vocabulary so the
+        # comparator's K=2 distinctness check grades a selection against the
+        # whole historical corpus, not the single emitting row (Rev B §B.2).
+        # classify_comparator_disposition expects list[list[str]] — wrap the
+        # flat vocabulary as one pseudo-selection so its union recovers it.
+        # Empty vocab (no provider, or a corpus-less DB) → None → the single-row
+        # default (today's behaviour). Never raises (provider is never-raise).
+        corpus_vocab = (
+            self._historical_baseline.corpus_distinct_paths()
+            if self._historical_baseline is not None else frozenset()
+        )
+        corpus_baselines = [sorted(corpus_vocab)] if corpus_vocab else None
+        # v3 Phase 3 3b (β-ii): shadow-execute Haiku. On a real-mode rich-context
+        # SHADOW step with the opt-in set, run Haiku in parallel and grade its
+        # selection against Opus's. INVERTED orientation (Rev B §B.4 #2, brief §5
+        # watch item): routed = Haiku (the observed cheap selection), baseline =
+        # Opus (`selected`, the ground truth) — so silent_miss = Opus paths Haiku
+        # dropped (the T11 genuine-mismatch the design grades). route_actual is
+        # UNCHANGED (Opus) — _decide_stage_a_shadow is untouched and plan_step
+        # still returns Opus's `selected` downstream; Haiku is observed-only via
+        # the comparator event. On a Haiku miss (None) or trigger-off, the
+        # comparator runs as before (identity/canary).
+        routed_for_compare = selected
+        baseline_for_compare = baseline_selected
+        compare_source = baseline_source
+        if self._should_shadow_execute_haiku():
+            haiku_selected = self._stage_a_shadow_execute_haiku(
+                stage_a_prompt, step_idx, vault_index
+            )
+            if haiku_selected is not None:
+                routed_for_compare = haiku_selected
+                baseline_for_compare = selected
+                compare_source = "shadow-execute"
         _events.emit_stage_a_shadow_compare(
             step_idx=step_idx,
-            routed_paths=selected,
-            baseline_paths=baseline_selected,
-            baseline_source=baseline_source,
+            routed_paths=routed_for_compare,
+            baseline_paths=baseline_for_compare,
+            baseline_source=compare_source,
+            corpus_baselines=corpus_baselines,
         )
         result = self._run_stage_b_with_retry(brief, state, step_idx, selected)
         if result.get("escalate"):
@@ -732,6 +776,93 @@ class Planner:
                 step_idx, baseline_model, None, 0, ok=False, error=str(e)[:300]
             )
             return ""
+
+    def _should_shadow_execute_haiku(self) -> bool:
+        """v3 Phase 3 3b (β-ii): gate for the shadow-execute-Haiku branch. ALL
+        must hold (Rev B §B.4 #2):
+          - opt-in env `ANVIL_SHADOW_EXECUTE_HAIKU` truthy (dormant by default);
+          - real mode — the run_id carries the `-real` suffix (the Planner has
+            no mode attribute; mode lives only in the run_id). Mock mode is
+            excluded: this method makes a real Haiku API call, which a mock
+            sweep must never do (MockedPlanner does NOT override it);
+          - the policy is NOT the canary — the canary path already runs its own
+            baseline comparison; shadow-execute is shadow-only (route_actual
+            stays Opus). A canary run never reaches this branch;
+          - rich context (`context_paths_count > 0`). Empty-context Haiku Stage A
+            is the canonical Haiku-Stage-A canary's exclusive scope
+            (`canaries/haiku-stage-a-cr-cc-zero.md`); shadow-execute grades the
+            rich-context shapes only.
+        Never raises (degrades to False on any unexpected internal state)."""
+        try:
+            if os.environ.get(_SHADOW_EXECUTE_ENV, "").strip().lower() not in _TRUTHY:
+                return False
+            if not (_events.current_run_id() or "").endswith("-real"):
+                return False
+            if getattr(self._policy, "policy_version", None) == PHASE_1B_STAGE_A_CANARY:
+                return False
+            return (getattr(self, "_current_context_paths_count", 0) or 0) > 0
+        except Exception:  # noqa: BLE001 — never-raise contract
+            return False
+
+    def _stage_a_shadow_execute_haiku(
+        self, prompt: str, step_idx, vault_index: dict
+    ) -> "list[str] | None":
+        """v3 Phase 3 3b (β-ii): the parallel Haiku Stage A shadow call. Mirrors
+        `_stage_a_canary_baseline` but targets the cheap model
+        (`CHEAP_STAGE_A_MODEL`, Haiku) instead of the per-stage Opus reference —
+        it runs Haiku on the SAME assembled Stage A prompt to OBSERVE what a
+        cheap route would select, parses it with the same Stage A parser, and
+        records its cost-bearing event under `CANARY_BASELINE_KIND` (the existing
+        kind — no new VALID_KINDS entry, Rev B §B.3; the kind exists precisely to
+        log a parallel model call without perturbing the Stage A 1:1 invariant).
+        The cache_diagnostics view extension (Step 4 / β-iii) maps this kind to
+        stage 'A', so the emitted shape is identical to the Opus canary baseline
+        (model + cache fields) — no `stage` data field is added here.
+
+        Returns the parsed Haiku selection (the COMPARATOR's `routed` side), or
+        None on any API/parse failure. Never raises (→ None, and a ok=False
+        baseline event), so a Haiku hiccup can never tank a SHADOW step — the
+        caller falls back to the identity comparison and the Opus selection is
+        still what plan_step returns."""
+        try:
+            client = self._client.with_options(timeout=_STAGE_A_TIMEOUT)
+            t0 = time.monotonic()
+            system_param = (
+                [{
+                    "type": "text",
+                    "text": self._system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+                if self._system_prompt else self._system_prompt
+            )
+            with client.messages.stream(
+                model=CHEAP_STAGE_A_MODEL,
+                max_tokens=8192,
+                system=system_param,
+                messages=[{
+                    "role": "user",
+                    "content": _split_user_for_brief_cache(prompt),
+                }],
+            ) as stream:
+                final = stream.get_final_message()
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            text = "".join(
+                b.text for b in final.content
+                if getattr(b, "type", None) == "text"
+            )
+            self._emit_canary_baseline(
+                step_idx, CHEAP_STAGE_A_MODEL, final.usage, duration_ms, ok=True
+            )
+            return _parse_stage_a_response(text, vault_index, step_idx=step_idx)
+        except Exception as e:  # noqa: BLE001 — never-raise contract
+            log.error(
+                f"[planner] shadow-execute Haiku (step={step_idx}) failed "
+                f"({e}); no shadow selection"
+            )
+            self._emit_canary_baseline(
+                step_idx, CHEAP_STAGE_A_MODEL, None, 0, ok=False, error=str(e)[:300]
+            )
+            return None
 
     def _run_stage_b_with_retry(
         self, brief, state, step_idx: int, selected_paths: list[str]
@@ -1297,6 +1428,9 @@ class HistoricalBaselineProvider:
 
     def __init__(self, db_path: "Path | str | None") -> None:
         self._db_path = Path(db_path) if db_path else None
+        # v3 Phase 3 3b (β-i): cache for corpus_distinct_paths(). None = not yet
+        # computed; an empty frozenset is a valid computed result (empty corpus).
+        self._corpus_cache: "frozenset[str] | None" = None
 
     def lookup(self, task_id: str, step_idx: int) -> "list[str] | None":
         """Return the recorded baseline selection for (task_id, step_idx), or
@@ -1347,6 +1481,42 @@ class HistoricalBaselineProvider:
             return None  # rich-context legacy: can't reconstruct a list from a count
         except Exception:  # noqa: BLE001 — never-raise contract
             return None
+
+    def corpus_distinct_paths(self) -> "frozenset[str]":
+        """v3 Phase 3 3b (β-i, Rev B §B.2): the cross-row baseline vocabulary —
+        the union of distinct Opus `selected_paths` across the WHOLE historical
+        corpus (every real-mode `stage_a_selections` row, no task filter; the
+        historical DB *is* the corpus). This is what the comparator's per-corpus
+        K=2 distinctness check (`anvil/events.py:398`) grades against, so a
+        single-path baseline is no longer judged in isolation (which trips
+        `vacuous-uniform`) but against the corpus vocabulary.
+
+        Cached on first call — the corpus is fixed at sweep-start. An empty /
+        missing / broken DB, or one whose schema lacks `stage_a_selections`
+        (e.g. the Phase 1b exit-sweep, or a minimal events-only DB), returns an
+        empty frozenset; the caller decides what an empty corpus means (it
+        degrades the K-check to the single-row default — today's behaviour).
+        Never raises (mirrors `lookup`)."""
+        if self._corpus_cache is not None:
+            return self._corpus_cache
+        result: "frozenset[str]" = frozenset()
+        if self._db_path and self._db_path.is_file():
+            try:
+                import duckdb
+                con = duckdb.connect(str(self._db_path), read_only=True)
+                try:
+                    rows = con.execute(
+                        "SELECT DISTINCT path FROM ("
+                        "SELECT UNNEST(CAST(selected_paths AS VARCHAR[])) AS path "
+                        "FROM stage_a_selections WHERE mode = 'real')"
+                    ).fetchall()
+                    result = frozenset(r[0] for r in rows if r[0] is not None)
+                finally:
+                    con.close()
+            except Exception:  # noqa: BLE001 — never-raise contract
+                result = frozenset()
+        self._corpus_cache = result
+        return result
 
 
 def _assemble_stage_a_prompt(

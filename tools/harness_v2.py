@@ -851,6 +851,23 @@ _SILENT_MISS_EPISODES_COLUMNS: tuple[str, ...] = (
 # injected CASE — the `model` column lets consumers grade BOTH models at their
 # native slope (Opus 1.64, Haiku 1.18); the Phase 1c Opus-only filter is
 # retired. task_id via the run_metadata join (operations-view pattern).
+#
+# v3 Phase 3 3b (β-iii, Rev B §B.3): TWO kinds map to stage='A'.
+#   - planner.stage_a.api_end — the primary Opus Stage A call. All columns
+#     populated.
+#   - planner.stage_a.canary_baseline.api_end — the parallel cheap-model Stage A
+#     call (canary-baseline orientation in Phase 2; shadow-execute orientation in
+#     v3 Phase 3 3b onward). Cache-token fields (cr/cc), input_tokens, and model
+#     are populated; vault_index_hit and the block-size fields (and thus
+#     candidate_user_block_sizes, seconds_since_cache_creation) are NULL — the
+#     event payload (anvil/planner.py:_emit_canary_baseline) does not carry them.
+#     These rows are NOT filtered out; the nulls flow through.
+# The stage column for canary_baseline rows is SYNTHESIZED by the CASE on
+# e.kind — the underlying event has no stage field. Downstream queries filtering
+# on cd.stage='A' will receive BOTH kinds; a query needing to discriminate must
+# filter on cd.model (Haiku vs Opus) or join back to events on kind. (The
+# empty-context Haiku Stage A canary already filters model LIKE 'claude-haiku%',
+# so it reads only the Haiku rows; Finding D filters stage='B', untouched here.)
 _CACHE_DIAGNOSTICS_VIEW_SQL = """
 CREATE OR REPLACE VIEW cache_diagnostics AS
 SELECT
@@ -860,6 +877,7 @@ SELECT
     e.step_idx,
     CASE e.kind
         WHEN 'planner.stage_a.api_end' THEN 'A'
+        WHEN 'planner.stage_a.canary_baseline.api_end' THEN 'A'
         WHEN 'planner.stage_b.api_end' THEN 'B'
         WHEN 'planner.stage_c.api_end' THEN 'C'
     END AS stage,
@@ -896,6 +914,7 @@ FROM events e
 LEFT JOIN run_metadata rm USING (run_id, mode)
 WHERE e.kind IN (
     'planner.stage_a.api_end',
+    'planner.stage_a.canary_baseline.api_end',
     'planner.stage_b.api_end',
     'planner.stage_c.api_end'
 )
