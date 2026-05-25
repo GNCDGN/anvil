@@ -32,6 +32,7 @@ import yaml
 from pydantic import BaseModel
 
 from anvil import events as _events
+from anvil import routing
 from anvil.brief import Step
 from anvil.calibration import CHEAP_STAGE_A_MODEL
 from anvil.policy import PHASE_1A_PLACEHOLDER, PHASE_1B_STAGE_A_CANARY, RoutingPolicy
@@ -58,6 +59,16 @@ _STAGE_A_TIMEOUT = 30
 # planner's construction default and the placeholder shadow route are
 # distinct concepts that will diverge once Phase 1b lands real routing.
 DEFAULT_PLANNER_MODEL = "claude-opus-4-7"
+
+# v4 Phase 1a Step 3 (Amendment 5): construction-default constants for
+# call-site clarity. Both equal DEFAULT_PLANNER_MODEL — the v3 Stage A/B
+# default is Opus under the placeholder policy. "Haiku on Stage A" is NOT a
+# default: it is the calibration canary (PHASE_1B_STAGE_A_CANARY) routing
+# empty-context Stage A to CHEAP_STAGE_A_MODEL. These are documentation aids;
+# the live per-stage default is self.stage_<x>_model (= base = this constant
+# when no per-stage kwarg is passed).
+DEFAULT_STAGE_A_MODEL = DEFAULT_PLANNER_MODEL
+DEFAULT_STAGE_B_MODEL = DEFAULT_PLANNER_MODEL
 
 
 class ScopeBoundaries(BaseModel):
@@ -263,6 +274,21 @@ class Planner:
         self._current_step_idx = step_idx
         self._current_context_paths_count = len(
             getattr(brief, "context_paths", []) or []
+        )
+        # v4 Phase 1a Step 3 (Amendment 5): per-step operator model override.
+        # Read step.model (Step 2's brief-schema field), resolve it via
+        # routing.resolve_model, and stash the resolved version string for
+        # _api_model to consume. When set it overrides the policy (incl. the
+        # canary) for the model the API runs and the `model` event field
+        # records; None (no `model:` declared) → the existing v3 machinery runs
+        # unchanged → byte-identical default path. Resolved only when declared
+        # (a no-op on the default path); set fresh per step so it never leaks.
+        try:
+            _step_model = brief.steps[step_idx].model
+        except (IndexError, AttributeError):
+            _step_model = None
+        self._current_step_model = (
+            routing.resolve_model(_step_model) if _step_model else None
         )
         stage_a_resp = self._call_anthropic(
             system=self._system_prompt, user=stage_a_prompt,
@@ -489,7 +515,21 @@ class Planner:
         when it didn't act). Gating on the canary policy_version — not on
         `route_actual != _model_for_stage` — avoids a placeholder per-stage
         override falsely triggering a model swap (which would defeat Step 1's
-        per-stage plumbing under the default policy)."""
+        per-stage plumbing under the default policy).
+
+        v4 Phase 1a Step 3 (Amendment 5): a per-step operator override
+        (`self._current_step_model`, resolved in plan_step) wins over the
+        policy — including the canary. It is the model the API runs and the
+        `model` event field records. `route_actual` is left unchanged (the
+        policy's decision); the `model`/`route_actual` divergence under an
+        override is the intended v4 audit trail, not a regression. When the
+        override is absent (the default path), the existing v3 resolution runs
+        unchanged → byte-identical. NOT applied to `_model_for_stage`, which
+        feeds the canary's Opus ground-truth baseline (_stage_a_canary_baseline)
+        and the shadow-execute reference — those stay the construction model."""
+        override = getattr(self, "_current_step_model", None)
+        if override:
+            return override
         if self._policy.policy_version == PHASE_1B_STAGE_A_CANARY:
             return decision.route_actual
         return self._model_for_stage(stage)

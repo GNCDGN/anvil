@@ -30,6 +30,7 @@ from anvil.planner import Planner, DEFAULT_PLANNER_MODEL
 from anvil.policy import (
     PHASE_1B_STAGE_A_CANARY,
     PHASE_1B_STAGE_A_SHADOW,
+    RouteDecision,
     RoutingPolicy,
 )
 from anvil.state import init_state
@@ -1938,6 +1939,132 @@ class TestBriefBlockCaching(_PlannerEventsBase):
         self.assertEqual(len(content), 2)
         self.assertEqual(content[0]["cache_control"], {"type": "ephemeral"})
         self.assertEqual(content[0]["text"] + content[1]["text"], _BRIEF_USER_PROMPT)
+
+
+class TestOperatorModelOverride(_PlannerEventsBase):
+    """v4 Phase 1a Step 3 (Amendment 5): the per-step `model:` override is the
+    model the API runs (recorded in the `model` event field), winning over the
+    policy; `route_actual` stays the policy's decision (the model/route_actual
+    divergence is the intended v4 audit trail). The override tests exercise the
+    REAL `_call_anthropic` against a fake streaming client; the stash tests
+    verify plan_step reads + resolves step.model."""
+
+    def test_override_runs_on_stage_b_and_records_in_model_field(self):
+        client, capture = _make_fake_client(
+            input_tokens=500, output_tokens=50, cache_creation=0, cache_read=2603)
+        self.planner._client = client
+        self.planner._current_step_idx = 0
+        self.planner._current_context_paths_count = 0
+        self.planner._current_step_model = "claude-haiku-4-5-20251001"  # override
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=1, stage="B")
+        # The actual API call ran the override.
+        self.assertEqual(capture["model"], "claude-haiku-4-5-20251001")
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_b.api_end")
+        d = end["data"]
+        # The `model` field records what ran (the override)...
+        self.assertEqual(d["model"], "claude-haiku-4-5-20251001")
+        # ...while route_actual stays the policy's decision (placeholder=opus).
+        self.assertEqual(d["route_actual"], "claude-opus-4-7")
+
+    def test_default_no_override_runs_construction_model(self):
+        client, capture = _make_fake_client(
+            input_tokens=500, output_tokens=50, cache_creation=0, cache_read=2603)
+        self.planner._client = client
+        self.planner._current_step_idx = 0
+        self.planner._current_context_paths_count = 0
+        self.planner._current_step_model = None  # default path
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=1, stage="B")
+        # No override → the planner's construction model (base = ctor model).
+        self.assertEqual(capture["model"], "claude-opus-4-7-test")
+        end = next(e for e in self._events_for()
+                   if e["kind"] == "planner.stage_b.api_end")
+        self.assertEqual(end["data"]["model"], "claude-opus-4-7-test")
+
+    def test_override_runs_on_stage_a(self):
+        client, capture = _make_fake_client(
+            input_tokens=400, output_tokens=30, cache_creation=0, cache_read=0)
+        self.planner._client = client
+        self.planner._current_step_idx = 0
+        self.planner._current_context_paths_count = 0
+        self.planner._current_step_model = "claude-opus-4-7"  # override Stage A
+        self.planner._call_anthropic(
+            system="SYS", user="u", timeout=30, step=1, stage="A")
+        self.assertEqual(capture["model"], "claude-opus-4-7")
+
+    @staticmethod
+    def _capture_stash_side_effect(captured):
+        def _side(self_, system, user, timeout, *, step, stage):
+            captured["step_model"] = getattr(self_, "_current_step_model", "UNSET")
+            events.emit(
+                f"planner.stage_{stage.lower()}.api_end",
+                {"step_idx": getattr(self_, "_current_step_idx", None),
+                 "model": self_._model_for_stage(stage), "input_tokens": 10,
+                 "output_tokens": 1, "cache_creation_input_tokens": 0,
+                 "cache_read_input_tokens": 0, "duration_ms": 1, "ok": True},
+                step_idx=getattr(self_, "_current_step_idx", None))
+            return _STAGE_A_VALID if stage == "A" else _STAGE_B_VALID
+        return _side
+
+    def test_plan_step_stashes_resolved_override_from_step_model(self):
+        captured = {}
+        self.brief.steps[0].model = "haiku"
+        with mock.patch.object(
+            Planner, "_call_anthropic", autospec=True,
+            side_effect=self._capture_stash_side_effect(captured),
+        ):
+            self.planner.plan_step(self.brief, self.state, 0)
+        self.assertEqual(captured["step_model"], "claude-haiku-4-5-20251001")
+
+    def test_plan_step_no_model_stashes_none(self):
+        captured = {}
+        # self.brief.steps[0].model defaults to None.
+        with mock.patch.object(
+            Planner, "_call_anthropic", autospec=True,
+            side_effect=self._capture_stash_side_effect(captured),
+        ):
+            self.planner.plan_step(self.brief, self.state, 0)
+        self.assertIsNone(captured["step_model"])
+
+
+class TestApiModelOverridePrecedence(unittest.TestCase):
+    """v4 Phase 1a Step 3 (Amendment 5): `_api_model` precedence — a per-step
+    override wins over the policy, INCLUDING the canary. The decision's
+    `route_actual` is left untouched (the divergence is the audit trail).
+    `_api_model` is pure model resolution; no client / API call is needed."""
+
+    @staticmethod
+    def _decision(model):
+        return RouteDecision(
+            route_candidate=model, route_actual=model,
+            route_fallback_fired=False, decision_basis={})
+
+    def test_placeholder_no_override_uses_model_for_stage(self):
+        pl = Planner(model="m")  # placeholder policy by default
+        self.assertEqual(
+            pl._api_model("B", self._decision("claude-opus-4-7")), "m")
+
+    def test_placeholder_override_wins(self):
+        pl = Planner(model="m")
+        pl._current_step_model = "claude-haiku-4-5-20251001"
+        self.assertEqual(
+            pl._api_model("B", self._decision("claude-opus-4-7")),
+            "claude-haiku-4-5-20251001")
+
+    def test_canary_no_override_uses_route_actual(self):
+        pl = Planner(model="m", policy=RoutingPolicy(PHASE_1B_STAGE_A_CANARY))
+        dec = self._decision("claude-haiku-4-5-20251001")
+        self.assertEqual(pl._api_model("A", dec), "claude-haiku-4-5-20251001")
+
+    def test_canary_override_wins_and_leaves_route_actual_untouched(self):
+        pl = Planner(model="m", policy=RoutingPolicy(PHASE_1B_STAGE_A_CANARY))
+        pl._current_step_model = "claude-opus-4-7"  # operator declares opus
+        dec = self._decision("claude-haiku-4-5-20251001")  # canary decided haiku
+        self.assertEqual(pl._api_model("A", dec), "claude-opus-4-7")  # operator wins
+        # The policy's decision is unchanged — the model/route_actual divergence.
+        self.assertEqual(dec.route_actual, "claude-haiku-4-5-20251001")
 
 
 if __name__ == "__main__":

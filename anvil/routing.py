@@ -14,25 +14,30 @@ equivalent to another for any task — the operator (via the brief's per-step
 `model:` field, Step 2) names the model, and this seam routes the call. No
 calibration corpus, no comparator, no silent_miss grading.
 
-Step 1 ships two public surfaces in isolation — `MODEL_ALIASES` and
-`client_for_model` — with no call sites consuming them yet (Step 3 wires
-planner.py). `call_model_for_subtask` and its lightweight never-raises+retry
-wrapper are Step 3 (brief Amendment 3), not here.
+Public surfaces (Step 1 + Step 3): `MODEL_ALIASES`, `resolve_model`,
+`client_for_model`, and `call_model_for_subtask`. Step 1 shipped the first two
+data/resolution surfaces in isolation; Step 3 (Amendment 5) promotes the
+resolver to public `resolve_model` (the planner reads it to thread a per-step
+`model:` override into `_api_model`) and adds `call_model_for_subtask` — the
+Phase 2/3 sub-task entry point with its own lightweight never-raises+retry
+wrapper (Amendment 3).
 
 Note on the SDK: an `anthropic.Anthropic` client is model-agnostic — the
 model is a per-call parameter on `messages.create`/`messages.stream`, not a
 property of the client object. So `client_for_model` returns the shared
 configured client; the *resolved model string* a caller passes at call time
-comes from the resolver (`_resolve`, private in Step 1; Step 3 promotes it to
-a public resolver when the call sites need it). Keeping client construction
-here — rather than per-model client classes — mirrors planner.py and leaves
-room for v5 evidence-gated routing to extend the module without touching
-call sites.
+comes from `resolve_model`. The planner does NOT call `client_for_model` per
+stage (Amendment 5) — it keeps its own configured client and threads the
+resolved override through `_api_model`; `client_for_model` is consumed only by
+`call_model_for_subtask` here. Keeping client construction here — rather than
+per-model client classes — mirrors planner.py and leaves room for v5
+evidence-gated routing to extend the module without touching call sites.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 
 import anthropic
 
@@ -81,17 +86,25 @@ assert not _unregistered_alias_targets, (
 _default_client: anthropic.Anthropic | None = None
 
 
-def _resolve(name: str | None) -> str:
+# Unknown model names already warned this process — the warning fires once per
+# distinct name per run (debouncing), so a hot loop requesting a stale model
+# doesn't flood the log. Module-global (process-scoped), reset only on reimport.
+_warned_unknown: set[str] = set()
+
+
+def resolve_model(name: str | None) -> str:
     """Resolve an alias or version string to a known model version string.
 
     - `None` / empty → `DEFAULT_MODEL` (the v3 no-`model:` default).
     - alias (in `MODEL_ALIASES`) → its version-string target.
     - known version string (in `MODEL_RATES`) → itself.
     - anything else → `DEFAULT_MODEL` + a structured warning (never raises;
-      V3P1C-4 `unknown_cost_models()` warn-and-fallback precedent).
+      V3P1C-4 `unknown_cost_models()` warn-and-fallback precedent). The warning
+      fires once per distinct unknown name per process-run (debounced).
 
-    Private in Step 1; Step 3 promotes it to the public resolver the call
-    sites use for the `model=` parameter.
+    Public since Step 3 (Amendment 5): the planner reads it to resolve a
+    per-step `model:` override before threading it through `_api_model`, and
+    `call_model_for_subtask` resolves its `model_name` arg through it.
     """
     if not name:  # None or ""
         return DEFAULT_MODEL
@@ -99,11 +112,13 @@ def _resolve(name: str | None) -> str:
         return MODEL_ALIASES[name]
     if name in MODEL_RATES:
         return name
-    log.warning(
-        "[routing] unknown model=%r — falling back to default=%r "
-        "(known_aliases=%s known_versions=%s)",
-        name, DEFAULT_MODEL, sorted(MODEL_ALIASES), sorted(MODEL_RATES),
-    )
+    if name not in _warned_unknown:
+        _warned_unknown.add(name)
+        log.warning(
+            "[routing] unknown model=%r — falling back to default=%r "
+            "(known_aliases=%s known_versions=%s)",
+            name, DEFAULT_MODEL, sorted(MODEL_ALIASES), sorted(MODEL_RATES),
+        )
     return DEFAULT_MODEL
 
 
@@ -136,5 +151,73 @@ def client_for_model(name: str | None = None) -> anthropic.Anthropic:
     caller passes at call time comes from the resolver. Resolving here (rather
     than only at the call site) is what surfaces the unknown-name warning.
     """
-    _resolve(name)  # validate + warn-on-unknown side effect; client is shared
+    resolve_model(name)  # validate + warn-on-unknown side effect; client shared
     return _client()
+
+
+# v4 Phase 1a Step 3 default cap for the sub-task entry point, matching
+# planner.py's `_call_anthropic` max_tokens.
+_SUBTASK_MAX_TOKENS = 8192
+
+
+def call_model_for_subtask(
+    model_name: str, system_prompt: str, user_message: str
+) -> str:
+    """Generic single-shot model call for Phase 2/3 internal sub-tasks (e.g. a
+    browser-observation re-check, a vision-frame interpretation) — the seam's
+    third public surface (Q-A6: lives here, not in planner.py).
+
+    Resolves `model_name` via `resolve_model`, gets the shared client via
+    `client_for_model`, calls the Anthropic SDK, and returns the concatenated
+    assistant text.
+
+    Lightweight never-raises+retry wrapper (Amendment 3): the SAME shape as
+    planner.py's `_call_anthropic` — retry once on `APITimeoutError` /
+    `RateLimitError` after `sleep(min(60, retry-after))`; a broad `Exception`
+    is logged and returns a structured error — but WITHOUT importing it or its
+    planner-internal coupling (stage routing, brief-block caching, event
+    emission, instance `self._client`). Reference shape only; not imported.
+
+    No brief-block caching (Q-A3): `system_prompt` is passed as a plain string
+    with no `cache_control`; callers that need caching layer it on top.
+
+    Returns the response text on success, or a grep-able structured error
+    string on terminal failure (`"[call_model_for_subtask error: <reason>]"`)
+    — never raises, so Phase 2/3 consumers can detect failure without a
+    try/except.
+    """
+    resolved = resolve_model(model_name)
+    client = client_for_model(model_name)
+
+    def _attempt() -> str:
+        resp = client.messages.create(
+            model=resolved,
+            max_tokens=_SUBTASK_MAX_TOKENS,
+            system=system_prompt,  # plain string — no cache_control (Q-A3)
+            messages=[{"role": "user", "content": user_message}],
+        )
+        return "".join(
+            b.text for b in resp.content
+            if getattr(b, "type", None) == "text"
+        )
+
+    def _retry_after(exc: Exception) -> int:
+        resp = getattr(exc, "response", None)
+        hdr = getattr(resp, "headers", None)
+        try:
+            return int(hdr.get("retry-after")) if hdr else 1
+        except (TypeError, ValueError):
+            return 1
+
+    try:
+        try:
+            return _attempt()
+        except (anthropic.APITimeoutError, anthropic.RateLimitError) as e:
+            time.sleep(min(60, _retry_after(e)))
+            return _attempt()
+    except Exception as e:  # noqa: BLE001 — never-raise contract
+        log.error(
+            "[routing] call_model_for_subtask model=%r failed (%s); "
+            "returning structured error", resolved, e,
+        )
+        return f"[call_model_for_subtask error: {str(e)[:300]}]"
