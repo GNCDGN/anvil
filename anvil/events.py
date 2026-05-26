@@ -149,8 +149,14 @@ VALID_KINDS: frozenset[str] = frozenset({
     # double-count the primary Stage A call or perturb the shadow 1:1
     # invariant. First v3 VALID_KINDS bump (Step3B-F1). (1)
     "planner.stage_a.canary_baseline.api_end",
+    # v4 Phase 2c Step 2: the observe-loop's capture event — emitted by the
+    # orchestrator's observe sub-phase during a build (with a run_id context),
+    # the connector-pattern.md Contract 5 condition. The FIRST v4 VALID_KINDS
+    # bump (51 → 52); a single kind carrying a `surfaces` payload field (Q-F2),
+    # not per-surface kinds. (2)
+    "observe.captured",
 })
-assert len(VALID_KINDS) == 51, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
+assert len(VALID_KINDS) == 52, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
 
 # v3 Phase 1b Step 3: the canary baseline event kind, referenced by the Planner
 # emit + the harness operations view (so the baseline's cost is ledgered).

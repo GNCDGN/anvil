@@ -1497,7 +1497,12 @@ class TestShadowExecuteHaiku(_PlannerEventsBase):
 
     def test_valid_kinds_unchanged(self) -> None:
         from anvil.events import VALID_KINDS
-        self.assertEqual(len(VALID_KINDS), 51)  # Rev B §B.3: no new kind
+        # Rev B §B.3: the shadow-execute work added no new kind (still true —
+        # observe.captured is a v4 Phase 2c kind, not a shadow-execute one). The
+        # absolute count tracks the catalogue: 51 → 52 at the v4 Phase 2c Step 2
+        # bump (the count-drift guard re-anchors; the canonical size check is
+        # test_events.test_valid_kinds_catalogue_size).
+        self.assertEqual(len(VALID_KINDS), 52)
 
 
 class TestSelectedPathsAndRawResponseRecording(_PlannerEventsBase):

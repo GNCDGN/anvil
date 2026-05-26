@@ -46,6 +46,10 @@ from anvil import ssh_ops
 # `from anvil import ssh_ops` style) so the mock-patch target is
 # `anvil.orchestrator.browser` / `anvil.orchestrator.visibility_session`.
 from anvil.integrations import browser, visibility_session
+# v4 Phase 2c Step 2: the observe-loop's first real consumer of the Phase 1a
+# seam (the Haiku-routed observation digest). Module import so the mock-patch
+# target is `anvil.orchestrator.routing.call_model_for_subtask`.
+from anvil import routing
 # v2 Phase 1 Step 6: `anvil.checkpoint` does `from anvil.orchestrator
 # import _slug` at module load. Importing checkpoint eagerly here
 # triggers the circular load when this module is the entry point
@@ -100,6 +104,43 @@ def _slug(build_name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (build_name or "").lower())
     s = re.sub(r"-+", "-", s).strip("-")
     return s or "build"
+
+
+# v4 Phase 2c Step 2 (Q-F5): the digest-interpretation system prompt the observe
+# sub-phase sends to Haiku via call_model_for_subtask. Plain string (no
+# cache_control — the seam's Q-A3). Asks for a Planner-readable digest.
+DIGEST_SYSTEM_PROMPT = (
+    "You interpret browser observations from a build step. Given DOM/console/"
+    "network observations, produce a concise digest — a short paragraph plus a "
+    "bullet list of notable findings (console errors, network failures, "
+    "anomalies) — that the Planner reads on the next iteration. Be terse; if "
+    "nothing is notable, say so in one line."
+)
+
+
+def _build_observation_summary(observations: dict) -> str:
+    """Render the observations as a cost-shaped text summary for the Haiku
+    digest (Q-F5): console + network entries verbatim, but the DOM as a
+    SUMMARY (length only — NOT the full HTML body, which is token-heavy and
+    defeats the cost-shaping). Module-level so it is not re-created per step."""
+    parts: list[str] = []
+    dom = observations.get("dom")
+    if dom is not None:
+        html = dom.get("html", "") if isinstance(dom, dict) else str(dom)
+        parts.append(f"DOM: {len(html)} chars (body omitted from digest input)")
+    console = observations.get("console")
+    if console is not None:
+        entries = console.get("entries", []) if isinstance(console, dict) else []
+        parts.append(f"Console: {len(entries)} entries")
+        for e in entries:
+            parts.append(f"  [{e.get('type')}] {e.get('text')}")
+    network = observations.get("network")
+    if network is not None:
+        entries = network.get("entries", []) if isinstance(network, dict) else []
+        parts.append(f"Network: {len(entries)} responses")
+        for e in entries:
+            parts.append(f"  {e.get('status')} {e.get('url')}")
+    return "\n".join(parts) if parts else "(no observations captured)"
 
 
 class Orchestrator:
@@ -677,10 +718,11 @@ class Orchestrator:
                 # browser/write failure logs and continues to commit — it NEVER
                 # fails the step. Per-step BrowserSession lifecycle, closed in
                 # try/finally so a mid-capture error still tears down (Q-F6).
-                # Step 1 ships the mechanical loop ONLY — NO Haiku digest
-                # (digest=None) and NO observe.captured event (Step 2 adds both +
-                # the VALID_KINDS bump). The default path (no observe:) is byte-
-                # identical: this whole block short-circuits when observe is None.
+                # Step 2 completes the loop: capture → Haiku digest (the Phase 1a
+                # seam's first real consumer) → single write (digest-first, BAF-1)
+                # → emit observe.captured (the first v4 VALID_KINDS bump, 52). The
+                # default path (no observe:) is byte-identical: this whole block
+                # short-circuits when observe is None.
                 if bstep.observe is not None:
                     observe_target = bstep.observe.get("target")
                     # Order-preserving dedup of the declared surfaces (Phase 2b
@@ -735,24 +777,87 @@ class Orchestrator:
                             sess.close()
                         except Exception:  # noqa: BLE001 — defensive; never-raises
                             pass
-                    # Persist (digest=None in Step 1; Step 2 routes the Haiku
-                    # digest and writes it). Never fails the step (capture-only).
+                    # Route the captured observations to a Haiku digest (the
+                    # Phase 1a seam's FIRST real consumer) BEFORE the single
+                    # write (BAF-1 digest-first-single-write — no double-blob-
+                    # write, no visibility_session.py change). Capture-only: a
+                    # seam failure (the error sentinel, BAF-2) OR an empty/
+                    # whitespace response (Q-F4-F1) both yield digest=None +
+                    # continue.
+                    digest = None
+                    if any(observations.get(s) is not None
+                           for s in ("dom", "console", "network")):
+                        raw_digest = routing.call_model_for_subtask(
+                            "haiku",
+                            DIGEST_SYSTEM_PROMPT,
+                            _build_observation_summary(observations),
+                        )
+                        if raw_digest.startswith("[call_model_for_subtask error:"):
+                            self._log_event(
+                                "observe",
+                                f"step {bstep.number}: digest seam error "
+                                f"(digest=None): {raw_digest}",
+                            )
+                        elif not raw_digest.strip():
+                            self._log_event(
+                                "observe",
+                                f"step {bstep.number}: digest empty — Haiku "
+                                "returned no text content (digest=None; Q-F4-F1)",
+                            )
+                        else:
+                            digest = raw_digest
+                    # Single write with the digest (digest=None on a seam
+                    # failure / empty response / no captured surface). Never
+                    # fails the step (capture-only).
                     written = visibility_session.write_session(
                         state.run_id, idx, observe_target or "", observations,
-                        digest=None,
+                        digest=digest,
                     )
-                    if not written.get("ok"):
+                    record_path = ""
+                    if written.get("ok"):
+                        record_path = (written.get("result") or {}).get("path", "")
+                    else:
                         self._log_event(
                             "observe",
                             f"step {bstep.number}: visibility_session write "
                             f"failed: {written.get('error')}",
                         )
-                    else:
-                        self._log_event(
-                            "observe",
-                            f"step {bstep.number}: captured "
-                            f"{[s for s in surfaces]} → {written['result'].get('path')}",
+                    # Emit observe.captured (Q-F2/Q-F3) — derived counts + the
+                    # record path + digest size + ok; NO blobs on the row. The
+                    # first v4 event kind, emitted with a run_id context (the
+                    # connector-pattern.md Contract 5 condition).
+                    _console_errs = 0
+                    _net_fails = 0
+                    if observations.get("console"):
+                        _console_errs = sum(
+                            1 for e in observations["console"].get("entries", [])
+                            if e.get("type") == "error"
                         )
+                    if observations.get("network"):
+                        _net_fails = sum(
+                            1 for e in observations["network"].get("entries", [])
+                            if (e.get("status") or 0) >= 400
+                        )
+                    _events.emit(
+                        "observe.captured",
+                        {
+                            "step_idx": idx,
+                            "target": observe_target or "",
+                            "surfaces": surfaces,
+                            "record_path": record_path,
+                            "console_error_count": _console_errs,
+                            "network_failure_count": _net_fails,
+                            "digest_chars": len(digest) if digest else 0,
+                            "ok": bool(written.get("ok")),
+                        },
+                        step_idx=idx,
+                    )
+                    self._log_event(
+                        "observe",
+                        f"step {bstep.number}: captured {surfaces} → "
+                        f"{record_path or '(write failed)'}; "
+                        f"digest_chars={len(digest) if digest else 0}",
+                    )
 
                 # 5e commit (orchestrator owns it so the footer is canonical)
                 commit_hash = self.git.commit_step(
