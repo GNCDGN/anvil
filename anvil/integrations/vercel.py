@@ -12,16 +12,21 @@ connector does not manage auth (the same posture as `gh`). The Vercel CLI is
 taken from Vercel's published CLI docs and is pending live ratification when the
 CLI is installed; the test suite is mock-only regardless (Q-C1/Q-C6 hermetic).
 
-**Step 1 ships the bare wrapper only.** There is NO confirmation gate, NO
-`confirmed` parameter, NO `deploy-history.json` consultation — Step 2 retrofits
-all three (per brief Amendment 1; the deploy-history helper does not exist until
-Step 2). The orchestrator's `vps_deploy`/`vps_target_path` deploy chain is
-untouched; this connector is available-but-not-consumed in first-pass (Q-C5).
+**Step 2 retrofit (Amendment 1):** the first-deploy confirmation gate, the
+`confirmed` kwarg, and the shared `deploy_history` consultation were added here
+in Step 2 (Step 1 shipped the bare wrapper). The gate flow mirrors netlify.py
+exactly. The orchestrator's `vps_deploy`/`vps_target_path` deploy chain is
+untouched; this connector is available-but-not-consumed in first-pass (Q-C5) —
+the wrapper *signals* confirmation-required; the *prompt* is deferred wiring.
 """
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
+from pathlib import Path
+
+from anvil.integrations import deploy_history
 
 log = logging.getLogger("anvil.integrations.vercel")
 
@@ -68,34 +73,56 @@ def _run_vercel(argv: list[str], *, cwd: str, timeout: int) -> dict:
     return {"ok": True, "stdout": proc.stdout or ""}
 
 
-def deploy(cwd, *, prod=False, project=None) -> dict:
-    """Deploy the build in `cwd` to Vercel (never-raises).
+def deploy(cwd, *, prod=False, project=None, confirmed=False,
+           history_path=None) -> dict:
+    """Deploy the build in `cwd` to Vercel (never-raises, gate-complete).
 
     `prod=False` runs `vercel` (a preview deploy); `prod=True` runs
     `vercel --prod` (production). `--yes` is always passed so the non-interactive
-    subprocess does not stall on a prompt. `project` (optional) targets a
-    specific project directory via Vercel's `--cwd` flag; when `None`, the
-    subprocess `cwd` (and its `.vercel/project.json` link) determines the
-    project. The Vercel CLI prints the deployment URL on stdout; the result is
-    ``{"ok": True, "result": {"url": "<url>", "status": "deployed"}}``. A zero
-    exit with no URL on stdout is treated as malformed output (structured error).
+    subprocess does not stall on a prompt. The subprocess `cwd` (and its
+    `.vercel/project.json` link) determines the deployed project. `project` is
+    the deploy-history key (absent → the deploy directory's name); `history_path`
+    overrides the history file (tests). The Vercel CLI prints the deployment URL
+    on stdout; the result is ``{"ok": True, "result": {"url": "<url>", "status":
+    "deployed"}}``. A zero exit with no URL on stdout is malformed output.
 
-    Step 1 has NO confirmation gate — a first-vs-subsequent check + a `confirmed`
-    kwarg are retrofitted in Step 2 (Amendment 1).
+    First-deploy gate (Step 2 retrofit per Amendment 1; mirrors netlify.py
+    exactly): a first `(project, "vercel")` deploy without `confirmed=True`
+    returns a structured ``deploy-confirmation-required`` result WITHOUT invoking
+    the CLI; a confirmed first deploy or any subsequent deploy proceeds, recording
+    on CLI success.
+
+    (Note vs Step 1: `project` no longer maps to `--cwd` — it is the
+    deploy-history identity; the CLI targets the subprocess `cwd`, which is how
+    Vercel locates the linked project, so the Step 1 `--cwd` mapping was
+    redundant. See V4P1C Step 2 / Q-C4.)
     """
+    target = "vercel"
+    proj = project if project is not None else Path(str(cwd)).name
+    hpath = Path(history_path) if history_path is not None else deploy_history._DEFAULT_PATH
+
+    # First-deploy confirmation gate (Step 2; the same flow as netlify.py).
+    history = deploy_history.read_history(hpath)
+    if deploy_history.is_first_deploy(history, proj, target) and not confirmed:
+        return {
+            "ok": False,
+            "error": f"deploy-confirmation-required: first deploy of {proj} to {target}",
+            "requires_confirmation": True,
+        }
+
     argv = ["vercel"]
     if prod:
         argv.append("--prod")
     argv.append("--yes")  # non-interactive: accept defaults, do not prompt
-    if project is not None:
-        argv += ["--cwd", str(project)]  # target a specific project directory
     run = _run_vercel(argv, cwd=str(cwd), timeout=_VERCEL_TIMEOUT)
     if not run["ok"]:
-        return run
-    # vercel prints the deployment URL on stdout (last http(s) line).
-    lines = [ln.strip() for ln in (run["stdout"] or "").splitlines() if ln.strip()]
-    url = next((ln for ln in reversed(lines) if ln.startswith("http")), "")
-    if not url:
+        return run  # CLI failed — do NOT record (only successes are recorded)
+    # vercel prints the deployment URL on stdout (the last http(s) token —
+    # handles both own-line and inline "URL: https://..." shapes).
+    urls = re.findall(r"https?://[^\s]+", run["stdout"] or "")
+    if not urls:
         snippet = (run["stdout"] or "").strip()[:200]
         return _err(f"vercel produced no deploy URL: {snippet!r}")
+    url = urls[-1].rstrip(".,;)")
+    deploy_history.record_deploy(hpath, proj, target, "success", url)  # best-effort post-success
     return _ok({"url": url, "status": "deployed"})
