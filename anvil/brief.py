@@ -49,6 +49,11 @@ SENTRY_SCOPES = frozenset({"read"})
 # rule 16; vps_deploy: coexistence is a warning (vps-deploy-deprecated /
 # deploy-target-mismatch), never a rejection.
 DEPLOY_TARGETS = frozenset({"vps", "vercel", "netlify", "none"})
+# v4 Phase 2b Step 1 (DC5/DC6): valid surfaces for the per-step `observe:` block
+# — the three browser.py observation methods (snapshot_dom / capture_console /
+# capture_network → dom / console / network). A fixed value set like
+# ISSUES_SCOPES / SENTRY_SCOPES; rule 17 validates `observe.surfaces` ⊆ this.
+OBSERVE_SURFACES = frozenset({"dom", "console", "network"})
 _REQUIRED_FRONTMATTER = (
     "brief_version",
     "project",
@@ -86,6 +91,15 @@ class Step(BaseModel):
     # ({"read"} — the connector is read-only); enforced at the connector wrapper
     # (integrations.sentry). Orthogonal to model:, issues:, and scope.operations.
     sentry: str | None = None
+    # v4 Phase 2b Step 1 (DC5): optional per-step observe: block (opt-in; absent →
+    # None). Assembled by _parse_steps from the flat dot-notation bullets
+    # `observe.target` / `observe.surfaces` (BAF-1 — the step body is markdown
+    # bullets, not YAML; reuses _field + _csv like scope.files/scope.operations).
+    # Shape: {"target": str | None, "surfaces": [str, ...]}. Validated in rule 17
+    # (target required when present; surfaces ⊆ OBSERVE_SURFACES) AND version-gated
+    # to brief_version: 2 (DC6 — observe: is not safely-ignorable). Parsed-not-
+    # consumed in Phase 2b; the observe-loop that reads it is Phase 2c.
+    observe: dict | None = None
 
 
 class EndToEndTest(BaseModel):
@@ -236,6 +250,27 @@ def _parse_steps(steps_section: str) -> list[Step]:
             if (raw_sentry and raw_sentry.lower() not in ("null", "none"))
             else None
         )
+        # v4 Phase 2b Step 1 (DC5/BAF-1/BAF-2): the per-step observe: block, flat
+        # dot-notation (observe.target / observe.surfaces). _field re.escapes the
+        # dotted key (Step 0 Q-E5), so the literal "." matches literally; _csv
+        # splits the surfaces list — the scope.files/scope.operations precedent.
+        # target normalizes null/none/"" → None (the model:/issues:/sentry:
+        # defensive precedent). observe is assembled when a real target OR any
+        # surfaces is present: a surfaces-without-target declaration assembles with
+        # target=None and is caught loudly by rule 17 (BAF-2 — not silently
+        # dropped); both absent/empty → None (the v1 + v2-without-observe case).
+        raw_obs_target = _field(block, "observe.target")
+        obs_target = (
+            raw_obs_target
+            if (raw_obs_target and raw_obs_target.lower() not in ("null", "none"))
+            else None
+        )
+        obs_surfaces = _csv(_field(block, "observe.surfaces"))
+        observe = (
+            {"target": obs_target, "surfaces": obs_surfaces}
+            if (obs_target is not None or obs_surfaces)
+            else None
+        )
         steps.append(
             Step(
                 number=number,
@@ -249,6 +284,7 @@ def _parse_steps(steps_section: str) -> list[Step]:
                 model=model,
                 issues=issues,
                 sentry=sentry,
+                observe=observe,
             )
         )
     return steps
@@ -480,10 +516,12 @@ def parse_brief(path: Path) -> Brief:
 
 
 # ---------------------------------------------------------------------------
-# Validation — 16 rules. Rules 1-12 are implementation-notes Component 2; rule
+# Validation — 17 rules. Rules 1-12 are implementation-notes Component 2; rule
 # 13 (per-step model:, v4 Phase 1a Step 2), rule 14 (issues:, v4 Phase 1b Step
 # 1), rule 15 (sentry:, v4 Phase 1b Step 2), and rule 16 (per-brief
-# deploy_target:, v4 Phase 1c Step 1) extend it backwards-compatibly.
+# deploy_target:, v4 Phase 1c Step 1) extend it backwards-compatibly. Rule 17
+# (per-step observe:, v4 Phase 2b Step 1) is the first to gate on brief_version
+# (== 2) — the migration that rule 2's relaxation to {1, 2} unlocks.
 # ---------------------------------------------------------------------------
 
 def _is_git_repo(path: Path) -> bool:
@@ -560,9 +598,11 @@ def validate_or_reject(
             if getattr(brief, k, None) in (None, "", 0) and k != "brief_version":
                 e.append(f"frontmatter: required key '{k}' missing or empty")
 
-    # 2. brief_version == 1
-    if brief.brief_version != 1:
-        e.append(f"brief_version must be 1 (got {brief.brief_version})")
+    # 2. brief_version is 1 or 2 (v4 Phase 2b Step 1: rule 2 relaxed from {1} to
+    # {1, 2}; version 2 unlocks the per-step observe: block — rule 17. Existing v1
+    # briefs stay v1; no migration. v3+ still rejects.)
+    if brief.brief_version not in (1, 2):
+        e.append(f"brief_version must be 1 or 2 (got {brief.brief_version})")
 
     # 3. target_repo_path exists and is a git repo
     if not brief.target_repo_path.exists():
@@ -684,6 +724,33 @@ def validate_or_reject(
             f"deploy_target {brief.deploy_target!r} is not a known target "
             f"{sorted(DEPLOY_TARGETS)}"
         )
+
+    # 17. v4 Phase 2b Step 1 (DC5/DC6): per-step observe: block. A single rule
+    # (Q-E4) covering (i) version-gating — observe: requires brief_version: 2
+    # (DC6: observe: is not safely-ignorable, so an observe: block on a v1 brief
+    # rejects rather than silently drops; this is the first rule to gate on the
+    # version that rule 2's {1, 2} relaxation unlocks); (ii) target required when
+    # present; (iii) surfaces ⊆ OBSERVE_SURFACES (an empty/absent surfaces is
+    # valid — a step that requests observation but names no surface yet).
+    # Orthogonal to rules 13-16; observe is None on every v1/default-path step, so
+    # this rule short-circuits there (no behaviour change on the default path).
+    for s in brief.steps:
+        if s.observe is None:
+            continue
+        if brief.brief_version != 2:
+            e.append(
+                f"step {s.number} ({s.name}): observe: requires brief_version: 2 "
+                f"(got {brief.brief_version})"
+            )
+            continue
+        if not s.observe.get("target"):
+            e.append(f"step {s.number} ({s.name}): observe: requires a target")
+        bad = set(s.observe.get("surfaces", [])) - OBSERVE_SURFACES
+        if bad:
+            e.append(
+                f"step {s.number} ({s.name}): observe.surfaces contains invalid "
+                f"values {sorted(bad)} (valid: {sorted(OBSERVE_SURFACES)})"
+            )
 
     if e:
         raise BriefValidationError(e)

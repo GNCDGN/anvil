@@ -93,7 +93,10 @@ class TestBrief(unittest.TestCase):
         self.assertGreaterEqual(len(errs), 5, f"too few violations: {errs}")
         self.assertIn("project", joined)            # rule 1 missing key
         self.assertIn("build_name", joined)         # rule 1 missing key
-        self.assertIn("brief_version must be 1", joined)   # rule 2
+        # rule 2: the invalid-brief.md fixture carries brief_version: 2, which is
+        # now VALID (v4 Phase 2b relaxed rule 2 to {1, 2} — Q-E3-F1). The
+        # version-rejection path moved to the dedicated TestRule2Relaxation class;
+        # this omnibus fixture is still rejected for its ~6 other violations below.
         self.assertTrue(                            # rule 3
             "not a git repo" in joined or "does not exist" in joined
         )
@@ -493,6 +496,17 @@ Exercise the per-step model field.
                     f"(opt-in field; no existing brief declares it), got "
                     f"{step.sentry!r}",
                 )
+                # v4 Phase 2b Step 1: the new per-step observe: block must also
+                # default to None on every existing brief (backwards-compat — the
+                # field is opt-in, version-gated to brief_version: 2, and no
+                # existing brief declares it; they are all v1). Per the reframed
+                # criterion 2 (V4P1A-2): assertion is on PARSE, not validate.
+                self.assertIsNone(
+                    step.observe,
+                    f"{b.parent.name} step {step.number}: observe must be None "
+                    f"(opt-in field; no existing brief declares it), got "
+                    f"{step.observe!r}",
+                )
             # v4 Phase 1c Step 1: the new per-brief deploy_target: field defaults
             # to None on every existing brief (none declares it yet). (Briefs with
             # vps_deploy: yes emit the vps-deploy-deprecated warning here — that is
@@ -832,3 +846,262 @@ Exercise the per-brief deploy_target field.
         self.assertEqual(step.issues, "write")
         self.assertEqual(step.sentry, "read")
         validate_or_reject(brief, fm)  # all four axes validate independently
+
+
+class TestRule2Relaxation(unittest.TestCase):
+    """v4 Phase 2b Step 1: rule 2 relaxed from {1} to {1, 2}. v1 and v2 both
+    validate; v3+ rejects with the "1 or 2" message; absent rejects via rule 1.
+    (Q-E3-F1: the version-rejection path moved here from the invalid-brief.md
+    omnibus fixture, which now carries a valid brief_version: 2.)"""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-rule2-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-rule2-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, version_line: str = "brief_version: 1"):
+        body = f"""---
+{version_line}
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: no
+---
+
+## Goal
+
+Exercise rule 2.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** read
+- **smoke:** `echo hi`
+- **confirm:** explicit
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    def test_brief_version_1_valid(self) -> None:
+        brief, fm = self._parse(version_line="brief_version: 1")
+        self.assertEqual(brief.brief_version, 1)
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_brief_version_2_valid_no_observe(self) -> None:
+        brief, fm = self._parse(version_line="brief_version: 2")
+        self.assertEqual(brief.brief_version, 2)
+        validate_or_reject(brief, fm)  # no raise — v2 accepted, observe optional
+
+    def test_brief_version_3_rejected(self) -> None:
+        brief, fm = self._parse(version_line="brief_version: 3")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("brief_version must be 1 or 2 (got 3)",
+                      " ".join(ctx.exception.errors))
+
+    def test_brief_version_absent_rejected(self) -> None:
+        # No brief_version key → rule 1 (presence) fires; rule 2 also fires on the
+        # parser default 0. Either way the brief is rejected, version flagged.
+        brief, fm = self._parse(version_line="project_placeholder: x")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("brief_version", " ".join(ctx.exception.errors))
+
+
+class TestStepObserveField(unittest.TestCase):
+    """v4 Phase 2b Step 1 (DC5/DC6, BAF-1/BAF-2): per-step observe: block —
+    flat dot-notation parse (observe.target / observe.surfaces), rule 17
+    well-formedness (target required when present; surfaces ⊆ OBSERVE_SURFACES;
+    empty surfaces valid; duplicates allowed; ordering preserved), and the
+    any-field-present detection (surfaces-without-target is a caught error, not
+    a silent drop). All on brief_version: 2 (version-gate tested separately)."""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-observe-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-observe-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, version: int = 2, observe_lines: str = ""):
+        body = f"""---
+brief_version: {version}
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: no
+---
+
+## Goal
+
+Exercise the per-step observe: block.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** read
+- **smoke:** `echo hi`
+- **confirm:** explicit
+{observe_lines}
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    def test_observe_target_only(self) -> None:
+        brief, fm = self._parse(
+            observe_lines="- **observe.target:** http://localhost:3000")
+        self.assertEqual(brief.steps[0].observe,
+                         {"target": "http://localhost:3000", "surfaces": []})
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_observe_target_and_surfaces(self) -> None:
+        brief, fm = self._parse(observe_lines=(
+            "- **observe.target:** http://localhost:3000\n"
+            "- **observe.surfaces:** dom, console"))
+        self.assertEqual(
+            brief.steps[0].observe,
+            {"target": "http://localhost:3000", "surfaces": ["dom", "console"]})
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_observe_surfaces_only_rule17_target_required(self) -> None:
+        # BAF-2: surfaces present but target absent → observe assembled with
+        # target=None → rule 17 fires "requires a target" (loud, not dropped).
+        brief, fm = self._parse(observe_lines="- **observe.surfaces:** dom")
+        self.assertEqual(brief.steps[0].observe,
+                         {"target": None, "surfaces": ["dom"]})
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("observe: requires a target", " ".join(ctx.exception.errors))
+
+    def test_observe_absent_is_none(self) -> None:
+        brief, fm = self._parse(observe_lines="")
+        self.assertIsNone(brief.steps[0].observe)
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_observe_target_defensive_normalization(self) -> None:
+        # null/none/"" alone (no surfaces) → observe None (the model:/issues:/
+        # sentry: none→absent precedent); validates clean (no observe block).
+        for line in ("- **observe.target:** null",
+                     "- **observe.target:** none",
+                     "- **observe.target:** "):
+            with self.subTest(line=line):
+                brief, fm = self._parse(observe_lines=line)
+                self.assertIsNone(brief.steps[0].observe)
+                validate_or_reject(brief, fm)  # no raise
+
+    def test_observe_surfaces_empty_valid(self) -> None:
+        # target present, surfaces line empty → surfaces=[], rule 17 passes.
+        brief, fm = self._parse(observe_lines=(
+            "- **observe.target:** http://localhost\n"
+            "- **observe.surfaces:** "))
+        self.assertEqual(brief.steps[0].observe,
+                         {"target": "http://localhost", "surfaces": []})
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_observe_surfaces_duplicates_allowed(self) -> None:
+        brief, fm = self._parse(observe_lines=(
+            "- **observe.target:** x\n"
+            "- **observe.surfaces:** dom, dom, console"))
+        self.assertEqual(brief.steps[0].observe["surfaces"],
+                         ["dom", "dom", "console"])
+        validate_or_reject(brief, fm)  # no raise — duplicates harmless
+
+    def test_observe_surfaces_invalid_value_rejected(self) -> None:
+        for bad in ("screenshot", "performance", "video"):
+            with self.subTest(value=bad):
+                brief, fm = self._parse(observe_lines=(
+                    f"- **observe.target:** x\n"
+                    f"- **observe.surfaces:** dom, {bad}"))
+                with self.assertRaises(BriefValidationError) as ctx:
+                    validate_or_reject(brief, fm)
+                joined = " ".join(ctx.exception.errors)
+                self.assertIn("observe.surfaces contains invalid values", joined)
+                self.assertIn(bad, joined)
+
+    def test_observe_surfaces_ordering_preserved(self) -> None:
+        brief, fm = self._parse(observe_lines=(
+            "- **observe.target:** x\n"
+            "- **observe.surfaces:** console, dom, network"))
+        self.assertEqual(brief.steps[0].observe["surfaces"],
+                         ["console", "dom", "network"])  # not sorted
+        validate_or_reject(brief, fm)  # no raise
+
+
+class TestRule17VersionGate(unittest.TestCase):
+    """v4 Phase 2b Step 1 (DC6): observe: is version-gated to brief_version: 2.
+    An observe: block on a v1 brief is a validation error (not-safely-ignorable);
+    a v2 brief accepts a well-formed observe: block; a v2 brief with no observe:
+    is valid (v2 does not require observe:, only observe: requires v2)."""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-r17-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-r17-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, version: int, observe_lines: str = ""):
+        body = f"""---
+brief_version: {version}
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: no
+---
+
+## Goal
+
+Exercise rule 17 version-gating.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** read
+- **smoke:** `echo hi`
+- **confirm:** explicit
+{observe_lines}
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    def test_observe_on_v1_brief_rejects(self) -> None:
+        brief, fm = self._parse(version=1, observe_lines=(
+            "- **observe.target:** http://localhost\n"
+            "- **observe.surfaces:** dom"))
+        # the block parses (it's well-formed), but rule 17 version-gates it
+        self.assertIsNotNone(brief.steps[0].observe)
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("observe: requires brief_version: 2",
+                      " ".join(ctx.exception.errors))
+
+    def test_observe_on_v2_brief_accepts(self) -> None:
+        brief, fm = self._parse(version=2, observe_lines=(
+            "- **observe.target:** http://localhost\n"
+            "- **observe.surfaces:** dom, console, network"))
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_v2_brief_without_observe_valid(self) -> None:
+        brief, fm = self._parse(version=2, observe_lines="")
+        self.assertIsNone(brief.steps[0].observe)
+        validate_or_reject(brief, fm)  # no raise — v2 does not require observe:
