@@ -41,6 +41,11 @@ from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
 from anvil.lint import lint_brief
 from anvil.coder import Coder
 from anvil import ssh_ops
+# v4 Phase 2c Step 1: the observe sub-phase consumes the Phase 2a substrate
+# (browser substrate + visibility-session state writer). Module imports (the
+# `from anvil import ssh_ops` style) so the mock-patch target is
+# `anvil.orchestrator.browser` / `anvil.orchestrator.visibility_session`.
+from anvil.integrations import browser, visibility_session
 # v2 Phase 1 Step 6: `anvil.checkpoint` does `from anvil.orchestrator
 # import _slug` at module load. Importing checkpoint eagerly here
 # triggers the circular load when this module is the entry point
@@ -662,6 +667,92 @@ class Orchestrator:
                     )
                     if not self._await_user_decision(state):
                         return 1
+
+                # 5d.5 observe (v4 Phase 2c Step 1 — the orchestrator's first
+                # build-loop observe sub-phase; inserted after smoke / before
+                # commit per the Phase 2 design Q9 placement). Mechanical here:
+                # launch the Phase 2a browser substrate, capture the brief-
+                # declared surfaces, persist via visibility_session. CAPTURE-ONLY
+                # (Q-F7): fires only when the step declares observe:; every
+                # browser/write failure logs and continues to commit — it NEVER
+                # fails the step. Per-step BrowserSession lifecycle, closed in
+                # try/finally so a mid-capture error still tears down (Q-F6).
+                # Step 1 ships the mechanical loop ONLY — NO Haiku digest
+                # (digest=None) and NO observe.captured event (Step 2 adds both +
+                # the VALID_KINDS bump). The default path (no observe:) is byte-
+                # identical: this whole block short-circuits when observe is None.
+                if bstep.observe is not None:
+                    observe_target = bstep.observe.get("target")
+                    # Order-preserving dedup of the declared surfaces (Phase 2b
+                    # carry-forward 2: the schema permits duplicates; the observe-
+                    # loop dedups at consumption so a surface isn't double-captured
+                    # in one observation window).
+                    _seen: set = set()
+                    surfaces = []
+                    for _s in (bstep.observe.get("surfaces") or []):
+                        if _s not in _seen:
+                            _seen.add(_s)
+                            surfaces.append(_s)
+                    observations = {"dom": None, "console": None, "network": None}
+                    _capture = {
+                        "dom": "snapshot_dom",
+                        "console": "capture_console",
+                        "network": "capture_network",
+                    }
+                    sess = browser.BrowserSession()
+                    try:
+                        launched = sess.launch(headless=True)
+                        if launched.get("ok"):
+                            nav = sess.navigate(observe_target)
+                            if nav.get("ok"):
+                                for surface in surfaces:
+                                    method = _capture.get(surface)
+                                    if method is None:
+                                        continue  # schema (rule 17) validated it
+                                    res = getattr(sess, method)()
+                                    if res.get("ok"):
+                                        observations[surface] = res.get("result")
+                                    else:
+                                        self._log_event(
+                                            "observe",
+                                            f"step {bstep.number}: capture "
+                                            f"{surface} failed: {res.get('error')}",
+                                        )
+                            else:
+                                self._log_event(
+                                    "observe",
+                                    f"step {bstep.number}: navigate "
+                                    f"{observe_target!r} failed: {nav.get('error')}",
+                                )
+                        else:
+                            self._log_event(
+                                "observe",
+                                f"step {bstep.number}: browser launch failed: "
+                                f"{launched.get('error')}",
+                            )
+                    finally:
+                        try:
+                            sess.close()
+                        except Exception:  # noqa: BLE001 — defensive; never-raises
+                            pass
+                    # Persist (digest=None in Step 1; Step 2 routes the Haiku
+                    # digest and writes it). Never fails the step (capture-only).
+                    written = visibility_session.write_session(
+                        state.run_id, idx, observe_target or "", observations,
+                        digest=None,
+                    )
+                    if not written.get("ok"):
+                        self._log_event(
+                            "observe",
+                            f"step {bstep.number}: visibility_session write "
+                            f"failed: {written.get('error')}",
+                        )
+                    else:
+                        self._log_event(
+                            "observe",
+                            f"step {bstep.number}: captured "
+                            f"{[s for s in surfaces]} → {written['result'].get('path')}",
+                        )
 
                 # 5e commit (orchestrator owns it so the footer is canonical)
                 commit_hash = self.git.commit_step(
