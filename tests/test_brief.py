@@ -493,8 +493,19 @@ Exercise the per-step model field.
                     f"(opt-in field; no existing brief declares it), got "
                     f"{step.sentry!r}",
                 )
-        # Success: every parsed brief had model/issues/sentry = None on every
-        # step. Briefs that fail to parse are pre-existing drift, not a regression.
+            # v4 Phase 1c Step 1: the new per-brief deploy_target: field defaults
+            # to None on every existing brief (none declares it yet). (Briefs with
+            # vps_deploy: yes emit the vps-deploy-deprecated warning here — that is
+            # the expected operational signal, not a field-population; deploy_target
+            # stays None.)
+            self.assertIsNone(
+                brief.deploy_target,
+                f"{b.parent.name}: deploy_target must be None (opt-in field; no "
+                f"existing brief declares it), got {brief.deploy_target!r}",
+            )
+        # Success: every parsed brief had model/issues/sentry = None on every step
+        # AND deploy_target = None. Briefs that fail to parse are pre-existing
+        # drift, not a regression.
         self.assertGreater(parsed, 0, f"no briefs parsed; failures={parse_failed}")
 
 
@@ -691,3 +702,133 @@ Exercise the per-step sentry field.
         self.assertEqual(step.issues, "write")
         self.assertEqual(step.sentry, "read")
         validate_or_reject(brief, fm)  # all three validate independently
+
+
+class TestBriefDeployTarget(unittest.TestCase):
+    """v4 Phase 1c Step 1 (Q-C3): the per-brief `deploy_target:` frontmatter
+    field — parse, validate (rule 16), defensive empty/null/none handling, the
+    vps_deploy: coexistence warnings (vps-deploy-deprecated / deploy-target-
+    mismatch, neither rejecting), and the four-axis coexistence (model: +
+    issues: + sentry: + deploy_target:)."""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-deploy-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-deploy-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, vps_deploy: str = "no", deploy_target_line: str = "",
+               step_extra: str = ""):
+        # Rule 4: vps_deploy: yes requires service_name + vps_target_path. Supply
+        # them so a yes-fixture exercises the deploy_target logic, not rule 4.
+        vps_extra = (
+            "service_name: test-svc\nvps_target_path: /srv/test\n"
+            if vps_deploy == "yes" else ""
+        )
+        body = f"""---
+brief_version: 1
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: {vps_deploy}
+{vps_extra}{deploy_target_line}
+---
+
+## Goal
+
+Exercise the per-brief deploy_target field.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** read
+- **smoke:** `echo hi`
+- **confirm:** explicit
+{step_extra}
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    def _kinds(self, brief):
+        return [w.get("kind") for w in brief.parse_warnings]
+
+    # --- parsing + validation -----------------------------------------------
+    def test_valid_targets_parse_and_validate(self) -> None:
+        # vps/vercel/netlify validate clean; "none" normalizes to None (still valid).
+        for tgt in ("vps", "vercel", "netlify", "none"):
+            with self.subTest(target=tgt):
+                # vps_deploy chosen to avoid a mismatch warning muddying the case.
+                vps = "yes" if tgt == "vps" else "no"
+                brief, fm = self._parse(
+                    vps_deploy=vps, deploy_target_line=f"deploy_target: {tgt}")
+                validate_or_reject(brief, fm)  # no raise
+                expected = None if tgt == "none" else tgt
+                self.assertEqual(brief.deploy_target, expected)
+
+    def test_unknown_target_rejected(self) -> None:
+        for bad in ("aws", "cloudflare", "lambda"):
+            with self.subTest(target=bad):
+                brief, fm = self._parse(deploy_target_line=f"deploy_target: {bad}")
+                with self.assertRaises(BriefValidationError) as ctx:
+                    validate_or_reject(brief, fm)
+                self.assertIn(f"deploy_target '{bad}'", " ".join(ctx.exception.errors))
+
+    def test_absent_is_none(self) -> None:
+        brief, fm = self._parse(deploy_target_line="")
+        self.assertIsNone(brief.deploy_target)
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_blank_values_treated_as_absent(self) -> None:
+        for val in ("", "null", "none"):
+            with self.subTest(value=val):
+                brief, fm = self._parse(deploy_target_line=f"deploy_target: {val}")
+                self.assertIsNone(brief.deploy_target)
+                validate_or_reject(brief, fm)  # no raise
+
+    # --- vps_deploy: coexistence warnings (Q-C3) ----------------------------
+    def test_vps_deploy_yes_absent_target_warns_deprecated(self) -> None:
+        brief, fm = self._parse(vps_deploy="yes", deploy_target_line="")
+        validate_or_reject(brief, fm)  # warning, not error
+        self.assertIn("vps-deploy-deprecated", self._kinds(brief))
+        # The warning is the operational signal — the field stays None.
+        self.assertIsNone(brief.deploy_target)
+
+    def test_deploy_target_vps_with_vps_deploy_no_warns_mismatch(self) -> None:
+        brief, fm = self._parse(
+            vps_deploy="no", deploy_target_line="deploy_target: vps")
+        validate_or_reject(brief, fm)  # warning, not error
+        self.assertIn("deploy-target-mismatch", self._kinds(brief))
+        self.assertEqual(brief.deploy_target, "vps")
+
+    def test_consistent_pairs_emit_no_coexistence_warning(self) -> None:
+        # vercel + vps_deploy:no is consistent (not deploying to vps); no warning.
+        brief, _ = self._parse(
+            vps_deploy="no", deploy_target_line="deploy_target: vercel")
+        kinds = self._kinds(brief)
+        self.assertNotIn("vps-deploy-deprecated", kinds)
+        self.assertNotIn("deploy-target-mismatch", kinds)
+
+    # --- four-axis coexistence ----------------------------------------------
+    def test_model_issues_sentry_deploy_target_coexist(self) -> None:
+        brief, fm = self._parse(
+            vps_deploy="no",
+            deploy_target_line="deploy_target: vercel",
+            step_extra=(
+                "- **model:** haiku\n"
+                "- **issues:** write\n"
+                "- **sentry:** read"
+            ),
+        )
+        self.assertEqual(brief.deploy_target, "vercel")
+        step = brief.steps[0]
+        self.assertEqual(step.model, "haiku")
+        self.assertEqual(step.issues, "write")
+        self.assertEqual(step.sentry, "read")
+        validate_or_reject(brief, fm)  # all four axes validate independently

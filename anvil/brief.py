@@ -41,6 +41,14 @@ ISSUES_SCOPES = frozenset({"read", "write"})
 # scope; validated in rule 15. Like ISSUES_SCOPES, a separate axis from model:
 # and scope.operations — validated independently.
 SENTRY_SCOPES = frozenset({"read"})
+# v4 Phase 1c Step 1 (Q-C3): the per-brief `deploy_target:` frontmatter field —
+# the deploy-target axis, extending the legacy required `vps_deploy:` bool. A
+# brief declares at most one target. "none"/""/"null" normalize to None at parse
+# (the model:/issues:/sentry: defensive precedent), so "none" is documented
+# vocabulary the parser maps to absent rather than a stored value. Validated in
+# rule 16; vps_deploy: coexistence is a warning (vps-deploy-deprecated /
+# deploy-target-mismatch), never a rejection.
+DEPLOY_TARGETS = frozenset({"vps", "vercel", "netlify", "none"})
 _REQUIRED_FRONTMATTER = (
     "brief_version",
     "project",
@@ -96,6 +104,13 @@ class Brief(BaseModel):
     service_name: str | None = None
     # Phase 3 Step 1: VPS-side path for deploy chain (cd here, then git pull --ff-only)
     vps_target_path: str | None = None
+    # v4 Phase 1c Step 1 (Q-C3): optional per-brief deploy target (opt-in;
+    # absent → None → derive from vps_deploy). Validated in rule 16 against
+    # DEPLOY_TARGETS; coexists with the legacy required vps_deploy: (warnings,
+    # not errors). Parsed-not-consumed in first-pass — the orchestrator's deploy
+    # chain still reads vps_deploy/vps_target_path directly (available-but-not-
+    # consumed; Step 1 does not wire this into the deploy loop).
+    deploy_target: str | None = None
     goal: str = ""
     context_links: list[str] = []
     context_paths: list[Path] = []
@@ -156,6 +171,17 @@ def _norm_yes_no(raw: object) -> str:
         return "yes" if raw else "no"
     s = str(raw).strip().lower()
     return s if s in ("yes", "no") else "no"
+
+
+def _norm_deploy_target(raw: object) -> str | None:
+    """Normalise a deploy_target value. Absent / "" / "null" / "none" → None
+    (the model:/issues:/sentry: defensive precedent — "none" is documented
+    vocabulary that maps to absent, not a stored value). Otherwise the lowercased
+    string (rule 16 validates membership in DEPLOY_TARGETS)."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    return None if s in ("", "null", "none") else s
 
 
 def _field(block: str, key: str) -> str | None:
@@ -333,6 +359,32 @@ def _compute_model_warnings(brief: Brief) -> list[dict]:
     return warnings
 
 
+def _compute_deploy_target_warnings(brief: Brief) -> list[dict]:
+    """v4 Phase 1c Step 1 (Q-C3): the deploy_target: / vps_deploy: coexistence.
+    Two non-rejecting warnings (deploy_target wins; vps_deploy is the deprecated
+    legacy bool the deploy chain still reads directly):
+    - `vps-deploy-deprecated`: vps_deploy: yes with no deploy_target: declared —
+      treat as deploy_target: vps; declare deploy_target: vps instead (vps_deploy
+      support is dropped in Phase 2).
+    - `deploy-target-mismatch`: deploy_target: declared but disagreeing with
+      vps_deploy: — i.e. (deploy_target == 'vps') != (vps_deploy == 'yes').
+      deploy_target wins; the warning flags the inconsistency to reconcile.
+    Neither rejects; repo-independent; surfaces via _emit_parse_warnings."""
+    warnings: list[dict] = []
+    dt = brief.deploy_target
+    vps_yes = brief.vps_deploy == "yes"
+    if dt is None:
+        if vps_yes:
+            warnings.append({"kind": "vps-deploy-deprecated"})
+    elif (dt == "vps") != vps_yes:
+        warnings.append({
+            "kind": "deploy-target-mismatch",
+            "deploy_target": dt,
+            "vps_deploy": brief.vps_deploy,
+        })
+    return warnings
+
+
 def _emit_parse_warnings(warnings: list[dict]) -> None:
     """Emit each warning to stderr and to the anvil logger. Stderr
     line shape matches the brief's spec:
@@ -351,6 +403,19 @@ def _emit_parse_warnings(warnings: list[dict]) -> None:
                 f"{sorted(w['operations'])} include no LLM-calling operation "
                 "(read/write/shell); the model selection will not affect this "
                 "step's substantive work. Continuing; the brief still validates."
+            )
+        elif w.get("kind") == "vps-deploy-deprecated":
+            line = (
+                "[brief-warning] vps_deploy: yes is deprecated; declare "
+                "deploy_target: vps instead (treating as deploy_target: vps for "
+                "the deploy chain, which still reads vps_deploy directly). "
+                "vps_deploy support is dropped in Phase 2. The brief still validates."
+            )
+        elif w.get("kind") == "deploy-target-mismatch":
+            line = (
+                f"[brief-warning] deploy_target: {w['deploy_target']!r} conflicts "
+                f"with vps_deploy: {w['vps_deploy']!r}; deploy_target wins. "
+                "Reconcile the frontmatter. The brief still validates."
             )
         else:  # path-not-found
             cm = w.get("closest_match")
@@ -387,6 +452,7 @@ def parse_brief_raw(path: Path) -> tuple[Brief, dict]:
         vps_target_path=(
             str(fm["vps_target_path"]) if fm.get("vps_target_path") else None
         ),
+        deploy_target=_norm_deploy_target(fm.get("deploy_target")),
         goal=sections.get("goal", ""),
         context_links=_parse_context(sections.get("context", "")),
         steps=_parse_steps(sections.get("steps", "")),
@@ -395,7 +461,11 @@ def parse_brief_raw(path: Path) -> tuple[Brief, dict]:
     # Phase 2 Step 6 (decision #18 layer 1): compute parse-time path
     # warnings and attach them to the Brief. Emit each to stderr +
     # logger so the build session sees them before Stage A runs.
-    warnings = _compute_parse_warnings(brief) + _compute_model_warnings(brief)
+    warnings = (
+        _compute_parse_warnings(brief)
+        + _compute_model_warnings(brief)
+        + _compute_deploy_target_warnings(brief)
+    )
     if warnings:
         brief = brief.model_copy(update={"parse_warnings": warnings})
         _emit_parse_warnings(warnings)
@@ -410,9 +480,10 @@ def parse_brief(path: Path) -> Brief:
 
 
 # ---------------------------------------------------------------------------
-# Validation — 15 rules. Rules 1-12 are implementation-notes Component 2; rule
+# Validation — 16 rules. Rules 1-12 are implementation-notes Component 2; rule
 # 13 (per-step model:, v4 Phase 1a Step 2), rule 14 (issues:, v4 Phase 1b Step
-# 1), and rule 15 (sentry:, v4 Phase 1b Step 2) extend it backwards-compatibly.
+# 1), rule 15 (sentry:, v4 Phase 1b Step 2), and rule 16 (per-brief
+# deploy_target:, v4 Phase 1c Step 1) extend it backwards-compatibly.
 # ---------------------------------------------------------------------------
 
 def _is_git_repo(path: Path) -> bool:
@@ -601,6 +672,18 @@ def validate_or_reject(
                 f"step {s.number} ({s.name}): sentry {s.sentry!r} is not a "
                 f"valid scope {sorted(SENTRY_SCOPES)}"
             )
+
+    # 16. v4 Phase 1c Step 1 (Q-C3): per-brief deploy_target: must be a known
+    # target (DEPLOY_TARGETS) or absent. "none"/""/null normalize to None at
+    # parse (the model:/issues:/sentry: defensive precedent), so this rule only
+    # sees vps/vercel/netlify or an unknown value. The vps_deploy: coexistence is
+    # a warning (vps-deploy-deprecated / deploy-target-mismatch), not a rule-16
+    # rejection — deploy_target is a separate axis, validated independently.
+    if brief.deploy_target is not None and brief.deploy_target not in DEPLOY_TARGETS:
+        e.append(
+            f"deploy_target {brief.deploy_target!r} is not a known target "
+            f"{sorted(DEPLOY_TARGETS)}"
+        )
 
     if e:
         raise BriefValidationError(e)
