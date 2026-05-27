@@ -35,6 +35,7 @@ evidence-gated routing to extend the module without touching call sites.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
@@ -166,11 +167,21 @@ _SUBTASK_MAX_TOKENS = 8192
 
 
 def call_model_for_subtask(
-    model_name: str, system_prompt: str, user_message: str
+    model_name: str, system_prompt: str, user_message: str,
+    *, image: bytes | None = None, image_media_type: str = "image/png",
 ) -> str:
     """Generic single-shot model call for Phase 2/3 internal sub-tasks (e.g. a
     browser-observation re-check, a vision-frame interpretation) — the seam's
     third public surface (Q-A6: lives here, not in planner.py).
+
+    v4 Phase 3c Step 1 (BAF-1): an optional `image` (raw bytes, `image_media_
+    type` defaulting to PNG) makes this the seam's first VISION consumer. When
+    `image` is present the user turn becomes a multimodal content-block list
+    (text + a base64 image source); when absent the content is the plain
+    `user_message` string — the text path is byte-identical to the Phase 2c
+    Haiku-digest behaviour (the first seam change since V4P1A; backwards-
+    compatible). The model must already be vision-capable (`sonnet`); the
+    caller picks it.
 
     Resolves `model_name` via `resolve_model`, gets the shared client via
     `client_for_model`, calls the Anthropic SDK, and returns the concatenated
@@ -194,12 +205,29 @@ def call_model_for_subtask(
     resolved = resolve_model(model_name)
     client = client_for_model(model_name)
 
+    # v4 Phase 3c Step 1: text-only (image=None) is the plain string — the
+    # byte-identical Phase 2c path; with an image, a multimodal content list.
+    if image is None:
+        content = user_message
+    else:
+        content = [
+            {"type": "text", "text": user_message},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image_media_type,
+                    "data": base64.b64encode(image).decode("ascii"),
+                },
+            },
+        ]
+
     def _attempt() -> str:
         resp = client.messages.create(
             model=resolved,
             max_tokens=_SUBTASK_MAX_TOKENS,
             system=system_prompt,  # plain string — no cache_control (Q-A3)
-            messages=[{"role": "user", "content": user_message}],
+            messages=[{"role": "user", "content": content}],
         )
         return "".join(
             b.text for b in resp.content

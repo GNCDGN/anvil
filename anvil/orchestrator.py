@@ -37,7 +37,9 @@ from zoneinfo import ZoneInfo
 
 from anvil import events as _events
 from anvil import git_ops as _git_ops
-from anvil.brief import parse_brief, resolve_context_paths, validate_or_reject
+from anvil.brief import (
+    parse_brief, resolve_context_paths, validate_or_reject, _observe_scheme,
+)
 from anvil.lint import lint_brief
 from anvil.coder import Coder
 from anvil import ssh_ops
@@ -46,6 +48,11 @@ from anvil import ssh_ops
 # `from anvil import ssh_ops` style) so the mock-patch target is
 # `anvil.orchestrator.browser` / `anvil.orchestrator.visibility_session`.
 from anvil.integrations import browser, visibility_session
+# v4 Phase 3c Step 1: the screen-aware observe sub-phase dispatches the screen://
+# (native) and tab:// (extension) schemes to the Phase 3a substrate wrappers
+# (module imports so the mock-patch target is `anvil.orchestrator.screen_capture`
+# / `anvil.orchestrator.screen_browser`).
+from anvil.integrations import screen_capture, screen_browser
 # v4 Phase 2c Step 2: the observe-loop's first real consumer of the Phase 1a
 # seam (the Haiku-routed observation digest). Module import so the mock-patch
 # target is `anvil.orchestrator.routing.call_model_for_subtask`.
@@ -141,6 +148,45 @@ def _build_observation_summary(observations: dict) -> str:
         for e in entries:
             parts.append(f"  {e.get('status')} {e.get('url')}")
     return "\n".join(parts) if parts else "(no observations captured)"
+
+
+# v4 Phase 3c Step 1: the vision-interpretation system prompt the screen-aware
+# observe sub-phase sends to Sonnet via call_model_for_subtask (the seam's FIRST
+# vision consumer, BAF-1). Plain string (no cache_control — the seam's Q-A3). Asks
+# for a Planner-readable digest of the screen frame + accessibility tree. The
+# "describe only what is visible; do not assert correctness" clause holds the
+# Q-C0 no-equivalence-claim line: this captures + feeds back, it does not grade.
+VISION_SYSTEM_PROMPT = (
+    "You interpret a screenshot of a build step's running UI, plus an optional "
+    "accessibility-tree summary. Produce a concise digest — a short paragraph "
+    "plus a bullet list of notable findings (visible errors, broken layout, "
+    "unexpected state) — that the Planner reads on the next iteration. Be terse; "
+    "if nothing is notable, say so in one line. Describe only what is visible; do "
+    "not assert correctness or equivalence to any expected output."
+)
+
+
+def _build_screen_summary(observations: dict) -> str:
+    """Render the screen observations as the TEXT half of the Sonnet vision call
+    (Phase 3c Step 1) — the frame itself rides as the image content block, so it
+    is noted by size only (the pixels are the image, not the text; cost-shaping).
+    The accessibility tree is summarized verbatim (role/label per element).
+    Module-level so it is not re-created per step (the _build_observation_summary
+    precedent)."""
+    parts: list[str] = []
+    frame = observations.get("frame")
+    if frame is not None and isinstance(frame, dict):
+        parts.append(
+            f"Frame: {frame.get('width')}x{frame.get('height')} "
+            "(the screenshot is attached as the image)"
+        )
+    ax = observations.get("accessibility")
+    if ax is not None and isinstance(ax, dict):
+        elements = ax.get("elements", [])
+        parts.append(f"Accessibility: {len(elements)} top-level elements")
+        for e in elements:
+            parts.append(f"  [{e.get('role')}] {e.get('label')}")
+    return "\n".join(parts) if parts else "(no screen observations captured)"
 
 
 class Orchestrator:
@@ -735,129 +781,22 @@ class Orchestrator:
                         if _s not in _seen:
                             _seen.add(_s)
                             surfaces.append(_s)
-                    observations = {"dom": None, "console": None, "network": None}
-                    _capture = {
-                        "dom": "snapshot_dom",
-                        "console": "capture_console",
-                        "network": "capture_network",
-                    }
-                    sess = browser.BrowserSession()
-                    try:
-                        launched = sess.launch(headless=True)
-                        if launched.get("ok"):
-                            nav = sess.navigate(observe_target)
-                            if nav.get("ok"):
-                                for surface in surfaces:
-                                    method = _capture.get(surface)
-                                    if method is None:
-                                        continue  # schema (rule 17) validated it
-                                    res = getattr(sess, method)()
-                                    if res.get("ok"):
-                                        observations[surface] = res.get("result")
-                                    else:
-                                        self._log_event(
-                                            "observe",
-                                            f"step {bstep.number}: capture "
-                                            f"{surface} failed: {res.get('error')}",
-                                        )
-                            else:
-                                self._log_event(
-                                    "observe",
-                                    f"step {bstep.number}: navigate "
-                                    f"{observe_target!r} failed: {nav.get('error')}",
-                                )
-                        else:
-                            self._log_event(
-                                "observe",
-                                f"step {bstep.number}: browser launch failed: "
-                                f"{launched.get('error')}",
-                            )
-                    finally:
-                        try:
-                            sess.close()
-                        except Exception:  # noqa: BLE001 — defensive; never-raises
-                            pass
-                    # Route the captured observations to a Haiku digest (the
-                    # Phase 1a seam's FIRST real consumer) BEFORE the single
-                    # write (BAF-1 digest-first-single-write — no double-blob-
-                    # write, no visibility_session.py change). Capture-only: a
-                    # seam failure (the error sentinel, BAF-2) OR an empty/
-                    # whitespace response (Q-F4-F1) both yield digest=None +
-                    # continue.
-                    digest = None
-                    if any(observations.get(s) is not None
-                           for s in ("dom", "console", "network")):
-                        raw_digest = routing.call_model_for_subtask(
-                            "haiku",
-                            DIGEST_SYSTEM_PROMPT,
-                            _build_observation_summary(observations),
+                    # v4 Phase 3c Step 1: dispatch the observe sub-phase by the
+                    # target's scheme (Q-C2 / BAF-3). https:// → the Phase 2c
+                    # browser path (BrowserSession + Haiku + observe.captured,
+                    # byte-identical, extracted unchanged to the helper below);
+                    # screen:// / tab:// → the screen-aware path (screen substrate
+                    # + Sonnet vision + screen.captured). A clean branch, not a
+                    # rewrite — the browser path is unchanged.
+                    scheme = _observe_scheme(observe_target)
+                    if scheme == "browser":
+                        self._observe_browser_subphase(
+                            state, idx, bstep, observe_target, surfaces
                         )
-                        if raw_digest.startswith("[call_model_for_subtask error:"):
-                            self._log_event(
-                                "observe",
-                                f"step {bstep.number}: digest seam error "
-                                f"(digest=None): {raw_digest}",
-                            )
-                        elif not raw_digest.strip():
-                            self._log_event(
-                                "observe",
-                                f"step {bstep.number}: digest empty — Haiku "
-                                "returned no text content (digest=None; Q-F4-F1)",
-                            )
-                        else:
-                            digest = raw_digest
-                    # Single write with the digest (digest=None on a seam
-                    # failure / empty response / no captured surface). Never
-                    # fails the step (capture-only).
-                    written = visibility_session.write_session(
-                        state.run_id, idx, observe_target or "", observations,
-                        digest=digest,
-                    )
-                    record_path = ""
-                    if written.get("ok"):
-                        record_path = (written.get("result") or {}).get("path", "")
-                    else:
-                        self._log_event(
-                            "observe",
-                            f"step {bstep.number}: visibility_session write "
-                            f"failed: {written.get('error')}",
+                    else:  # screen / tab
+                        self._observe_screen_subphase(
+                            state, idx, bstep, observe_target, surfaces, scheme
                         )
-                    # Emit observe.captured (Q-F2/Q-F3) — derived counts + the
-                    # record path + digest size + ok; NO blobs on the row. The
-                    # first v4 event kind, emitted with a run_id context (the
-                    # connector-pattern.md Contract 5 condition).
-                    _console_errs = 0
-                    _net_fails = 0
-                    if observations.get("console"):
-                        _console_errs = sum(
-                            1 for e in observations["console"].get("entries", [])
-                            if e.get("type") == "error"
-                        )
-                    if observations.get("network"):
-                        _net_fails = sum(
-                            1 for e in observations["network"].get("entries", [])
-                            if (e.get("status") or 0) >= 400
-                        )
-                    _events.emit(
-                        "observe.captured",
-                        {
-                            "step_idx": idx,
-                            "target": observe_target or "",
-                            "surfaces": surfaces,
-                            "record_path": record_path,
-                            "console_error_count": _console_errs,
-                            "network_failure_count": _net_fails,
-                            "digest_chars": len(digest) if digest else 0,
-                            "ok": bool(written.get("ok")),
-                        },
-                        step_idx=idx,
-                    )
-                    self._log_event(
-                        "observe",
-                        f"step {bstep.number}: captured {surfaces} → "
-                        f"{record_path or '(write failed)'}; "
-                        f"digest_chars={len(digest) if digest else 0}",
-                    )
 
                 # 5e commit (orchestrator owns it so the footer is canonical)
                 commit_hash = self.git.commit_step(
@@ -1163,6 +1102,277 @@ class Orchestrator:
         if text == "skip":
             return "skip"
         return "abort"
+
+    # ---- observe sub-phase (v4 Phase 2c browser / Phase 3c screen) ----
+    def _observe_browser_subphase(self, state, idx, bstep, observe_target, surfaces):
+        """v4 Phase 2c observe sub-phase, browser-class (https://). Launch the
+        Phase 2a browser substrate, capture the declared DOM/console/network
+        surfaces, route to a Haiku digest (the seam's first real consumer),
+        single-write via visibility_session, emit observe.captured. CAPTURE-ONLY
+        (Q-F7): every failure logs and continues — never fails the step. Per-step
+        BrowserSession lifecycle, closed in try/finally (Q-F6). Extracted
+        unchanged from the Phase 2c inline block at Phase 3c Step 1 (the scheme
+        dispatch); the browser path is byte-identical to Phase 2c."""
+        observations = {"dom": None, "console": None, "network": None}
+        _capture = {
+            "dom": "snapshot_dom",
+            "console": "capture_console",
+            "network": "capture_network",
+        }
+        sess = browser.BrowserSession()
+        try:
+            launched = sess.launch(headless=True)
+            if launched.get("ok"):
+                nav = sess.navigate(observe_target)
+                if nav.get("ok"):
+                    for surface in surfaces:
+                        method = _capture.get(surface)
+                        if method is None:
+                            continue  # schema (rule 17) validated it
+                        res = getattr(sess, method)()
+                        if res.get("ok"):
+                            observations[surface] = res.get("result")
+                        else:
+                            self._log_event(
+                                "observe",
+                                f"step {bstep.number}: capture "
+                                f"{surface} failed: {res.get('error')}",
+                            )
+                else:
+                    self._log_event(
+                        "observe",
+                        f"step {bstep.number}: navigate "
+                        f"{observe_target!r} failed: {nav.get('error')}",
+                    )
+            else:
+                self._log_event(
+                    "observe",
+                    f"step {bstep.number}: browser launch failed: "
+                    f"{launched.get('error')}",
+                )
+        finally:
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001 — defensive; never-raises
+                pass
+        # Route to a Haiku digest BEFORE the single write (BAF-1 digest-first-
+        # single-write). Capture-only: a seam failure (the error sentinel) OR an
+        # empty/whitespace response (Q-F4-F1) both yield digest=None + continue.
+        digest = None
+        if any(observations.get(s) is not None
+               for s in ("dom", "console", "network")):
+            raw_digest = routing.call_model_for_subtask(
+                "haiku",
+                DIGEST_SYSTEM_PROMPT,
+                _build_observation_summary(observations),
+            )
+            if raw_digest.startswith("[call_model_for_subtask error:"):
+                self._log_event(
+                    "observe",
+                    f"step {bstep.number}: digest seam error "
+                    f"(digest=None): {raw_digest}",
+                )
+            elif not raw_digest.strip():
+                self._log_event(
+                    "observe",
+                    f"step {bstep.number}: digest empty — Haiku "
+                    "returned no text content (digest=None; Q-F4-F1)",
+                )
+            else:
+                digest = raw_digest
+        written = visibility_session.write_session(
+            state.run_id, idx, observe_target or "", observations,
+            digest=digest,
+        )
+        record_path = ""
+        if written.get("ok"):
+            record_path = (written.get("result") or {}).get("path", "")
+        else:
+            self._log_event(
+                "observe",
+                f"step {bstep.number}: visibility_session write "
+                f"failed: {written.get('error')}",
+            )
+        # Emit observe.captured (Q-F2/Q-F3) — derived counts + the record path
+        # + digest size + ok; NO blobs on the row.
+        _console_errs = 0
+        _net_fails = 0
+        if observations.get("console"):
+            _console_errs = sum(
+                1 for e in observations["console"].get("entries", [])
+                if e.get("type") == "error"
+            )
+        if observations.get("network"):
+            _net_fails = sum(
+                1 for e in observations["network"].get("entries", [])
+                if (e.get("status") or 0) >= 400
+            )
+        _events.emit(
+            "observe.captured",
+            {
+                "step_idx": idx,
+                "target": observe_target or "",
+                "surfaces": surfaces,
+                "record_path": record_path,
+                "console_error_count": _console_errs,
+                "network_failure_count": _net_fails,
+                "digest_chars": len(digest) if digest else 0,
+                "ok": bool(written.get("ok")),
+            },
+            step_idx=idx,
+        )
+        self._log_event(
+            "observe",
+            f"step {bstep.number}: captured {surfaces} → "
+            f"{record_path or '(write failed)'}; "
+            f"digest_chars={len(digest) if digest else 0}",
+        )
+
+    def _observe_screen_subphase(
+        self, state, idx, bstep, observe_target, surfaces, scheme
+    ):
+        """v4 Phase 3c Step 1 observe sub-phase, screen-class (screen:// native /
+        tab:// extension). Launch the Phase 3a screen substrate, capture the
+        declared frame/accessibility surfaces, route the frame to a Sonnet VISION
+        digest (the seam's first vision consumer, BAF-1), single-write via
+        visibility_session (frame is binary — write_bytes), emit screen.captured
+        (mode=build). CAPTURE-ONLY (Q-F7): every failure logs and continues —
+        never fails the step. Per-step session lifecycle, torn down in finally
+        (Q-F6). screen:// → ScreenCaptureSession (snapshot_frame +
+        query_accessibility); tab:// → BrowserExtensionSession (capture_tab;
+        the accessibility tree is a native-only surface, skipped on tab://)."""
+        observations = {"frame": None, "accessibility": None}
+        if scheme == "tab":
+            sess = screen_browser.BrowserExtensionSession()
+            _open, _close = sess.connect_extension, sess.disconnect
+            _frame = sess.capture_tab
+            _accessibility = None  # the extension surface has no AX tree
+        else:  # screen
+            sess = screen_capture.ScreenCaptureSession()
+            _open, _close = sess.start_capture, sess.stop_capture
+            _frame = sess.snapshot_frame
+            _accessibility = sess.query_accessibility
+        try:
+            opened = _open()
+            if opened.get("ok"):
+                if "frame" in surfaces:
+                    res = _frame()
+                    if res.get("ok"):
+                        observations["frame"] = res.get("result")
+                    else:
+                        self._log_event(
+                            "observe",
+                            f"step {bstep.number}: capture frame failed: "
+                            f"{res.get('error')}",
+                        )
+                if "accessibility" in surfaces:
+                    if _accessibility is None:
+                        self._log_event(
+                            "observe",
+                            f"step {bstep.number}: accessibility surface "
+                            f"unsupported on {scheme} scheme (skipped)",
+                        )
+                    else:
+                        res = _accessibility()
+                        if res.get("ok"):
+                            observations["accessibility"] = res.get("result")
+                        else:
+                            self._log_event(
+                                "observe",
+                                f"step {bstep.number}: capture accessibility "
+                                f"failed: {res.get('error')}",
+                            )
+            else:
+                self._log_event(
+                    "observe",
+                    f"step {bstep.number}: screen substrate ({scheme}) open "
+                    f"failed: {opened.get('error')}",
+                )
+        finally:
+            try:
+                _close()
+            except Exception:  # noqa: BLE001 — defensive; never-raises
+                pass
+        # Route the frame to a Sonnet VISION digest (the seam's first vision
+        # consumer). digest=None on no frame / seam error / empty. An
+        # accessibility-only capture (no frame) still digests via Sonnet, text-
+        # only (image absent) — the AX tree is the signal.
+        digest = None
+        vision_used = False
+        frame_blob = observations.get("frame")
+        ax_blob = observations.get("accessibility")
+        if frame_blob is not None and frame_blob.get("frame_png"):
+            vision_used = True
+            raw_digest = routing.call_model_for_subtask(
+                "sonnet",
+                VISION_SYSTEM_PROMPT,
+                _build_screen_summary(observations),
+                image=frame_blob["frame_png"],
+            )
+            if raw_digest.startswith("[call_model_for_subtask error:"):
+                self._log_event(
+                    "observe",
+                    f"step {bstep.number}: vision digest seam error "
+                    f"(digest=None): {raw_digest}",
+                )
+            elif not raw_digest.strip():
+                self._log_event(
+                    "observe",
+                    f"step {bstep.number}: vision digest empty — Sonnet "
+                    "returned no text content (digest=None)",
+                )
+            else:
+                digest = raw_digest
+        elif ax_blob is not None:
+            raw_digest = routing.call_model_for_subtask(
+                "sonnet",
+                VISION_SYSTEM_PROMPT,
+                _build_screen_summary(observations),
+            )
+            if (not raw_digest.startswith("[call_model_for_subtask error:")
+                    and raw_digest.strip()):
+                digest = raw_digest
+        written = visibility_session.write_session(
+            state.run_id, idx, observe_target or "", observations,
+            digest=digest,
+        )
+        record_path = ""
+        if written.get("ok"):
+            record_path = (written.get("result") or {}).get("path", "")
+        else:
+            self._log_event(
+                "observe",
+                f"step {bstep.number}: visibility_session write failed: "
+                f"{written.get('error')}",
+            )
+        # Emit screen.captured (Q-C7; mode=build) — derived counts + the record
+        # path + digest size + ok; NO blobs on the row. VALID_KINDS stays 53.
+        _ax_count = (
+            len(ax_blob.get("elements", []))
+            if isinstance(ax_blob, dict) else 0
+        )
+        _events.emit(
+            "screen.captured",
+            {
+                "mode": "build",
+                "step_idx": idx,
+                "target": observe_target or "",
+                "surfaces": surfaces,
+                "record_path": record_path,
+                "accessibility_element_count": _ax_count,
+                "vision_used": vision_used,
+                "frame_count": 1 if frame_blob is not None else 0,
+                "digest_chars": len(digest) if digest else 0,
+                "ok": bool(written.get("ok")),
+            },
+            step_idx=idx,
+        )
+        self._log_event(
+            "observe",
+            f"step {bstep.number}: screen-captured {surfaces} ({scheme}) → "
+            f"{record_path or '(write failed)'}; vision_used={vision_used}; "
+            f"digest_chars={len(digest) if digest else 0}",
+        )
 
     # ---- escalation ----
     # Decision #19 (Phase 2 Step 3): the `options` argument is now a

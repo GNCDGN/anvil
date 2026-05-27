@@ -239,5 +239,54 @@ class TestCallModelForSubtask(unittest.TestCase):
         self.assertFalse(sleep.called)
 
 
+class TestCallModelForSubtaskVision(unittest.TestCase):
+    """v4 Phase 3c Step 1 (BAF-1): the seam's first VISION consumer. An optional
+    `image` makes the user turn a multimodal content-block list (text + base64
+    image); the text path (image=None) stays byte-identical to Phase 2c."""
+
+    @staticmethod
+    def _fake_client(text="seen"):
+        client = mock.MagicMock()
+        client.messages.create.return_value = _fake_message(text)
+        return client
+
+    def test_image_builds_multimodal_content_block(self):
+        client = self._fake_client()
+        with mock.patch.object(routing, "_client", return_value=client):
+            out = call_model_for_subtask(
+                "sonnet", "sys", "describe", image=b"\x89PNGdata"
+            )
+        self.assertEqual(out, "seen")
+        content = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0], {"type": "text", "text": "describe"})
+        self.assertEqual(content[1]["type"], "image")
+        src = content[1]["source"]
+        self.assertEqual(src["type"], "base64")
+        self.assertEqual(src["media_type"], "image/png")  # default
+        # round-trips the raw bytes through base64
+        import base64
+        self.assertEqual(base64.b64decode(src["data"]), b"\x89PNGdata")
+
+    def test_image_media_type_override(self):
+        client = self._fake_client()
+        with mock.patch.object(routing, "_client", return_value=client):
+            call_model_for_subtask(
+                "sonnet", "sys", "u", image=b"jpegbytes",
+                image_media_type="image/jpeg",
+            )
+        content = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        self.assertEqual(content[1]["source"]["media_type"], "image/jpeg")
+
+    def test_no_image_keeps_plain_string_content(self):
+        # the byte-identical Phase 2c text path: content is the plain string,
+        # not a content-block list.
+        client = self._fake_client()
+        with mock.patch.object(routing, "_client", return_value=client):
+            call_model_for_subtask("haiku", "sys", "plain-text")
+        content = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        self.assertEqual(content, "plain-text")
+
+
 if __name__ == "__main__":
     unittest.main()

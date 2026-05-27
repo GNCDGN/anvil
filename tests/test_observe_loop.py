@@ -117,6 +117,44 @@ def _ok_session(*, dom="<html><body>x</body></html>",
     return sess
 
 
+def _ok_screen_session(*, width=2560, height=1440, frame_png=b"\x89PNGdata",
+                        ax_elements=None, start_ok=True, frame_ok=True,
+                        ax_ok=True):
+    """Build a MagicMock ScreenCaptureSession instance (v4 Phase 3c)."""
+    sess = mock.MagicMock(name="ScreenCaptureSession-instance")
+    sess.start_capture.return_value = (
+        {"ok": True, "result": {"started": True}} if start_ok
+        else {"ok": False, "error": "screen recording permission required"})
+    sess.snapshot_frame.return_value = (
+        {"ok": True, "result": {"frame_png": frame_png, "width": width,
+                                "height": height}} if frame_ok
+        else {"ok": False, "error": "capture returned no image"})
+    sess.query_accessibility.return_value = (
+        {"ok": True, "result": {"elements": ax_elements
+                                if ax_elements is not None else [
+                                    {"role": "AXWindow", "label": "Build",
+                                     "frame": None}],
+                                "query": None}} if ax_ok
+        else {"ok": False, "error": "accessibility permission required"})
+    sess.stop_capture.return_value = {"ok": True, "result": {"stopped": True}}
+    return sess
+
+
+def _ok_tab_session(*, width=1280, height=720, frame_png=b"\x89PNGtab",
+                    connect_ok=True, capture_ok=True):
+    """Build a MagicMock BrowserExtensionSession instance (v4 Phase 3c tab://)."""
+    sess = mock.MagicMock(name="BrowserExtensionSession-instance")
+    sess.connect_extension.return_value = (
+        {"ok": True, "result": {"connected": True}} if connect_ok
+        else {"ok": False, "error": "extension not connected"})
+    sess.capture_tab.return_value = (
+        {"ok": True, "result": {"frame_png": frame_png, "width": width,
+                                "height": height}} if capture_ok
+        else {"ok": False, "error": "capture_tab failed"})
+    sess.disconnect.return_value = {"ok": True, "result": {"disconnected": True}}
+    return sess
+
+
 class _ObserveBase(unittest.TestCase):
     def setUp(self) -> None:
         self._prev_state = os.environ.get("ANVIL_STATE_DIR")
@@ -558,6 +596,155 @@ class TestStep2ValidKindsBump(unittest.TestCase):
         # the events.py `assert len(VALID_KINDS) == 53` fires at import — a clean
         # import means the count-drift guard passed (52 → 53, Phase 3a Step 3).
         import anvil.events  # noqa: F401
+
+
+class TestPhase3cScreenObserve(_ObserveBase):
+    """v4 Phase 3c Step 1: the screen-aware observe sub-phase (screen:// native /
+    tab:// extension). The screen substrate is MOCKED at the orchestrator import
+    site (anvil.orchestrator.screen_capture / screen_browser); the seam
+    (call_model_for_subtask) is the _ObserveBase patch. screen-class observations
+    route a Sonnet VISION digest (image attached) and emit screen.captured
+    (mode=build), NOT observe.captured. Capture-only; never fails the step."""
+
+    @mock.patch("anvil.orchestrator._events.emit")
+    @mock.patch("anvil.integrations.visibility_session.write_session")
+    @mock.patch("anvil.orchestrator.screen_capture.ScreenCaptureSession")
+    def test_screen_scheme_dispatch_vision_digest_and_emit(
+        self, MockSC, mock_write, mock_emit
+    ):
+        MockSC.return_value = _ok_screen_session()
+        mock_write.return_value = {"ok": True, "result": {"path": "/p/record.json",
+                                                          "blobs": {}}}
+        orch = self._orch(["done"])
+        rc = orch.handle_brief(self._write_brief(
+            self._observe_step(1, target="screen://main",
+                               surfaces="frame, accessibility"),
+            version=3))
+        self.assertEqual(rc, 0)
+        sess = MockSC.return_value
+        sess.start_capture.assert_called_once()
+        sess.snapshot_frame.assert_called_once()
+        sess.query_accessibility.assert_called_once()
+        sess.stop_capture.assert_called_once()
+        # the seam was called for the vision digest — model=sonnet, image passed
+        seam_call = self.mock_seam.call_args
+        self.assertEqual(seam_call[0][0], "sonnet")
+        self.assertEqual(seam_call.kwargs.get("image"), b"\x89PNGdata")
+        # write_session got frame + accessibility observations + the digest
+        args, kwargs = mock_write.call_args
+        self.assertEqual(args[2], "screen://main")
+        observations = args[3]
+        self.assertEqual(observations["frame"]["frame_png"], b"\x89PNGdata")
+        self.assertEqual(len(observations["accessibility"]["elements"]), 1)
+        self.assertEqual(kwargs.get("digest"), "Digest: nothing notable.")
+        # screen.captured emitted (mode=build), NOT observe.captured
+        screen_emits = [c for c in mock_emit.call_args_list
+                        if c[0][0] == "screen.captured"]
+        observe_emits = [c for c in mock_emit.call_args_list
+                         if c[0][0] == "observe.captured"]
+        self.assertEqual(len(screen_emits), 1)
+        self.assertEqual(len(observe_emits), 0)
+        payload = screen_emits[0][0][1]
+        self.assertEqual(payload["mode"], "build")
+        self.assertEqual(payload["target"], "screen://main")
+        self.assertTrue(payload["vision_used"])
+        self.assertEqual(payload["frame_count"], 1)
+        self.assertEqual(payload["accessibility_element_count"], 1)
+        self.assertTrue(payload["ok"])
+
+    @mock.patch("anvil.orchestrator._events.emit")
+    @mock.patch("anvil.integrations.visibility_session.write_session")
+    @mock.patch("anvil.orchestrator.screen_browser.BrowserExtensionSession")
+    def test_tab_scheme_dispatch_extension_no_accessibility(
+        self, MockBE, mock_write, mock_emit
+    ):
+        MockBE.return_value = _ok_tab_session()
+        mock_write.return_value = {"ok": True, "result": {"path": "/p", "blobs": {}}}
+        orch = self._orch(["done"])
+        # tab:// + frame only (accessibility is native-only; would still be
+        # skipped if declared — here we declare just frame)
+        rc = orch.handle_brief(self._write_brief(
+            self._observe_step(1, target="tab://active", surfaces="frame"),
+            version=3))
+        self.assertEqual(rc, 0)
+        sess = MockBE.return_value
+        sess.connect_extension.assert_called_once()
+        sess.capture_tab.assert_called_once()
+        sess.disconnect.assert_called_once()
+        screen_emits = [c for c in mock_emit.call_args_list
+                        if c[0][0] == "screen.captured"]
+        self.assertEqual(len(screen_emits), 1)
+        payload = screen_emits[0][0][1]
+        self.assertEqual(payload["accessibility_element_count"], 0)
+        self.assertTrue(payload["vision_used"])
+
+    @mock.patch("anvil.orchestrator._events.emit")
+    @mock.patch("anvil.integrations.visibility_session.write_session")
+    @mock.patch("anvil.orchestrator.screen_capture.ScreenCaptureSession")
+    def test_browser_path_unchanged_no_screen_session(
+        self, MockSC, mock_write, mock_emit
+    ):
+        # a regression guard: an https:// target never touches the screen
+        # substrate and still emits observe.captured (not screen.captured).
+        mock_write.return_value = {"ok": True, "result": {"path": "p", "blobs": {}}}
+        with mock.patch("anvil.integrations.browser.BrowserSession") as MockBS:
+            MockBS.return_value = _ok_session()
+            orch = self._orch(["done"])
+            orch.handle_brief(self._write_brief(self._observe_step(1)))
+        MockSC.assert_not_called()
+        observe_emits = [c for c in mock_emit.call_args_list
+                         if c[0][0] == "observe.captured"]
+        screen_emits = [c for c in mock_emit.call_args_list
+                        if c[0][0] == "screen.captured"]
+        self.assertEqual(len(observe_emits), 1)
+        self.assertEqual(len(screen_emits), 0)
+
+    @mock.patch("anvil.orchestrator._events.emit")
+    @mock.patch("anvil.integrations.visibility_session.write_session")
+    @mock.patch("anvil.orchestrator.screen_capture.ScreenCaptureSession")
+    def test_frame_capture_failure_continues_capture_only(
+        self, MockSC, mock_write, mock_emit
+    ):
+        # frame capture fails (e.g. TCC), accessibility succeeds → no vision,
+        # but an accessibility-only digest + write + emit still happen; step OK.
+        MockSC.return_value = _ok_screen_session(frame_ok=False)
+        mock_write.return_value = {"ok": True, "result": {"path": "p", "blobs": {}}}
+        orch = self._orch(["done"])
+        rc = orch.handle_brief(self._write_brief(
+            self._observe_step(1, target="screen://main",
+                               surfaces="frame, accessibility"),
+            version=3))
+        self.assertEqual(rc, 0)  # capture-only: step proceeds
+        observations = mock_write.call_args[0][3]
+        self.assertIsNone(observations["frame"])
+        self.assertEqual(len(observations["accessibility"]["elements"]), 1)
+        payload = [c for c in mock_emit.call_args_list
+                   if c[0][0] == "screen.captured"][0][0][1]
+        self.assertFalse(payload["vision_used"])
+        self.assertEqual(payload["frame_count"], 0)
+
+    @mock.patch("anvil.orchestrator._events.emit")
+    @mock.patch("anvil.integrations.visibility_session.write_session")
+    @mock.patch("anvil.orchestrator.screen_capture.ScreenCaptureSession")
+    def test_vision_seam_error_yields_no_digest(self, MockSC, mock_write, mock_emit):
+        MockSC.return_value = _ok_screen_session()
+        mock_write.return_value = {"ok": True, "result": {"path": "p", "blobs": {}}}
+        self.mock_seam.return_value = "[call_model_for_subtask error: boom]"
+        orch = self._orch(["done"])
+        rc = orch.handle_brief(self._write_brief(
+            self._observe_step(1, target="screen://main", surfaces="frame"),
+            version=3))
+        self.assertEqual(rc, 0)
+        self.assertIsNone(mock_write.call_args[1].get("digest"))
+        payload = [c for c in mock_emit.call_args_list
+                   if c[0][0] == "screen.captured"][0][0][1]
+        self.assertEqual(payload["digest_chars"], 0)
+        self.assertTrue(payload["vision_used"])  # vision was attempted
+
+    def test_screen_captured_in_valid_kinds_no_new_bump(self):
+        from anvil.events import VALID_KINDS
+        self.assertIn("screen.captured", VALID_KINDS)
+        self.assertEqual(len(VALID_KINDS), 53)  # catalogue-only from 3a; no bump
 
 
 if __name__ == "__main__":
