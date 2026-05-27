@@ -19,7 +19,7 @@ import signal
 import sys
 import time
 
-from anvil.monitor import anvil_ops
+from anvil.monitor import anvil_ops, schedule
 
 DEFAULT_DB = os.environ.get("ANVIL_OPS_DB_PATH", "state/anvil-ops.db")
 POLL_INTERVAL_S = int(os.environ.get("ANVIL_MONITOR_POLL_S", "60"))
@@ -28,18 +28,22 @@ _EXPECTED_TABLES = {"scheduled_tasks", "trigger_log", "running_builds"}
 log = logging.getLogger("anvil.monitor")
 
 
+def _dispatch_wake(task: dict) -> dict:
+    """The schedule poll's wake dispatcher. Step 2 replaces the body with
+    `wake.send_wake(task)`; Step 1 logs the routing decision (the substrate
+    fires + logs the trigger; the Telegram send is Step 2)."""
+    return schedule._log_stub(task)
+
+
 def _configure_logging() -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    log_path = os.environ.get("LOG_PATH")
-    if log_path:
-        try:
-            handlers.append(logging.FileHandler(log_path))
-        except OSError:
-            pass  # never-raises: fall back to stdout only
+    # v5 Phase 1b (1a Amendment 4 fix): stdout only. systemd's
+    # StandardOutput=append owns the log file; adding a FileHandler too
+    # double-wrote every line. Under systemd, stdout flows to the file;
+    # run locally, it goes to the terminal.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        handlers=handlers,
+        handlers=[logging.StreamHandler(sys.stdout)],
     )
 
 
@@ -81,18 +85,19 @@ def run(db_path: str = DEFAULT_DB) -> int:
     state = _Idle()
     signal.signal(signal.SIGTERM, state.stop)
     signal.signal(signal.SIGINT, state.stop)
-    log.info("anvil-monitor started (db=%s) — Phase 1a idle: no triggers wired", db_path)
+    log.info("anvil-monitor started (db=%s) — Phase 1b: schedule trigger active", db_path)
     # Tick every 1s so SIGTERM/SIGINT stops the service promptly (a 60s sleep
     # would resume after the signal under PEP 475, delaying clean shutdown).
-    # POLL_INTERVAL_S is the trigger-poll cadence 1b/1c run their poll body on.
+    # The schedule poll runs every POLL_INTERVAL_S. (1c adds the Sentry poll
+    # + the running_builds mode-guard read.)
     tick = 0
     while state.running:
         time.sleep(1)
         tick += 1
         if tick % POLL_INTERVAL_S == 0:
-            # Phase 1a: no-op. 1b wires the schedule poll here; 1c wires the
-            # Sentry poll + the running_builds mode-guard read.
-            pass
+            res = schedule.poll(db_path, dispatch=_dispatch_wake)
+            if res.get("fired"):
+                log.info("schedule poll fired: %s", res["fired"])
     log.info("anvil-monitor stopped cleanly")
     return 0
 
