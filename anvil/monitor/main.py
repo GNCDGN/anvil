@@ -19,10 +19,18 @@ import signal
 import sys
 import time
 
-from anvil.monitor import anvil_ops, schedule, wake
+from datetime import datetime
+
+from anvil.monitor import anvil_ops, schedule, sentry_poller, wake
 
 DEFAULT_DB = os.environ.get("ANVIL_OPS_DB_PATH", "state/anvil-ops.db")
 POLL_INTERVAL_S = int(os.environ.get("ANVIL_MONITOR_POLL_S", "60"))
+# The Sentry poll runs on its own (slower) cadence — 5-min lean (Q-C2). Gated
+# on SENTRY_PROJECT: with no Sentry account provisioned (brief Amendment 1 —
+# the live probe is deferred), the loop never calls out. The code ships +
+# unit-tested; flipping SENTRY_PROJECT on (Phase 2) activates it with no change.
+SENTRY_POLL_INTERVAL_S = int(os.environ.get("ANVIL_SENTRY_POLL_S", "300"))
+SENTRY_ENABLED = bool(os.environ.get("SENTRY_PROJECT"))
 _EXPECTED_TABLES = {"scheduled_tasks", "trigger_log", "running_builds"}
 
 log = logging.getLogger("anvil.monitor")
@@ -34,6 +42,13 @@ def _dispatch_wake(task: dict) -> dict:
     Mac wake-listener). Never-raises (wake.send_wake returns a structured
     result)."""
     return wake.send_wake(task)
+
+
+def _dispatch_sentry(issue: dict) -> dict:
+    """The Sentry poll's route handler — sends the [ANVIL] Sentry notice to the
+    operator's Telegram (explicit; the operator decides whether to investigate).
+    Never-raises."""
+    return sentry_poller._notify(sentry_poller._alert_text(issue))
 
 
 def _configure_logging() -> None:
@@ -86,12 +101,17 @@ def run(db_path: str = DEFAULT_DB) -> int:
     state = _Idle()
     signal.signal(signal.SIGTERM, state.stop)
     signal.signal(signal.SIGINT, state.stop)
-    log.info("anvil-monitor started (db=%s) — Phase 1b: schedule trigger active", db_path)
+    log.info(
+        "anvil-monitor started (db=%s) — Phase 1c: schedule + sentry(%s) triggers",
+        db_path, "on" if SENTRY_ENABLED else "off (no SENTRY_PROJECT)",
+    )
     # Tick every 1s so SIGTERM/SIGINT stops the service promptly (a 60s sleep
     # would resume after the signal under PEP 475, delaying clean shutdown).
-    # The schedule poll runs every POLL_INTERVAL_S. (1c adds the Sentry poll
-    # + the running_builds mode-guard read.)
+    # The schedule poll runs every POLL_INTERVAL_S; the Sentry poll every
+    # SENTRY_POLL_INTERVAL_S. (Step 2 wires the running_builds mode-guard read
+    # in front of both dispatches.)
     tick = 0
+    sentry_since: datetime | None = None
     while state.running:
         time.sleep(1)
         tick += 1
@@ -99,6 +119,15 @@ def run(db_path: str = DEFAULT_DB) -> int:
             res = schedule.poll(db_path, dispatch=_dispatch_wake)
             if res.get("fired"):
                 log.info("schedule poll fired: %s", res["fired"])
+        if SENTRY_ENABLED and tick % SENTRY_POLL_INTERVAL_S == 0:
+            now = datetime.now()
+            sres = sentry_poller.poll(db_path, since=sentry_since, now=now,
+                                      dispatch=_dispatch_sentry)
+            sentry_since = now
+            if sres.get("routed"):
+                log.info("sentry poll routed: %s", sres["routed"])
+            elif not sres.get("ok"):
+                log.warning("sentry poll error: %s", sres.get("error"))
     log.info("anvil-monitor stopped cleanly")
     return 0
 
