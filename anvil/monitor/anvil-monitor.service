@@ -1,0 +1,22 @@
+[Unit]
+Description=ANVIL Always-On Monitor (v5)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User=root mirrors the live vault-reporter-bot.service (Step 0 Q-A2: there is
+# no vault-reporter Unix user; /home/vault-reporter/ is root-owned). System
+# python3 + PYTHONPATH to the repo root (no venv — the reporter precedent).
+User=root
+WorkingDirectory=/home/vault-reporter/anvil-monitor
+EnvironmentFile=/home/vault-reporter/anvil-monitor/.env.systemd
+Environment=PYTHONPATH=/home/vault-reporter/anvil-monitor
+ExecStart=/usr/bin/python3 -m anvil.monitor.main
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/vault-reporter/anvil-monitor.log
+StandardError=append:/home/vault-reporter/anvil-monitor.log
+
+[Install]
+WantedBy=multi-user.target
