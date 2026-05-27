@@ -850,10 +850,10 @@ Exercise the per-brief deploy_target field.
 
 
 class TestRule2Relaxation(unittest.TestCase):
-    """v4 Phase 2b Step 1: rule 2 relaxed from {1} to {1, 2}. v1 and v2 both
-    validate; v3+ rejects with the "1 or 2" message; absent rejects via rule 1.
-    (Q-E3-F1: the version-rejection path moved here from the invalid-brief.md
-    omnibus fixture, which now carries a valid brief_version: 2.)"""
+    """v4 Phase 2b Step 1: rule 2 relaxed {1} → {1, 2}; Phase 3b Step 1: {1, 2} →
+    {1, 2, 3}. v1/v2/v3 all validate; v4+ rejects with the "1, 2, or 3" message;
+    absent rejects via rule 1. (Q-E3-F1: the version-rejection path moved here
+    from the invalid-brief.md omnibus fixture, which carries a valid brief_version.)"""
 
     def setUp(self) -> None:
         self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-rule2-"))
@@ -901,11 +901,19 @@ Exercise rule 2.
         self.assertEqual(brief.brief_version, 2)
         validate_or_reject(brief, fm)  # no raise — v2 accepted, observe optional
 
-    def test_brief_version_3_rejected(self) -> None:
+    def test_brief_version_3_valid(self) -> None:
+        # v4 Phase 3b Step 1: rule 2 relaxed {1, 2} → {1, 2, 3}; v3 now validates
+        # (was rejected in Phase 2b). v3 unlocks the screen:// / tab:// observe
+        # targets (rule 17); a v3 brief with no observe: is valid.
         brief, fm = self._parse(version_line="brief_version: 3")
+        self.assertEqual(brief.brief_version, 3)
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_brief_version_4_rejected(self) -> None:
+        brief, fm = self._parse(version_line="brief_version: 4")
         with self.assertRaises(BriefValidationError) as ctx:
             validate_or_reject(brief, fm)
-        self.assertIn("brief_version must be 1 or 2 (got 3)",
+        self.assertIn("brief_version must be 1, 2, or 3 (got 4)",
                       " ".join(ctx.exception.errors))
 
     def test_brief_version_absent_rejected(self) -> None:
@@ -1030,7 +1038,7 @@ Exercise the per-step observe: block.
                 with self.assertRaises(BriefValidationError) as ctx:
                     validate_or_reject(brief, fm)
                 joined = " ".join(ctx.exception.errors)
-                self.assertIn("observe.surfaces contains invalid values", joined)
+                self.assertIn("invalid for scheme", joined)  # Phase 3b wording
                 self.assertIn(bad, joined)
 
     def test_observe_surfaces_ordering_preserved(self) -> None:
@@ -1106,3 +1114,109 @@ Exercise rule 17 version-gating.
         brief, fm = self._parse(version=2, observe_lines="")
         self.assertIsNone(brief.steps[0].observe)
         validate_or_reject(brief, fm)  # no raise — v2 does not require observe:
+
+
+class TestPhase3bObserveScheme(unittest.TestCase):
+    """v4 Phase 3b Step 1 (DC5): the observe: URI-scheme extension. screen://→
+    native, tab://→extension, else→browser (anchored, BAF-1); screen/tab targets
+    require brief_version: 3 (the not-safely-ignorable schemes); scheme-surface
+    consistency (browser ↔ dom/console/network; screen/tab ↔ frame/accessibility)."""
+
+    def setUp(self) -> None:
+        self._repo = Path(tempfile.mkdtemp(prefix="anvil-test-p3b-"))
+        _git_init(self._repo)
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="anvil-test-p3b-brief-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._repo, ignore_errors=True)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _parse(self, *, version: int, target: str, surfaces: str = ""):
+        sfx = f"\n- **observe.surfaces:** {surfaces}" if surfaces else ""
+        body = f"""---
+brief_version: {version}
+project: anvil
+build_name: test
+target_repo: github.com/test/test
+target_repo_path: {self._repo}
+vps_deploy: no
+---
+
+## Goal
+
+Exercise the observe: URI scheme.
+
+## Steps
+
+### Step 1 — A step
+
+- **scope.files:**
+- **scope.operations:** read
+- **smoke:** `echo hi`
+- **confirm:** explicit
+- **observe.target:** {target}{sfx}
+"""
+        p = self._tmpdir / "brief.md"
+        p.write_text(body, encoding="utf-8")
+        return parse_brief_raw(p)
+
+    def test_scheme_classification(self) -> None:
+        from anvil.brief import _observe_scheme
+        self.assertEqual(_observe_scheme("screen://main"), "screen")
+        self.assertEqual(_observe_scheme("tab://active"), "tab")
+        self.assertEqual(_observe_scheme("https://example.test"), "browser")
+        self.assertEqual(_observe_scheme("http://localhost:3000"), "browser")
+        self.assertEqual(_observe_scheme("localhost:3000"), "browser")
+        # anchored (BAF-1): a host that merely contains "tab" is browser
+        self.assertEqual(_observe_scheme("https://tab.example.com"), "browser")
+        self.assertEqual(_observe_scheme(None), "browser")
+
+    def test_screen_target_requires_v3(self) -> None:
+        brief, fm = self._parse(version=2, target="screen://main", surfaces="frame")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("scheme 'screen://' requires brief_version: 3",
+                      " ".join(ctx.exception.errors))
+
+    def test_tab_target_requires_v3(self) -> None:
+        brief, fm = self._parse(version=2, target="tab://active", surfaces="frame")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("scheme 'tab://' requires brief_version: 3",
+                      " ".join(ctx.exception.errors))
+
+    def test_screen_target_on_v3_accepts(self) -> None:
+        brief, fm = self._parse(version=3, target="screen://main",
+                                surfaces="frame, accessibility")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_browser_target_on_v2_still_accepts(self) -> None:
+        # the Phase 2 form is unchanged: a browser-class observe: on v2 validates
+        brief, fm = self._parse(version=2, target="http://localhost",
+                                surfaces="dom, console, network")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_anchored_https_tab_is_browser(self) -> None:
+        # BAF-1: https://tab.example.com classifies as browser (anchored), so it
+        # neither requires v3 nor takes screen surfaces.
+        brief, fm = self._parse(version=2, target="https://tab.example.com",
+                                surfaces="dom")
+        validate_or_reject(brief, fm)  # no raise
+
+    def test_screen_target_with_browser_surface_rejects(self) -> None:
+        brief, fm = self._parse(version=3, target="screen://main", surfaces="dom")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("invalid for scheme 'screen'", " ".join(ctx.exception.errors))
+
+    def test_browser_target_with_screen_surface_rejects(self) -> None:
+        brief, fm = self._parse(version=3, target="https://x.test", surfaces="frame")
+        with self.assertRaises(BriefValidationError) as ctx:
+            validate_or_reject(brief, fm)
+        self.assertIn("invalid for scheme 'browser'", " ".join(ctx.exception.errors))
+
+    def test_screen_surfaces_valid_on_v3(self) -> None:
+        for surf in ("frame", "accessibility", "frame, accessibility"):
+            with self.subTest(surfaces=surf):
+                brief, fm = self._parse(version=3, target="screen://main", surfaces=surf)
+                validate_or_reject(brief, fm)  # no raise

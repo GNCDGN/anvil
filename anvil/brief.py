@@ -49,11 +49,31 @@ SENTRY_SCOPES = frozenset({"read"})
 # rule 16; vps_deploy: coexistence is a warning (vps-deploy-deprecated /
 # deploy-target-mismatch), never a rejection.
 DEPLOY_TARGETS = frozenset({"vps", "vercel", "netlify", "none"})
-# v4 Phase 2b Step 1 (DC5/DC6): valid surfaces for the per-step `observe:` block
-# — the three browser.py observation methods (snapshot_dom / capture_console /
-# capture_network → dom / console / network). A fixed value set like
-# ISSUES_SCOPES / SENTRY_SCOPES; rule 17 validates `observe.surfaces` ⊆ this.
-OBSERVE_SURFACES = frozenset({"dom", "console", "network"})
+# v4 Phase 2b Step 1 (DC5/DC6) + Phase 3b Step 1 (DC5): valid surfaces for the
+# per-step `observe:` block, split by capture class. BROWSER_SURFACES — the three
+# browser.py methods (snapshot_dom / capture_console / capture_network). SCREEN_
+# SURFACES — the Phase 3a screen substrate (screen_capture.snapshot_frame /
+# query_accessibility + screen_browser.capture_tab → the visibility_session
+# frame.png / accessibility.json blobs). OBSERVE_SURFACES is the union (the
+# "all valid surfaces" set); rule 17 validates surfaces ⊆ the *scheme's* class.
+BROWSER_SURFACES = frozenset({"dom", "console", "network"})
+SCREEN_SURFACES = frozenset({"frame", "accessibility"})
+OBSERVE_SURFACES = BROWSER_SURFACES | SCREEN_SURFACES
+
+
+def _observe_scheme(target: str | None) -> str:
+    """Classify an observe.target by URI scheme (v4 Phase 3b / DC5 / BAF-1):
+    a ``screen://`` prefix → ``"screen"`` (native capture layer); ``tab://`` →
+    ``"tab"`` (browser-extension layer); anything else (https://, http://,
+    localhost, a bare host, a file path) → ``"browser"`` (the Phase 2 default).
+    Anchored on the literal ``scheme://`` prefix, so ``https://tab.example.com``
+    classifies as browser, not extension."""
+    t = (target or "").strip().lower()
+    if t.startswith("screen://"):
+        return "screen"
+    if t.startswith("tab://"):
+        return "tab"
+    return "browser"
 _REQUIRED_FRONTMATTER = (
     "brief_version",
     "project",
@@ -598,11 +618,13 @@ def validate_or_reject(
             if getattr(brief, k, None) in (None, "", 0) and k != "brief_version":
                 e.append(f"frontmatter: required key '{k}' missing or empty")
 
-    # 2. brief_version is 1 or 2 (v4 Phase 2b Step 1: rule 2 relaxed from {1} to
-    # {1, 2}; version 2 unlocks the per-step observe: block — rule 17. Existing v1
-    # briefs stay v1; no migration. v3+ still rejects.)
-    if brief.brief_version not in (1, 2):
-        e.append(f"brief_version must be 1 or 2 (got {brief.brief_version})")
+    # 2. brief_version is 1, 2, or 3 (v4 Phase 2b Step 1: relaxed {1} → {1, 2};
+    # Phase 3b Step 1: relaxed {1, 2} → {1, 2, 3}. version 2 unlocks the per-step
+    # observe: block (browser-class targets); version 3 unlocks the screen:// /
+    # tab:// observe targets — rule 17. Existing briefs stay at their version; no
+    # migration. v4+ still rejects.)
+    if brief.brief_version not in (1, 2, 3):
+        e.append(f"brief_version must be 1, 2, or 3 (got {brief.brief_version})")
 
     # 3. target_repo_path exists and is a git repo
     if not brief.target_repo_path.exists():
@@ -725,31 +747,41 @@ def validate_or_reject(
             f"{sorted(DEPLOY_TARGETS)}"
         )
 
-    # 17. v4 Phase 2b Step 1 (DC5/DC6): per-step observe: block. A single rule
-    # (Q-E4) covering (i) version-gating — observe: requires brief_version: 2
-    # (DC6: observe: is not safely-ignorable, so an observe: block on a v1 brief
-    # rejects rather than silently drops; this is the first rule to gate on the
-    # version that rule 2's {1, 2} relaxation unlocks); (ii) target required when
-    # present; (iii) surfaces ⊆ OBSERVE_SURFACES (an empty/absent surfaces is
-    # valid — a step that requests observation but names no surface yet).
-    # Orthogonal to rules 13-16; observe is None on every v1/default-path step, so
-    # this rule short-circuits there (no behaviour change on the default path).
+    # 17. v4 Phase 2b Step 1 (DC5/DC6) + Phase 3b Step 1 (DC5): per-step observe:
+    # block. A single rule covering (i) version-gating — observe: requires
+    # brief_version >= 2 (Phase 2b DC6: observe: is not safely-ignorable; Phase 3b
+    # relaxed `!= 2` → `< 2` so v3 observe: blocks validate); (ii) target required
+    # when present; (iv) scheme classification (screen://→native / tab://→extension
+    # / else→browser) + (vi) the screen-scheme version-gate — a screen:// or tab://
+    # target requires brief_version: 3 (the new not-safely-ignorable schemes, DC5);
+    # (iii)+(v) surfaces ⊆ the *scheme's* class (browser ↔ BROWSER_SURFACES;
+    # screen/tab ↔ SCREEN_SURFACES — scheme-surface consistency). Orthogonal to
+    # rules 13-16; observe is None on every v1/default-path step, so this rule
+    # short-circuits there (no behaviour change on the default path).
     for s in brief.steps:
         if s.observe is None:
             continue
-        if brief.brief_version != 2:
+        if brief.brief_version < 2:
             e.append(
                 f"step {s.number} ({s.name}): observe: requires brief_version: 2 "
-                f"(got {brief.brief_version})"
+                f"or 3 (got {brief.brief_version})"
             )
             continue
-        if not s.observe.get("target"):
+        target = s.observe.get("target")
+        if not target:
             e.append(f"step {s.number} ({s.name}): observe: requires a target")
-        bad = set(s.observe.get("surfaces", [])) - OBSERVE_SURFACES
+        scheme = _observe_scheme(target)
+        if scheme in ("screen", "tab") and brief.brief_version < 3:
+            e.append(
+                f"step {s.number} ({s.name}): observe.target scheme '{scheme}://' "
+                f"requires brief_version: 3 (got {brief.brief_version})"
+            )
+        valid = SCREEN_SURFACES if scheme in ("screen", "tab") else BROWSER_SURFACES
+        bad = set(s.observe.get("surfaces", [])) - valid
         if bad:
             e.append(
-                f"step {s.number} ({s.name}): observe.surfaces contains invalid "
-                f"values {sorted(bad)} (valid: {sorted(OBSERVE_SURFACES)})"
+                f"step {s.number} ({s.name}): observe.surfaces {sorted(bad)} invalid "
+                f"for scheme '{scheme}' (valid: {sorted(valid)})"
             )
 
     if e:
