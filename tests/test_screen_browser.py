@@ -76,6 +76,59 @@ class TestBrowserExtensionActuationRefused(unittest.TestCase):
         self.assertIn("not connected", r["error"])
 
 
+class TestBrowserExtensionActuationGate(unittest.TestCase):
+    """v4 Phase 3c Step 2: run_script is promoted from the 3a refusing stub to a
+    LIVE, opt-in-gated path (DC8). The opt-in GATE is the security boundary —
+    default-off refuses; an explicit live opt-in attempts the chrome.scripting
+    send."""
+
+    def test_refuses_with_opt_in_off_session(self):
+        from anvil import copilot
+        sess = copilot.start_session("tab://active")  # default-off
+        s = _connected_session(mock.MagicMock())
+        r = s.run_script("document.body.click()", session=sess)
+        self.assertFalse(r["ok"])
+        self.assertIn("actuation not enabled", r["error"])
+
+    def test_executes_when_opt_in_on(self):
+        from anvil import copilot
+        sess = copilot.start_session("tab://active", autonomous=True)
+        send = mock.MagicMock(return_value={"ok": True, "result": {"ran": True}})
+        s = _connected_session(send)
+        r = s.run_script("document.title", session=sess)
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["result"]["executed"])
+        send.assert_called_once()
+        self.assertEqual(send.call_args[0][0]["cmd"], "run_script")
+
+    def test_send_failure_is_structured_error(self):
+        from anvil import copilot
+        sess = copilot.start_session("tab://active", autonomous=True)
+        send = mock.MagicMock(return_value={"ok": False, "error": "no tab"})
+        s = _connected_session(send)
+        r = s.run_script("x", session=sess)
+        self.assertFalse(r["ok"])
+        self.assertIn("run_script failed", r["error"])
+
+    def test_send_raising_is_caught_never_raises(self):
+        from anvil import copilot
+        sess = copilot.start_session("tab://active", autonomous=True)
+        send = mock.MagicMock(side_effect=RuntimeError("transport boom"))
+        s = _connected_session(send)
+        r = s.run_script("x", session=sess)  # must NOT raise
+        self.assertFalse(r["ok"])
+        self.assertIn("unexpected error (run_script)", r["error"])
+
+    def test_ended_session_refuses(self):
+        from anvil import copilot
+        sess = copilot.start_session("tab://active", autonomous=True)
+        copilot.end_session(sess)  # opt-in expired
+        s = _connected_session(mock.MagicMock())
+        r = s.run_script("x", session=sess)
+        self.assertFalse(r["ok"])
+        self.assertIn("actuation not enabled", r["error"])
+
+
 class TestBrowserExtensionErrorPaths(unittest.TestCase):
     def test_connect_ping_fails(self):
         s = sb.BrowserExtensionSession()

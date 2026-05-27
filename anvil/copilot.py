@@ -96,3 +96,19 @@ def end_session(session: CopilotSession) -> None:
     ended and clears the flag, so `is_autonomous_enabled` is False thereafter."""
     session.ended = True
     session.autonomous_actuation_enabled = False
+
+
+def apply_telegram_grant(session: CopilotSession, reply_text: str | None) -> bool:
+    """v4 Phase 3c Step 2: the Telegram opt-in grant path (DC8 / Q-B6). If
+    `reply_text` is exactly the reserved AUTONOMOUS_OPT_IN_TOKEN (case- and
+    whitespace-insensitive), grant the mid-session opt-in via enable_autonomous
+    and return True; otherwise a no-op returning False. Distinct from the
+    go/resume/abort reply vocabulary, so the co-pilot loop can recognize the
+    grant token without colliding with the build-loop reply grammar. Never
+    raises (a None / non-string reply returns False)."""
+    if not reply_text:
+        return False
+    if reply_text.strip().lower() == AUTONOMOUS_OPT_IN_TOKEN.lower():
+        enable_autonomous(session)
+        return True
+    return False

@@ -116,6 +116,34 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return Orchestrator(config, coder_mode=config.coder_mode).resume()
 
 
+def cmd_copilot(args: argparse.Namespace) -> int:
+    """v4 Phase 3c Step 2: `anvil copilot start <target> [--autonomous]` — the
+    co-pilot session path (DC7). Loads Config (for the Telegram channel), then
+    runs a bounded capture-interpret-guide session via copilot_runner. The
+    --autonomous flag grants the actuation opt-in at start (default-off, DC8)."""
+    if getattr(args, "copilot_command", None) != "start":
+        print("usage: anvil copilot start <target> [--autonomous]",
+              file=sys.stderr)
+        return 1
+    _setup_logging()
+    config = _load_config_or_exit()
+    from anvil import copilot_runner
+    from anvil.telegram import TelegramClient
+    telegram = TelegramClient(config.telegram_bot_token, config.telegram_chat_id)
+    summary = copilot_runner.run(
+        args.target,
+        autonomous=args.autonomous,
+        max_captures=args.max_captures,
+        telegram=telegram,
+    )
+    print(
+        f"co-pilot session {summary['session_id']} ({summary['scheme']}): "
+        f"{summary['captures']} captures, {summary['frames']} frames, "
+        f"autonomous_granted={summary['autonomous_granted']}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="anvil", description="Autonomous build orchestrator"
@@ -139,6 +167,26 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="Print the current run state"
     )
     p_status.set_defaults(func=cmd_status)
+
+    # v4 Phase 3c Step 2: the co-pilot session entry (DC7). `anvil copilot start
+    # <target> [--autonomous] [--max-captures N]`.
+    p_copilot = sub.add_parser(
+        "copilot", help="Run a screen-aware co-pilot session"
+    )
+    p_copilot.set_defaults(func=cmd_copilot)
+    copilot_sub = p_copilot.add_subparsers(dest="copilot_command", required=True)
+    p_cp_start = copilot_sub.add_parser(
+        "start", help="Start a co-pilot session against a target (e.g. screen://main)"
+    )
+    p_cp_start.add_argument("target", help="observe target, e.g. screen://main")
+    p_cp_start.add_argument(
+        "--autonomous", action="store_true",
+        help="grant the actuation opt-in at start (default-off, DC8)",
+    )
+    p_cp_start.add_argument(
+        "--max-captures", dest="max_captures", type=int, default=5,
+        help="bound the capture-interpret-guide loop (default 5)",
+    )
 
     return parser
 

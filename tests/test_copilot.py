@@ -67,5 +67,37 @@ class TestCopilotOptIn(unittest.TestCase):
             self.assertNotIn(reserved, cp.AUTONOMOUS_OPT_IN_TOKEN.split())
 
 
+class TestTelegramGrant(unittest.TestCase):
+    """v4 Phase 3c Step 2: the Telegram opt-in grant path (apply_telegram_grant)."""
+
+    def test_reserved_token_grants(self):
+        s = cp.start_session("screen://main")
+        self.assertTrue(cp.apply_telegram_grant(s, "autonomous: on"))
+        self.assertTrue(cp.is_autonomous_enabled(s))
+
+    def test_token_case_and_whitespace_insensitive(self):
+        s = cp.start_session("screen://main")
+        self.assertTrue(cp.apply_telegram_grant(s, "  Autonomous: On  "))
+        self.assertTrue(cp.is_autonomous_enabled(s))
+
+    def test_other_reply_is_noop(self):
+        s = cp.start_session("screen://main")
+        self.assertFalse(cp.apply_telegram_grant(s, "go"))
+        self.assertFalse(cp.is_autonomous_enabled(s))
+
+    def test_none_reply_is_noop(self):
+        s = cp.start_session("screen://main")
+        self.assertFalse(cp.apply_telegram_grant(s, None))
+        self.assertFalse(cp.is_autonomous_enabled(s))
+
+    def test_grant_on_ended_session_does_not_enable(self):
+        s = cp.start_session("screen://main")
+        cp.end_session(s)
+        # apply returns True (token matched) but enable_autonomous is a no-op on
+        # an ended session, so the guard stays False.
+        cp.apply_telegram_grant(s, "autonomous: on")
+        self.assertFalse(cp.is_autonomous_enabled(s))
+
+
 if __name__ == "__main__":
     unittest.main()

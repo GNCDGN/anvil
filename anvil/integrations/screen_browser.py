@@ -54,8 +54,9 @@ _log = logging.getLogger("anvil.integrations.screen_browser")
 _DEFAULT_TIMEOUT_S = 30.0
 
 _ACTUATION_DISABLED = (
-    "actuation not enabled in Phase 3a: chrome.scripting actuation is gated "
-    "behind the per-session opt-in (Phase 3b/3c)"
+    "actuation not enabled: chrome.scripting actuation is gated behind the "
+    "per-session co-pilot opt-in (default-off); grant it with `anvil copilot "
+    "start --autonomous` or the Telegram opt-in token"
 )
 
 
@@ -113,13 +114,27 @@ class BrowserExtensionSession:
         except Exception as exc:  # noqa: BLE001
             return self._unexpected("capture_tab", exc)
 
-    def run_script(self, script: str) -> dict:
-        """chrome.scripting actuation — REFUSING STUB in Phase 3a (Q-A0b). Present
-        in the surface so 3c can switch it on behind the per-session opt-in; in 3a
-        it performs NO actuation and returns a structured refusal. Never raises."""
+    def run_script(self, script: str, *, session=None) -> dict:
+        """chrome.scripting actuation — v4 Phase 3c promotes the Phase 3a refusing
+        stub to a LIVE, opt-in-gated path (Q-C0b / DC8). The gate is the security
+        boundary: actuation is refused unless `session` is a live co-pilot session
+        with an explicit autonomous opt-in (`copilot.is_autonomous_enabled`) —
+        default-off, so the absence of a session (mid-build, or an un-opted-in
+        co-pilot) refuses. When the opt-in is in force, the chrome.scripting send
+        is attempted (live `tab://` actuation rides the extension transport, which
+        is itself the deferred BAF-4 surface). Never raises."""
         if not self._connected:
             return _err("not connected")
-        return _err(_ACTUATION_DISABLED)
+        from anvil import copilot  # lazy: keep integrations import-light
+        if session is None or not copilot.is_autonomous_enabled(session):
+            return _err(_ACTUATION_DISABLED)
+        try:
+            resp = self._send({"cmd": "run_script", "script": script})
+            if not resp.get("ok"):
+                return _err(f"run_script failed: {resp.get('error', 'unknown')}")
+            return _ok({"executed": True, "result": resp.get("result")})
+        except Exception as exc:  # noqa: BLE001 — never-raise floor
+            return self._unexpected("run_script", exc)
 
     def disconnect(self) -> dict:
         """Close the channel. Idempotent; never raises (the browser.py ``close`` /
