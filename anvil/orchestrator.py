@@ -407,6 +407,56 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             return False, f"smoke runner error: {e}"
 
+    # ---- v5 Phase 1c: the mode-guard reverse channel (Mac -> VPS SSH) ----
+    def _mode_guard_mark_active(self, run_id: str, brief_path) -> None:
+        """SSH-write running_builds=active on the VPS at build start (Q-C1 —
+        ssh_ops.ssh_run, NOT Telegram; the 409 holds). Best-effort + never-
+        raises: gated on config.mode_guard + a configured vps_host, off for
+        sweeps/local runs. A failed SSH-write logs + continues (the monitor's
+        fail-closed staleness covers a stale active row; the build is never
+        blocked by the mode-guard's own bookkeeping)."""
+        if not getattr(self.config, "mode_guard", False) or not self.config.vps_host:
+            return
+        try:
+            import shlex
+            path = shlex.quote(self.config.vps_monitor_path)
+            cmd = (
+                f"cd {path} && PYTHONPATH={path} "
+                f"ANVIL_OPS_DB_PATH={shlex.quote(self.config.vps_ops_db)} "
+                f"/usr/bin/python3 -m anvil.monitor.running_builds mark-active "
+                f"{shlex.quote(run_id)} {shlex.quote(str(brief_path))}"
+            )
+            ok, out = ssh_ops.ssh_run(self.config.vps_host, self.config.vps_user, cmd, timeout=20)
+            self._mode_guard_run_id = run_id  # remember for the completion write
+            if not ok:
+                log.warning("[mode-guard] mark-active SSH-write failed: %s", (out or "").strip()[:200])
+        except Exception as e:  # noqa: BLE001 — never break a build
+            log.warning("[mode-guard] mark-active error: %s", e)
+
+    def _mode_guard_mark_complete(self) -> None:
+        """SSH-write running_builds=completed on the VPS at build end (the
+        finally). Best-effort + never-raises; only fires if a mark-active landed
+        this run."""
+        run_id = getattr(self, "_mode_guard_run_id", None)
+        if not run_id or not getattr(self.config, "mode_guard", False) or not self.config.vps_host:
+            return
+        try:
+            import shlex
+            path = shlex.quote(self.config.vps_monitor_path)
+            cmd = (
+                f"cd {path} && PYTHONPATH={path} "
+                f"ANVIL_OPS_DB_PATH={shlex.quote(self.config.vps_ops_db)} "
+                f"/usr/bin/python3 -m anvil.monitor.running_builds mark-complete "
+                f"{shlex.quote(run_id)}"
+            )
+            ok, out = ssh_ops.ssh_run(self.config.vps_host, self.config.vps_user, cmd, timeout=20)
+            if not ok:
+                log.warning("[mode-guard] mark-complete SSH-write failed: %s", (out or "").strip()[:200])
+        except Exception as e:  # noqa: BLE001 — never break a build
+            log.warning("[mode-guard] mark-complete error: %s", e)
+        finally:
+            self._mode_guard_run_id = None
+
     # ---- public API ----
     def run(self, brief_path: Path) -> int:
         from anvil.telegram import (
@@ -516,6 +566,11 @@ class Orchestrator:
                     f"-{_slug(brief.build_name)}"
                 )
             _events.begin_run(run_id)
+
+            # v5 Phase 1c: mark the build active on the VPS (the mode-guard
+            # reverse channel) so the monitor defers concurrent triggers.
+            # Best-effort, opt-in (config.mode_guard), never blocks the build.
+            self._mode_guard_mark_active(run_id, brief_path)
 
             _events.emit(
                 "brief.parsed",
@@ -991,6 +1046,10 @@ class Orchestrator:
                 _events.end_run()
             except Exception:  # noqa: BLE001 — never-raise
                 pass
+            # v5 Phase 1c: clear the VPS running_builds row (mode-guard) on
+            # every exit path. Best-effort, never-raises (no-op if no
+            # mark-active landed this run).
+            self._mode_guard_mark_complete()
 
     # ---- e2e + deploy (Phase 3 Step 5) ----
     def _detect_e2e_location(self, brief) -> str:

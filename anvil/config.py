@@ -43,6 +43,15 @@ class Config:
     # Phase 3 Step 2: VPS deployment config; required when running briefs with vps_deploy: yes
     vps_host: str | None = None
     vps_user: str = "root"
+    # v5 Phase 1c: the mode-guard reverse channel. When `mode_guard` is on, the
+    # orchestrator SSH-writes running_builds (active/complete) on the VPS at
+    # build start/end (Q-C1 — ssh_ops.ssh_run, NOT Telegram). Off by default so
+    # the calibration sweeps + local runs don't touch the VPS ledger; the
+    # production Mac sets ANVIL_MODE_GUARD=1. The mark CLI runs from
+    # vps_monitor_path with vps_ops_db as ANVIL_OPS_DB_PATH.
+    mode_guard: bool = False
+    vps_monitor_path: str = "/home/vault-reporter/anvil-monitor"
+    vps_ops_db: str = "/home/vault-reporter/anvil-ops.db"
     # Phase 4 Step 1: checkpoint write target; derived from vault_path at load time
     checkpoint_active_path: Path = Path("/dev/null")  # replaced in load()
     # v2 Phase 1 Step 5: calibration-framework flags. Selected by env
@@ -107,6 +116,16 @@ class Config:
         # vps_host is None).
         vps_host = os.environ.get("VPS_HOST", "").strip() or None
         vps_user = os.environ.get("VPS_USER", "").strip() or "root"
+        # v5 Phase 1c mode-guard (opt-in reverse channel).
+        mode_guard = (os.environ.get("ANVIL_MODE_GUARD", "0").strip() == "1")
+        vps_monitor_path = (
+            os.environ.get("ANVIL_VPS_MONITOR_PATH", "").strip()
+            or "/home/vault-reporter/anvil-monitor"
+        )
+        vps_ops_db = (
+            os.environ.get("ANVIL_VPS_OPS_DB", "").strip()
+            or "/home/vault-reporter/anvil-ops.db"
+        )
 
         # v2 Phase 1 Step 5: calibration-framework env flags. "1" enables
         # the mocked subclass; anything else (default empty) keeps the
@@ -134,6 +153,9 @@ class Config:
             coder_mode=coder_mode,
             vps_host=vps_host,
             vps_user=vps_user,
+            mode_guard=mode_guard,
+            vps_monitor_path=vps_monitor_path,
+            vps_ops_db=vps_ops_db,
             checkpoint_active_path=(
                 vault_path / "01-Projects/second-brain/checkpoints/active"
             ),

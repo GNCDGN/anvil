@@ -215,6 +215,36 @@ class TestOrchestrator(unittest.TestCase):
             markers, [], f"clean run must produce no marker; found {markers}",
         )
 
+    def test_mode_guard_ssh_writes_at_build_start_and_end(self) -> None:
+        # v5 Phase 1c: with mode_guard on + a vps_host, handle_brief SSH-writes
+        # running_builds active at build start and complete at end (the Mac->VPS
+        # reverse channel — Q-C1). Config is frozen → replace().
+        from dataclasses import replace
+        cfg = replace(self.cfg, mode_guard=True, vps_host="vps.test")
+        orch = Orchestrator(
+            cfg, coder_mode="manual", planner=FakePlanner(),
+            telegram=FakeTelegram(["done", "go", "done", "done", "go"]),
+            git=FakeGit(), run_smoke=lambda cmd, cwd: (True, "pass"),
+        )
+        with mock.patch("anvil.ssh_ops.ssh_run", return_value=(True, "ok")) as ssh:
+            rc = orch.handle_brief(self.brief_path)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(ssh.call_args_list), 2)
+        cmds = [c.args[2] for c in ssh.call_args_list]
+        self.assertIn("running_builds mark-active", cmds[0])
+        self.assertIn("running_builds mark-complete", cmds[1])
+        self.assertEqual(ssh.call_args_list[0].args[0], "vps.test")  # host
+        self.assertEqual(ssh.call_args_list[0].args[1], "root")      # default user
+
+    def test_mode_guard_off_by_default_no_ssh(self) -> None:
+        # default config (mode_guard False) → no SSH-write; sweeps/local runs
+        # never touch the VPS ledger.
+        orch = self._orch(["done", "go", "done", "done", "go"])
+        with mock.patch("anvil.ssh_ops.ssh_run") as ssh:
+            rc = orch.handle_brief(self.brief_path)
+        self.assertEqual(rc, 0)
+        ssh.assert_not_called()
+
     def test_handle_brief_stashes_lint_result(self) -> None:
         # v3 Phase 1a Step 2: handle_brief runs lint_brief after
         # validate_or_reject (and resolve_context_paths) and persists the

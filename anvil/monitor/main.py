@@ -21,7 +21,7 @@ import time
 
 from datetime import datetime
 
-from anvil.monitor import anvil_ops, schedule, sentry_poller, wake
+from anvil.monitor import anvil_ops, running_builds, schedule, sentry_poller, wake
 
 DEFAULT_DB = os.environ.get("ANVIL_OPS_DB_PATH", "state/anvil-ops.db")
 POLL_INTERVAL_S = int(os.environ.get("ANVIL_MONITOR_POLL_S", "60"))
@@ -49,6 +49,13 @@ def _dispatch_sentry(issue: dict) -> dict:
     operator's Telegram (explicit; the operator decides whether to investigate).
     Never-raises."""
     return sentry_poller._notify(sentry_poller._alert_text(issue))
+
+
+def _escalate_stale(text: str) -> dict:
+    """The mode-guard's stale-build escalation — a one-shot Telegram notice (the
+    monitor's existing stdlib send). The dispatch gate calls this once per stale
+    incident (gated by the deferred-stale log_trigger insert)."""
+    return sentry_poller._notify(text)
 
 
 def _configure_logging() -> None:
@@ -116,16 +123,22 @@ def run(db_path: str = DEFAULT_DB) -> int:
         time.sleep(1)
         tick += 1
         if tick % POLL_INTERVAL_S == 0:
-            res = schedule.poll(db_path, dispatch=_dispatch_wake)
+            res = schedule.poll(db_path, dispatch=_dispatch_wake,
+                                guard=running_builds.mode_guard_check, on_stale=_escalate_stale)
             if res.get("fired"):
                 log.info("schedule poll fired: %s", res["fired"])
+            if res.get("deferred"):
+                log.info("schedule poll deferred (build active): %s", res["deferred"])
         if SENTRY_ENABLED and tick % SENTRY_POLL_INTERVAL_S == 0:
             now = datetime.now()
             sres = sentry_poller.poll(db_path, since=sentry_since, now=now,
-                                      dispatch=_dispatch_sentry)
+                                      dispatch=_dispatch_sentry,
+                                      guard=running_builds.mode_guard_check, on_stale=_escalate_stale)
             sentry_since = now
             if sres.get("routed"):
                 log.info("sentry poll routed: %s", sres["routed"])
+            if sres.get("deferred"):
+                log.info("sentry poll deferred (build active): %s", sres["deferred"])
             elif not sres.get("ok"):
                 log.warning("sentry poll error: %s", sres.get("error"))
     log.info("anvil-monitor stopped cleanly")

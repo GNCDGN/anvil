@@ -94,27 +94,56 @@ def _log_stub(task: dict) -> dict:
     return {"ok": True, "stub": True}
 
 
-def poll(db_path: str, now: datetime | None = None, dispatch=_log_stub) -> dict:
+def poll(db_path: str, now: datetime | None = None, dispatch=_log_stub,
+         guard=None, on_stale=None) -> dict:
     """One schedule poll: fire every due active task. Never-raises. Returns
-    {"ok", "fired": [task_id, ...], "checked": int}. `dispatch(task)` is the
-    wake handler (Step 2: `wake.send_wake`)."""
+    {"ok", "fired": [...], "deferred": [...], "checked": int}. `dispatch(task)`
+    is the wake handler (`wake.send_wake`).
+
+    Mode-guard (v5 Phase 1c): `guard(db_path, now=)` is the running_builds read
+    (`running_builds.mode_guard_check`). When it reports an active build, the
+    fire defers — logged under a distinct `…:deferred` id (so the eventual fire
+    still logs cleanly) and `last_fired` is NOT advanced, so it re-attempts next
+    poll once the build clears. A *stale* active row escalates once via
+    `on_stale(text)` (fail-closed, design Q8). guard=None → no mode-guard."""
     now = now or datetime.now()
     fired: list[str] = []
+    deferred: list[str] = []
     try:
         res = anvil_ops.list_scheduled_tasks(db_path, status="active")
         if not res["ok"]:
             return {"ok": False, "error": res["error"]}
         tasks = res["result"]
+        g = guard(db_path, now=now) if guard else {"active": False, "stale": False}
         for task in tasks:
             expr = task.get("schedule_expr", "")
             if not is_due(expr, now, task.get("last_fired")):
                 continue
             mrd = most_recent_due(expr, now)
             trigger_id = f"sched:{task['task_id']}@{mrd.isoformat()}"
+            note = f"brief={task.get('brief_path')} confirm={task.get('confirm_mode')}"
+            if g.get("stale"):
+                logged = anvil_ops.log_trigger(
+                    db_path, trigger_id + ":deferred-stale", source="schedule",
+                    received_at=now.isoformat(), disposition="deferred-stale-build", notes=note)
+                if on_stale and logged.get("inserted"):
+                    on_stale(
+                        f"[ANVIL] mode-guard — STALE running_build; schedule task "
+                        f"{task['task_id']} deferred. Inspect/clear running_builds, "
+                        f"then it re-fires.")
+                deferred.append(task["task_id"])
+                continue
+            if g.get("active"):
+                # defer: log under a distinct id, do NOT advance last_fired →
+                # re-fires next poll once the build clears.
+                anvil_ops.log_trigger(
+                    db_path, trigger_id + ":deferred", source="schedule",
+                    received_at=now.isoformat(), disposition="deferred-active-build", notes=note)
+                deferred.append(task["task_id"])
+                continue
             logged = anvil_ops.log_trigger(
                 db_path, trigger_id, source="schedule",
-                received_at=now.isoformat(), disposition="firing",
-                notes=f"brief={task.get('brief_path')} confirm={task.get('confirm_mode')}",
+                received_at=now.isoformat(), disposition="firing", notes=note,
             )
             if not logged["ok"] or not logged["inserted"]:
                 # already logged this window (idempotent) → skip the re-fire
@@ -131,7 +160,7 @@ def poll(db_path: str, now: datetime | None = None, dispatch=_log_stub) -> dict:
             )
             anvil_ops.mark_task_fired(db_path, task["task_id"], now.isoformat())
             fired.append(task["task_id"])
-        return {"ok": True, "fired": fired, "checked": len(tasks)}
+        return {"ok": True, "fired": fired, "deferred": deferred, "checked": len(tasks)}
     except Exception as exc:  # never-raises
         log.warning("schedule poll failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"schedule poll: {type(exc).__name__}: {exc}"}
