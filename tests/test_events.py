@@ -97,12 +97,15 @@ class TestEventSchema(_EventsTestBase):
         # silent-miss / parser-drop kinds. 50 → 51: v3 Phase 1b Step 3 added
         # "planner.stage_a.canary_baseline.api_end" — the first v3 bump.
         # 51 → 52: v4 Phase 2c Step 2 added "observe.captured" — the first v4
-        # bump, the observe-loop's capture event.)
-        self.assertEqual(len(events.VALID_KINDS), 52)
+        # bump, the observe-loop's capture event. 52 → 53: v4 Phase 3a Step 3
+        # added "screen.captured" — the second v4 bump, the screen-aware capture
+        # event (added in the substrate sub-build ahead of its 3c emitter).)
+        self.assertEqual(len(events.VALID_KINDS), 53)
         # A few canonical kinds present:
         for k in ("run.start", "planner.stage_b.api_end",
                   "ssh.stage.end", "telegram.poll.reply", "shadow.decision",
-                  "stage_a.shadow_compare.end", "stage_a.parser_drop"):
+                  "stage_a.shadow_compare.end", "stage_a.parser_drop",
+                  "observe.captured", "screen.captured"):
             self.assertIn(k, events.VALID_KINDS)
 
 

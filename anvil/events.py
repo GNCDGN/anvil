@@ -155,8 +155,16 @@ VALID_KINDS: frozenset[str] = frozenset({
     # bump (51 → 52); a single kind carrying a `surfaces` payload field (Q-F2),
     # not per-surface kinds. (2)
     "observe.captured",
+    # v4 Phase 3a Step 3: the screen-aware capture event — the screen/native +
+    # browser-extension analog of observe.captured. Added in the SUBSTRATE
+    # sub-build (3a) ahead of its emitter (DC9); the screen-aware observe-loop
+    # that emits it during a build/session lands in Phase 3c (available-but-not-
+    # consumed in 3a — no default-path emit). A single kind carrying a `mode`
+    # (build|co-pilot) payload field, not per-mode kinds (the V4P2C-1
+    # per-surface-kinds-rejected precedent). The SECOND v4 bump (52 → 53).
+    "screen.captured",
 })
-assert len(VALID_KINDS) == 52, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
+assert len(VALID_KINDS) == 53, f"VALID_KINDS count drift: {len(VALID_KINDS)}"
 
 # v3 Phase 1b Step 3: the canary baseline event kind, referenced by the Planner
 # emit + the harness operations view (so the baseline's cost is ledgered).

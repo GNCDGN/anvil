@@ -551,11 +551,12 @@ class TestStep2ValidKindsBump(unittest.TestCase):
     def test_valid_kinds_includes_observe_captured(self):
         from anvil.events import VALID_KINDS
         self.assertIn("observe.captured", VALID_KINDS)
-        self.assertEqual(len(VALID_KINDS), 52)
+        # 52 → 53 at v4 Phase 3a Step 3 (screen.captured); this guard re-anchors.
+        self.assertEqual(len(VALID_KINDS), 53)
 
-    def test_events_module_imports_with_52(self):
-        # the events.py `assert len(VALID_KINDS) == 52` fires at import — a clean
-        # import means the count-drift guard passed.
+    def test_events_module_imports_with_53(self):
+        # the events.py `assert len(VALID_KINDS) == 53` fires at import — a clean
+        # import means the count-drift guard passed (52 → 53, Phase 3a Step 3).
         import anvil.events  # noqa: F401
 
 
