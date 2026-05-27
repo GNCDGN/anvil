@@ -603,6 +603,13 @@ def planner_system_prompt_tokens(model: str) -> int:
 MODEL_RATES: dict[str, dict[str, float]] = {
     "claude-opus-4-7": {
         "input": 5.0, "output": 25.0, "cache_create": 6.25, "cache_read": 0.50},
+    # claude-sonnet-4-6 restored v4 Phase 3a (Step 0 Q-A5 / DC4) for the Phase 3c
+    # screen-aware vision interpreter. Sonnet 4.6 $3/$15 per Mtok (v4 design §8;
+    # cache-write 1.25x input = 3.75, cache-read 0.1x input = 0.30 — the
+    # derivation convention above). Confirm against the pricing page at first
+    # live Sonnet use (3c), the same way the live capture is 3c-ratified.
+    "claude-sonnet-4-6": {
+        "input": 3.0, "output": 15.0, "cache_create": 3.75, "cache_read": 0.30},
     "claude-haiku-4-5-20251001": {
         "input": 1.0, "output": 5.0, "cache_create": 1.25, "cache_read": 0.10},
 }

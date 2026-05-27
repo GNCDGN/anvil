@@ -8,8 +8,9 @@ lightweight never-raises+retry wrapper (Amendment 3) with no brief-block
 caching (Q-A3).
 
 Hermetic: no network, no API key required (the shared client is faked via
-routing._client; anthropic constructs without a key anyway). Per Amendment 1,
-`sonnet` is not an alias in Phase 1a.
+routing._client; anthropic constructs without a key anyway). `sonnet` was
+dropped in Phase 1a (Amendment 1) and restored in v4 Phase 3a (Step 0 Q-A5 /
+DC4) for the Phase 3c screen-aware vision interpreter.
 """
 from __future__ import annotations
 
@@ -55,15 +56,24 @@ def _rate_limit() -> anthropic.RateLimitError:
 
 class TestModelAliases(unittest.TestCase):
     def test_alias_contents(self):
-        # Q-A1 disposition + Amendment 1: exactly opus and haiku, no sonnet.
+        # Q-A1 + v4 Phase 3a (Step 0 Q-A5 / DC4): opus, sonnet, haiku. Sonnet was
+        # dropped in Phase 1a (Amendment 1) and restored in 3a for the 3c vision
+        # interpreter (its rate is now in MODEL_RATES).
         self.assertEqual(
             MODEL_ALIASES,
-            {"opus": "claude-opus-4-7", "haiku": "claude-haiku-4-5-20251001"},
+            {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
         )
 
-    def test_no_sonnet_alias(self):
-        # Amendment 1 guard: sonnet was dropped (no MODEL_RATES entry).
-        self.assertNotIn("sonnet", MODEL_ALIASES)
+    def test_sonnet_alias_restored(self):
+        # v4 Phase 3a (Step 0 Q-A5 / DC4): sonnet restored (dropped in Phase 1a,
+        # Amendment 1) — alias present, target resolvable, rate registered.
+        self.assertEqual(MODEL_ALIASES.get("sonnet"), "claude-sonnet-4-6")
+        self.assertEqual(resolve_model("sonnet"), "claude-sonnet-4-6")
+        self.assertIn("claude-sonnet-4-6", MODEL_RATES)
 
     def test_module_load_invariant_targets_in_model_rates(self):
         # The same condition routing.py asserts at module load: every alias

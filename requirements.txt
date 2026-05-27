@@ -6,3 +6,5 @@ python-telegram-bot>=20.0
 duckdb>=0.10.0
 openpyxl>=3.1.0
 playwright==1.60.0
+pyobjc-framework-ScreenCaptureKit==12.1
+pyobjc-framework-ApplicationServices==12.1

@@ -58,12 +58,17 @@ log = logging.getLogger("anvil.routing")
 DEFAULT_MODEL = "claude-opus-4-7"
 
 # Alias name → version string. Per Q-A1, targets must all exist in
-# MODEL_RATES. Sonnet is deliberately absent in Phase 1a (brief Amendment 1):
-# `claude-sonnet-4-6` has no MODEL_RATES entry (v3 never used Sonnet) and no
-# Phase 1a/2/3 consumer named it; the alias is restored in a later phase when
-# a Sonnet rate and a consumer both exist.
+# MODEL_RATES. Sonnet was deliberately absent in Phase 1a (brief Amendment 1):
+# `claude-sonnet-4-6` had no MODEL_RATES entry and no Phase 1a/2/3 consumer, so
+# the alias was to be restored "when a Sonnet rate and a consumer both exist".
+# v4 Phase 3a restores it (Step 0 Q-A5 / DC4): the rate now exists
+# (events.MODEL_RATES, $3/$15 per Mtok) and the consumer is named — Phase 3c
+# routes the screen-aware vision interpreter to Sonnet via call_model_for_subtask.
+# Available-but-not-consumed in 3a (nothing routes "sonnet" until 3c), the v4
+# substrate-ahead-of-consumer pattern.
 MODEL_ALIASES: dict[str, str] = {
     "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
 

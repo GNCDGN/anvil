@@ -415,12 +415,13 @@ Exercise the per-step model field.
             validate_or_reject(brief, fm)
         self.assertIn("model 'gpt-4'", " ".join(ctx.exception.errors))
 
-    def test_sonnet_alias_rejected(self) -> None:
-        # Amendment 1 negative test: sonnet was dropped from MODEL_ALIASES.
+    def test_sonnet_alias_accepted(self) -> None:
+        # v4 Phase 3a (Step 0 Q-A5 / DC4): sonnet restored to MODEL_ALIASES, so a
+        # `model: sonnet` step now validates (was rejected in Phase 1a,
+        # Amendment 1, when sonnet was dropped).
         brief, fm = self._parse(model_line="- **model:** sonnet")
-        with self.assertRaises(BriefValidationError) as ctx:
-            validate_or_reject(brief, fm)
-        self.assertIn("model 'sonnet'", " ".join(ctx.exception.errors))
+        validate_or_reject(brief, fm)  # must not raise
+        self.assertEqual(brief.steps[0].model, "sonnet")
 
     def test_missing_model_is_none_and_validates(self) -> None:
         brief, fm = self._parse(model_line="")
