@@ -19,7 +19,7 @@ import signal
 import sys
 import time
 
-from anvil.monitor import anvil_ops, schedule
+from anvil.monitor import anvil_ops, schedule, wake
 
 DEFAULT_DB = os.environ.get("ANVIL_OPS_DB_PATH", "state/anvil-ops.db")
 POLL_INTERVAL_S = int(os.environ.get("ANVIL_MONITOR_POLL_S", "60"))
@@ -29,10 +29,11 @@ log = logging.getLogger("anvil.monitor")
 
 
 def _dispatch_wake(task: dict) -> dict:
-    """The schedule poll's wake dispatcher. Step 2 replaces the body with
-    `wake.send_wake(task)`; Step 1 logs the routing decision (the substrate
-    fires + logs the trigger; the Telegram send is Step 2)."""
-    return schedule._log_stub(task)
+    """The schedule poll's wake dispatcher — sends the [ANVIL] Wake to the
+    operator's Telegram (explicit-mode; the operator relays `go <path>` to the
+    Mac wake-listener). Never-raises (wake.send_wake returns a structured
+    result)."""
+    return wake.send_wake(task)
 
 
 def _configure_logging() -> None:

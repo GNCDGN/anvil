@@ -144,6 +144,79 @@ def cmd_copilot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_wake_brief(path_str: str, config) -> Path | None:
+    """Validate an operator-relayed brief path from a `go <path>` wake reply:
+    an existing `.md` file. Returns the resolved Path, or None."""
+    try:
+        p = Path(os.path.expanduser(path_str.strip())).resolve()
+    except (OSError, ValueError):
+        return None
+    return p if (p.is_file() and p.suffix == ".md") else None
+
+
+def _handle_wake(text: str, config, tg, run_build) -> dict:
+    """Handle one operator reply in the wake-listen loop. `run_build(path)` is
+    injected (tests mock it). Returns {"action": ran|skipped|invalid|ignored}.
+    Never lets a bad reply or a build error crash the listener."""
+    text = (text or "").strip()
+    if text == "skip":
+        tg.send("[ANVIL] wake-run: skipped")
+        return {"action": "skipped"}
+    if text.startswith("go "):
+        p = _resolve_wake_brief(text[3:], config)
+        if p is None:
+            tg.send(f"[ANVIL] wake-run: invalid brief path {text[3:].strip()!r} (need an existing .md)")
+            return {"action": "invalid"}
+        tg.send(f"[ANVIL] wake-run starting: {p.name}")
+        try:
+            rc = run_build(p)
+        except Exception as e:  # never crash the listener on a build error
+            logging.getLogger("anvil.cli.wake").warning("wake-run build raised: %s", e)
+            tg.send(f"[ANVIL] wake-run errored: {p.name} ({type(e).__name__})")
+            return {"action": "ran", "rc": None, "error": str(e)}
+        tg.send(f"[ANVIL] wake-run done: {p.name} rc={rc}")
+        return {"action": "ran", "rc": rc}
+    return {"action": "ignored"}
+
+
+def cmd_wake_listen(args: argparse.Namespace) -> int:
+    """The Mac-side wake-listener (v5 Phase 1b, item E). Owns getUpdates on the
+    ANVIL bot while idle; on the operator's `go <path>` reply, runs that brief
+    (the orchestrator then owns getUpdates), then re-baselines + resumes — a
+    single-process serial handoff (Q-B5; the 409 single-consumer constraint).
+    `skip` defers. SIGINT exits cleanly."""
+    _setup_logging()
+    config = _load_config_or_exit()
+    log = logging.getLogger("anvil.cli.wake")
+    from anvil.telegram import (
+        TelegramClient, install_interrupt_handler, restore_interrupt_handler,
+    )
+    from anvil.orchestrator import Orchestrator
+
+    tg = TelegramClient(config.telegram_bot_token, config.telegram_chat_id)
+
+    def run_build(p: Path) -> int:
+        return Orchestrator(config, coder_mode=config.coder_mode).run(p)
+
+    install_interrupt_handler()
+    log.info("anvil wake-listen started — idle; awaiting [ANVIL] Wake -> operator 'go <path>'")
+    try:
+        while True:
+            reply = tg.wait_for_reply(timeout=None)  # owns getUpdates while idle
+            if reply is None:
+                continue
+            res = _handle_wake(reply.text, config, tg, run_build)
+            if res["action"] == "ran":
+                # the orchestrator owned getUpdates during the build; re-baseline
+                # so the resumed poll skips the build-period backlog (the handoff).
+                tg._last_update_id = None
+    except KeyboardInterrupt:
+        log.info("anvil wake-listen stopped cleanly")
+        return 0
+    finally:
+        restore_interrupt_handler()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="anvil", description="Autonomous build orchestrator"
@@ -167,6 +240,14 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="Print the current run state"
     )
     p_status.set_defaults(func=cmd_status)
+
+    # v5 Phase 1b: the Mac-side wake-listener (item E). A standing listener that
+    # runs the named brief on the operator's `go <path>` reply to an [ANVIL] Wake.
+    p_wake = sub.add_parser(
+        "wake-listen",
+        help="Mac-side: run the named brief on the operator's 'go <path>' reply to an [ANVIL] Wake",
+    )
+    p_wake.set_defaults(func=cmd_wake_listen)
 
     # v4 Phase 3c Step 2: the co-pilot session entry (DC7). `anvil copilot start
     # <target> [--autonomous] [--max-captures N]`.
