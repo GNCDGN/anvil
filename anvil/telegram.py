@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +55,7 @@ class _Upd:
     message_id: int | None
     text: str | None
     date: int | None
+    voice_file_id: str | None = None  # v5 Phase 2a: a Telegram voice message
 
 
 # ---- interrupt facility (Phase B hotfix) ------------------------------------
@@ -156,10 +159,53 @@ class TelegramClient:
                             message_id=m.message_id,
                             text=(m.text or ""),
                             date=int(m.date.timestamp()) if m.date else None,
+                            # v5 Phase 2a: capture a voice message's file_id;
+                            # resolved to text by _resolve_voice below.
+                            voice_file_id=(m.voice.file_id if getattr(m, "voice", None) else None),
                         )
                     )
                 return out
+        return self._resolve_voice(asyncio.run(_do()))
+
+    def _download_voice(self, file_id: str) -> str | None:
+        """Download a Telegram voice file (PTB Bot.get_file) to a temp path.
+        The async download seam (mocked in unit tests). Returns the path or
+        None. May raise (the caller, _resolve_voice, wraps it)."""
+        async def _do() -> str | None:
+            async with Bot(self.bot_token) as bot:
+                tg_file = await bot.get_file(file_id)
+                fd, path = tempfile.mkstemp(suffix=".oga")
+                os.close(fd)
+                await tg_file.download_to_drive(path)
+                return path
         return asyncio.run(_do())
+
+    def _resolve_voice(self, upds: list["_Upd"]) -> list["_Upd"]:
+        """v5 Phase 2a: turn voice messages into text. For each _Upd carrying a
+        voice_file_id and no text, download the audio and transcribe it
+        (voice_input.transcribe); the transcript becomes the _Upd.text, so the
+        rest of the pipeline treats it exactly like a typed message (the
+        Confirmation contract — no auto-fire). Never-raises: a download/
+        transcription failure leaves text empty + logs (the update is ignored
+        downstream, the operator can retype)."""
+        from anvil import voice_input
+        for u in upds:
+            if not u.voice_file_id or (u.text or "").strip():
+                continue
+            try:
+                path = self._download_voice(u.voice_file_id)
+                if not path:
+                    log.warning("voice download returned no path for %s", u.voice_file_id)
+                    continue
+                r = voice_input.transcribe(path)
+                if r.get("ok"):
+                    u.text = r["text"]
+                    log.info("transcribed voice message (%d chars)", len(u.text or ""))
+                else:
+                    log.warning("voice transcription failed: %s", r.get("error"))
+            except Exception as e:  # noqa: BLE001 — never-raise
+                log.warning("voice resolve failed for %s: %s", u.voice_file_id, e)
+        return upds
 
     def _send_typing(self) -> None:
         async def _do() -> None:
