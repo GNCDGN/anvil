@@ -52,6 +52,11 @@ class Config:
     mode_guard: bool = False
     vps_monitor_path: str = "/home/vault-reporter/anvil-monitor"
     vps_ops_db: str = "/home/vault-reporter/anvil-ops.db"
+    # v5 Phase 2a: TTS output (item B). Per-session opt-in — OFF by default so
+    # the build is silent unless the operator declares TTS for the session.
+    # ANVIL_TTS=1 enables it; ANVIL_TTS_BACKEND picks say (default) | elevenlabs.
+    tts_enabled: bool = False
+    tts_backend: str = "say"
     # Phase 4 Step 1: checkpoint write target; derived from vault_path at load time
     checkpoint_active_path: Path = Path("/dev/null")  # replaced in load()
     # v2 Phase 1 Step 5: calibration-framework flags. Selected by env
@@ -126,6 +131,9 @@ class Config:
             os.environ.get("ANVIL_VPS_OPS_DB", "").strip()
             or "/home/vault-reporter/anvil-ops.db"
         )
+        # v5 Phase 2a TTS output (per-session opt-in).
+        tts_enabled = (os.environ.get("ANVIL_TTS", "0").strip() == "1")
+        tts_backend = os.environ.get("ANVIL_TTS_BACKEND", "").strip() or "say"
 
         # v2 Phase 1 Step 5: calibration-framework env flags. "1" enables
         # the mocked subclass; anything else (default empty) keeps the
@@ -156,6 +164,8 @@ class Config:
             mode_guard=mode_guard,
             vps_monitor_path=vps_monitor_path,
             vps_ops_db=vps_ops_db,
+            tts_enabled=tts_enabled,
+            tts_backend=tts_backend,
             checkpoint_active_path=(
                 vault_path / "01-Projects/second-brain/checkpoints/active"
             ),

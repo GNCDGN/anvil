@@ -236,6 +236,25 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(ssh.call_args_list[0].args[0], "vps.test")  # host
         self.assertEqual(ssh.call_args_list[0].args[1], "root")      # default user
 
+    def test_tts_speaks_when_enabled(self) -> None:
+        # v5 Phase 2a: with tts_enabled, _tts_speak calls tts.speak with the
+        # session backend; off (default) → no-op.
+        from dataclasses import replace
+        cfg = replace(self.cfg, tts_enabled=True, tts_backend="say")
+        orch = Orchestrator(cfg, coder_mode="manual", planner=FakePlanner(),
+                            telegram=FakeTelegram([]), git=FakeGit(),
+                            run_smoke=lambda c, w: (True, "pass"))
+        with mock.patch("anvil.tts.speak", return_value={"ok": True, "backend": "say"}) as spk:
+            orch._tts_speak("build complete")
+        spk.assert_called_once()
+        self.assertEqual(spk.call_args.kwargs.get("backend"), "say")
+
+    def test_tts_off_by_default_no_speak(self) -> None:
+        orch = self._orch([])
+        with mock.patch("anvil.tts.speak") as spk:
+            orch._tts_speak("build complete")
+        spk.assert_not_called()
+
     def test_mode_guard_off_by_default_no_ssh(self) -> None:
         # default config (mode_guard False) → no SSH-write; sweeps/local runs
         # never touch the VPS ledger.

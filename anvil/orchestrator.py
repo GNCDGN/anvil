@@ -407,6 +407,22 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             return False, f"smoke runner error: {e}"
 
+    # ---- v5 Phase 2a: TTS output (item B) ----
+    def _tts_speak(self, text: str) -> None:
+        """Speak an outbound message if TTS is opted-in for this session.
+        Best-effort + never-raises (an output side-channel never breaks a
+        build); gated on config.tts_enabled (default off). Telegram remains the
+        primary channel — this is additive."""
+        if not getattr(self.config, "tts_enabled", False):
+            return
+        try:
+            from anvil import tts
+            r = tts.speak(text, backend=getattr(self.config, "tts_backend", "say"))
+            if not r.get("ok"):
+                log.warning("[tts] speak failed (%s): %s", r.get("backend"), r.get("error"))
+        except Exception as e:  # noqa: BLE001 — never break a build
+            log.warning("[tts] error: %s", e)
+
     # ---- v5 Phase 1c: the mode-guard reverse channel (Mac -> VPS SSH) ----
     def _mode_guard_mark_active(self, run_id: str, brief_path) -> None:
         """SSH-write running_builds=active on the VPS at build start (Q-C1 —
@@ -1010,7 +1026,9 @@ class Orchestrator:
             self._state = state
             self._log_event("complete", f"status={state.status}")
             self._archive_brief(brief_path, brief, state)
-            self.telegram.send(voice.format_completion(brief, state))
+            _completion_msg = voice.format_completion(brief, state)
+            self.telegram.send(_completion_msg)
+            self._tts_speak(_completion_msg)  # v5 Phase 2a: TTS output (opt-in)
             # Phase 4 Step 5: step 9 — draft + confirm + write artefacts.
             # Wrapped in try/except for never-raise contract; on any
             # unexpected exception, log and continue (build is done).
@@ -1513,9 +1531,9 @@ class Orchestrator:
         )
         self._pending_escalation_sent_at = time.monotonic()
 
-        self.telegram.send(
-            voice.format_escalation(state, reason, detail_with_options, display)
-        )
+        _escalation_msg = voice.format_escalation(state, reason, detail_with_options, display)
+        self.telegram.send(_escalation_msg)
+        self._tts_speak(_escalation_msg)  # v5 Phase 2a: TTS output (opt-in)
         self._log_event("escalation", reason)
         # Remembered for the immediately-following _await_user_decision.
         self._pending_options = grammar
